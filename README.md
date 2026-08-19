@@ -80,6 +80,20 @@ python seed_sample_data.py --reset      # three weeks of sample data
 uvicorn app:app --reload                # then open http://127.0.0.1:8000
 ```
 
+`--dry-run` calls Groq and prints what came back without touching the database,
+so it needs only `GROQ_API_KEY`. It shows the resolved local time and the
+clean-rep split, which is the only way to check either before anything is
+inserted:
+
+```
+  [INSERT] 1.00   16:35  Dumbbell Shoulder Press      10kg x 10  (warmup)
+  [INSERT] 1.00  ~18:00  Lateral Raise                7.5kg x 10 (3 cheat -> 7 clean)
+  [REVIEW] 0.65  ~18:00  Skull Crusher                10kg x ?
+```
+
+A leading `~` means the text carried no time marker and the default session hour
+was applied — which is how you spot a time the extraction missed.
+
 ## The decisions worth knowing about
 
 ### The LLM does not produce any number in the report
@@ -260,7 +274,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-172 tests, no network and no database required — they cover the Stage A rule
+190 tests, no network and no database required — they cover the Stage A rule
 branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold) and `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
