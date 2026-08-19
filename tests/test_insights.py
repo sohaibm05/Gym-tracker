@@ -574,3 +574,59 @@ class TestStageBContract:
         summary = insights.fallback_summary(stage_a)
         assert "62.5kg" in summary
         assert stage_a["recommendations"]["Bench Press"]["recommended_weight_kg"] == 62.5
+
+
+# --------------------------------------------------------------------------
+# Cheat reps: "10 reps 3 were cheat" is a count within a set, not a set flag
+# --------------------------------------------------------------------------
+
+
+class TestCheatReps:
+    def test_clean_reps_subtracts_cheat_reps(self):
+        assert insights.clean_reps(SetRecord("Lateral Raise", MONDAY, 7.5, 10, cheat_reps=3)) == 7
+
+    def test_defaults_to_all_reps_clean(self):
+        assert insights.clean_reps(SetRecord("Lateral Raise", MONDAY, 7.5, 10)) == 10
+
+    def test_missing_reps_stays_none(self):
+        assert insights.clean_reps(SetRecord("Lateral Raise", MONDAY, 7.5, None)) is None
+
+    def test_never_goes_negative(self):
+        assert insights.clean_reps(SetRecord("X", MONDAY, 10, 5, cheat_reps=9)) == 0
+
+    def test_e1rm_uses_clean_reps_not_total(self):
+        cheated = SetRecord("Lateral Raise", MONDAY, 7.5, 10, cheat_reps=3)
+        strict = SetRecord("Lateral Raise", MONDAY, 7.5, 7)
+        series_cheated = e1rm_series({MONDAY: [cheated]})
+        series_strict = e1rm_series({MONDAY: [strict]})
+        assert series_cheated == series_strict
+        assert series_cheated[0][1] == pytest.approx(9.25)
+
+    def test_counting_cheat_reps_as_clean_would_inflate_e1rm(self):
+        inflated = epley_1rm(7.5, 10)
+        honest = epley_1rm(7.5, 7)
+        assert inflated > honest
+
+    def test_a_fully_cheated_set_contributes_no_e1rm(self):
+        sets = {MONDAY: [SetRecord("X", MONDAY, 40, 8, cheat_reps=8)]}
+        assert e1rm_series(sets) == []
+
+    def test_volume_still_counts_every_rep_performed(self):
+        # The work happened, even if some reps were assisted.
+        record = SetRecord("Lateral Raise", MONDAY, 7.5, 10, cheat_reps=3)
+        assert total_volume([record]) == 75.0
+
+    def test_cheat_reps_can_flip_increase_into_hold(self):
+        strict = {MONDAY: [SetRecord("Lateral Raise", MONDAY, 7.5, 12)]}
+        assert recommend_for_exercise("Lateral Raise", strict).action == "increase"
+
+        cheated = {MONDAY: [SetRecord("Lateral Raise", MONDAY, 7.5, 12, cheat_reps=3)]}
+        rec = recommend_for_exercise("Lateral Raise", cheated)
+        assert rec.action == "hold"
+        assert rec.recommended_weight_kg == 7.5
+
+    def test_cheat_reps_can_trip_the_missed_bottom_rule(self):
+        sets = {MONDAY: [SetRecord("X", MONDAY, 40, 8, cheat_reps=4)]}  # 4 clean, below 6
+        rec = recommend_for_exercise("X", sets)
+        assert rec.action == "hold"
+        assert "below 6 reps" in rec.reason

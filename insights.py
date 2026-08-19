@@ -79,6 +79,7 @@ class SetRecord:
     session_date: date
     weight_kg: Optional[float] = None
     reps: Optional[int] = None
+    cheat_reps: int = 0
     is_warmup: bool = False
     pain_flag: bool = False
     muscle_group: Optional[str] = None
@@ -116,6 +117,18 @@ def epley_1rm(weight_kg: Optional[float], reps: Optional[int]) -> Optional[float
     return float(weight_kg) * (1.0 + reps / 30.0)
 
 
+def clean_reps(record: SetRecord) -> Optional[int]:
+    """Reps performed without cheating or assistance.
+
+    A cheated rep does not demonstrate strength at that load, so clean reps —
+    not total reps — drive estimated 1RM and the rep-range rules. Volume still
+    uses total reps, because the work was performed.
+    """
+    if record.reps is None:
+        return None
+    return max(0, record.reps - (record.cheat_reps or 0))
+
+
 def is_working_set(record: SetRecord) -> bool:
     """A set that counts toward progression: not a warm-up, and fully logged."""
     return (
@@ -147,7 +160,10 @@ def e1rm_series(sessions: dict[date, list[SetRecord]]) -> list[tuple[date, float
     for session_date in sorted(sessions):
         estimates = [
             value
-            for value in (epley_1rm(r.weight_kg, r.reps) for r in working_sets(sessions[session_date]))
+            for value in (
+                epley_1rm(r.weight_kg, clean_reps(r))
+                for r in working_sets(sessions[session_date])
+            )
             if value is not None
         ]
         if estimates:
@@ -386,7 +402,6 @@ def recommend_for_exercise(
         )
 
     current_weight = max(float(s.weight_kg) for s in last_working)  # type: ignore[arg-type]
-    top_set_reps = [s.reps for s in last_working if float(s.weight_kg) == current_weight]  # type: ignore[arg-type]
     target_reps = f"{rep_low}-{rep_high}"
 
     recent_two = ordered_dates[-2:]
@@ -424,7 +439,7 @@ def recommend_for_exercise(
         )
 
     # 2. Top of the rep range on every working set -> add load.
-    if all((s.reps or 0) >= rep_high for s in last_working):
+    if all((clean_reps(s) or 0) >= rep_high for s in last_working):
         return Recommendation(
             exercise=exercise,
             action="increase",
@@ -455,7 +470,7 @@ def recommend_for_exercise(
         )
 
     # 4. Otherwise hold and repeat.
-    missed_bottom = any((s.reps or 0) < rep_low for s in last_working)
+    missed_bottom = any((clean_reps(s) or 0) < rep_low for s in last_working)
     reason = (
         f"A working set fell below {rep_low} reps last session — repeat {current_weight:g}kg "
         "and build reps first."
@@ -717,7 +732,7 @@ def load_set_records(engine: Engine, since: date, until: date) -> list[SetRecord
     query = text(
         """
         SELECT e.name, e.muscle_group, w.logged_at, w.weight_kg, w.reps,
-               w.is_warmup, w.pain_flag
+               w.cheat_reps, w.is_warmup, w.pain_flag
         FROM workout_logs w
         JOIN exercises e ON e.exercise_id = w.exercise_id
         WHERE w.logged_at >= :since AND w.logged_at < :until
@@ -734,7 +749,8 @@ def load_set_records(engine: Engine, since: date, until: date) -> list[SetRecord
         rows = conn.execute(query, {"since": since_utc, "until": until_utc}).fetchall()
 
     records = []
-    for name, muscle_group, logged_at, weight_kg, reps, is_warmup, pain_flag in rows:
+    for (name, muscle_group, logged_at, weight_kg, reps, cheat_reps,
+         is_warmup, pain_flag) in rows:
         records.append(
             SetRecord(
                 exercise_name=name,
@@ -742,6 +758,7 @@ def load_set_records(engine: Engine, since: date, until: date) -> list[SetRecord
                 session_date=logged_at.astimezone(local_zone).date(),
                 weight_kg=float(weight_kg) if weight_kg is not None else None,
                 reps=int(reps) if reps is not None else None,
+                cheat_reps=int(cheat_reps or 0),
                 is_warmup=bool(is_warmup),
                 pain_flag=bool(pain_flag),
             )

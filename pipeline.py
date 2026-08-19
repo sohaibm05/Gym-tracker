@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from typing import Any, Iterable, Optional, Sequence
 
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from rapidfuzz import fuzz
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
@@ -92,6 +92,7 @@ Return ONLY a JSON object with exactly this shape:
       "exercise_name": "Chest Bench Press",
       "weight_kg": 24.0,
       "reps": 12,
+      "cheat_reps": 0,
       "set_number": 2,
       "is_warmup": false,
       "is_dropset": false,
@@ -114,6 +115,13 @@ Rules:
   "ches bent prees" -> "Chest Bench Press", "shoulder pres" -> "Shoulder Press".
   Use the same name for the same movement everywhere in the entry.
 - weight_kg is per-side load as written. "12.5kg each hand" -> 12.5.
+- cheat_reps: how many reps in THIS set were completed with cheating, momentum
+  or assistance. "10 reps 3 were cheat" -> reps 10, cheat_reps 3. Also covers
+  "3 cheat", "last 2 were assisted", "2 forced reps", "final rep was a grinder
+  with help". Default 0. cheat_reps must never exceed reps.
+- "each hand" / "per hand" / "each side" applies to every LATER set of the same
+  exercise in the entry even when written only once. Keep reporting the per-hand
+  number for those sets.
 - set_number counts within that exercise, starting at 1, in the order written.
 - is_warmup true when the text says warm up / warmup / "warm up ish" / similar.
 - is_dropset true only when a drop set is explicitly described.
@@ -130,9 +138,11 @@ Rules:
     shoulder press.
   - Never spread a single pain mention across every exercise in the entry.
 - logged_at_local: combine SESSION_DATE (given below) with any time marker in
-  the text ("6:20ish" -> 18:20 if the session reads as an evening workout,
-  06:20 if morning). Format "YYYY-MM-DDTHH:MM:SS", no timezone. If no time
-  marker applies to a set, use null.
+  the text. A bare time with no am/pm that sits in a workout sequence is
+  afternoon or evening: "4:35" -> 16:35, "6:20ish" -> 18:20. Read a time as
+  morning only when the text says so ("this morning", "am", "before work").
+  Format "YYYY-MM-DDTHH:MM:SS", no timezone. If no time marker applies to a
+  set, use null.
 - raw_span: the exact substring of the input this set was read from. Copy it
   verbatim; do not paraphrase. This is used to verify the extraction.
 - NEVER invent data. If a weight, rep count, or exercise name is not in the
@@ -153,6 +163,7 @@ class WorkoutSet(BaseModel):
     exercise_name: str = Field(min_length=1, max_length=120)
     weight_kg: Optional[float] = Field(default=None, ge=0, le=1000)
     reps: Optional[int] = Field(default=None, gt=0, le=1000)
+    cheat_reps: int = Field(default=0, ge=0, le=1000)
     set_number: Optional[int] = Field(default=None, gt=0, le=100)
     is_warmup: bool = False
     is_dropset: bool = False
@@ -161,6 +172,15 @@ class WorkoutSet(BaseModel):
     logged_at_local: Optional[str] = None
     raw_span: Optional[str] = None
     muscle_group: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _cheat_reps_within_reps(self) -> "WorkoutSet":
+        """A set cannot contain more cheat reps than reps."""
+        if self.reps is not None and self.cheat_reps > self.reps:
+            raise ValueError(
+                f"cheat_reps ({self.cheat_reps}) exceeds reps ({self.reps})"
+            )
+        return self
 
     @field_validator("exercise_name")
     @classmethod
@@ -217,6 +237,26 @@ def normalize_name(name: str) -> str:
     return re.sub(r"\s+", " ", lowered).strip()
 
 
+def _singularize(token: str) -> str:
+    """Crude singularizer so "Curls" and "Curl" compare equal.
+
+    Words ending in "ss" are left alone, which is what keeps "press" from
+    becoming "pres".
+    """
+    if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def normalize_tokens(name: str) -> list[str]:
+    """Normalized, singularized tokens of an exercise name."""
+    return [_singularize(token) for token in normalize_name(name).split() if token]
+
+
+# Compared against singularized tokens, so the qualifier set is singularized too.
+_QUALIFIER_TOKENS_SINGULAR = frozenset(_singularize(t) for t in QUALIFIER_TOKENS)
+
+
 def name_match_score(proposed: str, existing: str) -> float:
     """Similarity (0-100) between two exercise names.
 
@@ -230,20 +270,27 @@ def name_match_score(proposed: str, existing: str) -> float:
     "Chest Bench Press" without merging "Squat" into "Front Squat". Both names
     must have at least two tokens, so "Curl" never absorbs "Leg Curl".
     """
-    left, right = normalize_name(proposed), normalize_name(existing)
-    if not left or not right:
+    left_list, right_list = normalize_tokens(proposed), normalize_tokens(existing)
+    if not left_list or not right_list:
         return 0.0
+    left, right = " ".join(left_list), " ".join(right_list)
 
     score = float(fuzz.token_sort_ratio(left, right))
 
-    left_tokens, right_tokens = set(left.split()), set(right.split())
+    # "Skullcrushers" vs "Skull Crushers" differ only in word boundaries, which
+    # token-based scorers cannot see. Comparing with spaces stripped catches it,
+    # and stays low for genuinely different names ("benchpress" vs
+    # "inclinebenchpress" scores 74).
+    score = max(score, float(fuzz.ratio(left.replace(" ", ""), right.replace(" ", ""))))
+
+    left_tokens, right_tokens = set(left_list), set(right_list)
     is_strict_subset = left_tokens < right_tokens or right_tokens < left_tokens
     if (
         left_tokens != right_tokens
         and is_strict_subset
         and len(left_tokens) >= 2
         and len(right_tokens) >= 2
-        and (left_tokens ^ right_tokens) <= QUALIFIER_TOKENS
+        and (left_tokens ^ right_tokens) <= _QUALIFIER_TOKENS_SINGULAR
     ):
         score = max(score, float(fuzz.token_set_ratio(left, right)))
 
@@ -590,10 +637,10 @@ def get_or_create_exercise(
 _INSERT_WORKOUT_SET = text(
     """
     INSERT INTO workout_logs (
-        exercise_id, logged_at, weight_kg, reps, set_number,
+        exercise_id, logged_at, weight_kg, reps, cheat_reps, set_number,
         is_warmup, is_dropset, pain_flag, notes, raw_source, extraction_confidence
     ) VALUES (
-        :exercise_id, :logged_at, :weight_kg, :reps, :set_number,
+        :exercise_id, :logged_at, :weight_kg, :reps, :cheat_reps, :set_number,
         :is_warmup, :is_dropset, :pain_flag, :notes, :raw_source, :extraction_confidence
     )
     """
@@ -745,6 +792,7 @@ def process_entry(
                     "logged_at": resolve_logged_at(workout_set.logged_at_local, session_date),
                     "weight_kg": workout_set.weight_kg,
                     "reps": workout_set.reps,
+                    "cheat_reps": workout_set.cheat_reps,
                     "set_number": workout_set.set_number,
                     "is_warmup": workout_set.is_warmup,
                     "is_dropset": workout_set.is_dropset,

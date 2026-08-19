@@ -51,6 +51,25 @@ psql "$DATABASE_URL" -f schema.sql
 
 `schema.sql` is safe to re-run — every object is `IF NOT EXISTS`.
 
+**Existing databases:** apply anything in `migrations/` that postdates your
+setup. They are additive and re-runnable:
+
+```bash
+psql "$DATABASE_URL" -f migrations/001_add_cheat_reps.sql
+```
+
+**Supabase:** enable RLS on all four tables. The app connects as the table owner
+so it bypasses RLS, but Supabase auto-exposes a REST API over the `public`
+schema to the anon key, and without RLS that key can read and delete your data.
+No policies are needed — RLS on with zero policies denies the API entirely:
+
+```sql
+ALTER TABLE exercises       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE workout_logs    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bodyweight_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE weekly_reports  ENABLE ROW LEVEL SECURITY;
+```
+
 ### Try it
 
 ```bash
@@ -101,6 +120,11 @@ Bench Press", "Bench Press (Chest)" and "Barbell Chest Bench Press" become three
 rows and your progress history splits three ways — which defeats the point of
 tracking.
 
+Real journal entries also produce `Skullcrushers` vs `Skull Crushers` (word
+boundaries only) and `Cable Hammer Curls` vs `Hammer Curl` (an equipment
+qualifier and a plural at once). Names are singularized before comparison, and
+compared with spaces stripped as an extra signal, so both merge.
+
 No single rapidfuzz scorer gets this right. `token_set_ratio` merges "Bench
 Press" with "Incline Bench Press" (score 100), and `token_sort_ratio` refuses to
 merge "Barbell Chest Bench Press" with "Chest Bench Press" (score 81). So
@@ -113,6 +137,20 @@ Unknown words fail closed, into a separate row.
 
 Both names must have at least two tokens for the subset bonus, so "Curl" never
 absorbs "Leg Curl". Threshold is 85, tunable via `FUZZY_MATCH_THRESHOLD`.
+
+### Cheat reps are counted, not flagged
+
+Entries like `Lateral raises 7.5kg 10 reps 3 were cheat` mean three reps *inside*
+a ten-rep set were completed with momentum — not three cheat sets. So
+`cheat_reps` is a count, and **clean reps** (`reps - cheat_reps`) drive estimated
+1RM and the rep-range rules. Volume still uses total reps, because the work was
+performed.
+
+This matters more than it looks. Scoring those ten reps as clean inflates that
+set's e1RM by 8%, and at the top of the range it flips the recommendation
+outright: 12 reps with 3 cheat reps is 9 clean reps, which is a hold, not the
+load increase you would otherwise be told to take on a lift you cheated to
+finish.
 
 ### Recommendation precedence
 
@@ -222,7 +260,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-147 tests, no network and no database required — they cover the Stage A rule
+172 tests, no network and no database required — they cover the Stage A rule
 branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold) and `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp

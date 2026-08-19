@@ -28,6 +28,10 @@ CREATE TABLE IF NOT EXISTS workout_logs (
     logged_at             TIMESTAMPTZ NOT NULL,
     weight_kg             NUMERIC(6, 2),
     reps                  INTEGER,
+    -- Reps within the set completed with momentum/assistance ("10 reps, 3 were
+    -- cheat"). Clean reps = reps - cheat_reps, and clean reps are what drive
+    -- estimated 1RM and the rep-range rules; total reps still drive volume.
+    cheat_reps            INTEGER NOT NULL DEFAULT 0,
     set_number            INTEGER,
     is_warmup             BOOLEAN NOT NULL DEFAULT FALSE,
     is_dropset            BOOLEAN NOT NULL DEFAULT FALSE,
@@ -39,6 +43,8 @@ CREATE TABLE IF NOT EXISTS workout_logs (
 
     CONSTRAINT workout_logs_weight_nonneg CHECK (weight_kg IS NULL OR weight_kg >= 0),
     CONSTRAINT workout_logs_reps_positive CHECK (reps IS NULL OR reps > 0),
+    CONSTRAINT workout_logs_cheat_reps_valid
+        CHECK (cheat_reps >= 0 AND (reps IS NULL OR cheat_reps <= reps)),
     CONSTRAINT workout_logs_confidence_range
         CHECK (extraction_confidence IS NULL
                OR (extraction_confidence >= 0 AND extraction_confidence <= 1))
