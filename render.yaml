@@ -1,0 +1,24 @@
+# Render free-tier blueprint. Secrets are set in the dashboard, never here.
+services:
+  - type: web
+    name: gym-tracker
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: APP_USERNAME
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: LOCAL_TIMEZONE
+        value: UTC
+      - key: PAIN_SAFEGUARD_ENABLED
+        value: "true"
