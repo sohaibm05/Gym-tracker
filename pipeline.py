@@ -118,9 +118,17 @@ Rules:
 - is_warmup true when the text says warm up / warmup / "warm up ish" / similar.
 - is_dropset true only when a drop set is explicitly described.
 - pain_flag true on ANY mention of pain, discomfort, injury, tweak, strain,
-  soreness that reads as a problem, or "felt something". Apply it to the set(s)
-  the mention relates to; if it is not tied to a specific set, apply it to every
-  set of the exercise it names.
+  soreness that reads as a problem, or "felt something".
+  - Effort is NOT pain. "almost died", "brutal", "killed me", "barely got it",
+    "struggled", "tough", "burned" describe how hard a set was, not an injury.
+    Leave pain_flag false for those.
+  - If the mention names an exercise, apply it to every working set of that
+    exercise.
+  - If it names no exercise ("shoulder pain noticed toward the end"), apply it
+    to the sets of the exercise described most recently BEFORE the mention in
+    the text. A body part is not an exercise: "shoulder pain" does not mean the
+    shoulder press.
+  - Never spread a single pain mention across every exercise in the entry.
 - logged_at_local: combine SESSION_DATE (given below) with any time marker in
   the text ("6:20ish" -> 18:20 if the session reads as an evening workout,
   06:20 if morning). Format "YYYY-MM-DDTHH:MM:SS", no timezone. If no time
