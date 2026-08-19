@@ -426,3 +426,66 @@ class TestNumericGrounding:
 
     def test_normalizer_preserves_decimals(self):
         assert "82.4" in pipeline._normalize_numeric_text("Was  82.4KG this morning")
+
+
+# --------------------------------------------------------------------------
+# cheat_reps on the extraction model
+# --------------------------------------------------------------------------
+
+
+class TestCheatRepsModel:
+    def test_defaults_to_zero(self):
+        assert WorkoutSet(exercise_name="Lateral Raise", reps=10).cheat_reps == 0
+
+    def test_accepts_a_count_within_the_set(self):
+        s = WorkoutSet(exercise_name="Lateral Raise", weight_kg=7.5, reps=10, cheat_reps=3)
+        assert s.cheat_reps == 3
+
+    def test_rejects_more_cheat_reps_than_reps(self):
+        with pytest.raises(Exception, match="cheat_reps"):
+            WorkoutSet(exercise_name="Lateral Raise", reps=8, cheat_reps=9)
+
+    def test_allows_a_fully_cheated_set(self):
+        assert WorkoutSet(exercise_name="X", reps=5, cheat_reps=5).cheat_reps == 5
+
+    def test_rejects_negative(self):
+        with pytest.raises(Exception):
+            WorkoutSet(exercise_name="X", reps=5, cheat_reps=-1)
+
+
+# --------------------------------------------------------------------------
+# Matcher gaps found on real journal entries
+# --------------------------------------------------------------------------
+
+
+class TestRealEntryNameMatching:
+    @pytest.mark.parametrize(
+        "proposed,existing",
+        [
+            ("Skull Crushers", "Skullcrushers"),      # word boundary only
+            ("Cable Hammer Curls", "Hammer Curl"),    # qualifier + plural at once
+            ("Dumbbell Press", "Dumbbell Shoulder Press"),
+            ("Lateral Raises", "Lateral Raise"),
+            ("Face Pull", "Face Pulls"),
+        ],
+    )
+    def test_same_exercise_still_merges(self, proposed, existing):
+        assert find_matching_exercise(proposed, [existing]) == existing
+
+    @pytest.mark.parametrize(
+        "proposed,existing",
+        [
+            ("Dumbbell Press", "Dumbbell Bench Press"),   # shoulder vs chest
+            ("Lateral Raises", "Front Raises"),
+            ("Bench Press", "Incline Bench Press"),
+            ("Squat", "Front Squat"),
+        ],
+    )
+    def test_different_exercises_still_separate(self, proposed, existing):
+        assert find_matching_exercise(proposed, [existing]) is None
+
+    def test_singularizer_leaves_double_s_words_alone(self):
+        assert pipeline._singularize("press") == "press"
+        assert pipeline._singularize("curls") == "curl"
+        assert pipeline._singularize("raises") == "raise"
+        assert pipeline._singularize("abs") == "abs"  # too short to strip
