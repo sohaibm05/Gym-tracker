@@ -34,6 +34,50 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _local_time_label(workout_set, session_date: date) -> str:
+    """Resolved wall-clock time for a set, in LOCAL_TIMEZONE.
+
+    Prefixed with "~" when the text carried no usable time marker and the
+    default session hour was applied, so a missed "4:35" is visible.
+    """
+    from zoneinfo import ZoneInfo
+
+    # Read the zone once and use it for both the resolve and the display, so the
+    # two can never disagree.
+    zone_name = pipeline.LOCAL_TIMEZONE
+    resolved = pipeline.resolve_logged_at(
+        workout_set.logged_at_local, session_date, zone_name
+    )
+    local = resolved.astimezone(ZoneInfo(zone_name))
+    prefix = "" if (workout_set.logged_at_local or "").strip() else "~"
+    return f"{prefix}{local:%H:%M}"
+
+
+def format_set_line(workout_set, confidence: float, session_date: date) -> str:
+    """One dry-run line: verdict, confidence, resolved time, load, reps, flags."""
+    verdict = "INSERT" if confidence >= pipeline.CONFIDENCE_THRESHOLD else "REVIEW"
+    weight = f"{workout_set.weight_kg:g}kg" if workout_set.weight_kg is not None else "?kg"
+    reps = str(workout_set.reps) if workout_set.reps is not None else "?"
+
+    detail = f"{weight} x {reps}"
+    if workout_set.cheat_reps and workout_set.reps is not None:
+        clean = max(0, workout_set.reps - workout_set.cheat_reps)
+        detail += f" ({workout_set.cheat_reps} cheat -> {clean} clean)"
+
+    flags = ""
+    if workout_set.is_warmup:
+        flags += "  (warmup)"
+    if workout_set.is_dropset:
+        flags += "  (dropset)"
+    if workout_set.pain_flag:
+        flags += "  (PAIN)"
+
+    return (
+        f"  [{verdict}] {confidence:.2f}  {_local_time_label(workout_set, session_date):>6}  "
+        f"{workout_set.exercise_name:<28} {detail}{flags}"
+    )
+
+
 def _parse_date(value: str) -> date:
     try:
         return datetime.strptime(value, "%Y-%m-%d").date()
@@ -62,15 +106,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         payload = pipeline.extract_entities(raw_text, session_date)
         scored_sets, scored_bodyweight, review = pipeline.validate_extraction(payload, raw_text)
-        print(f"Dry run — nothing inserted. Session date: {session_date}\n")
+        print(f"Dry run — nothing inserted. Session date: {session_date}")
+        print(f"Times shown in {pipeline.LOCAL_TIMEZONE}; \"~\" means no time marker "
+              f"in the text, so the default hour was used.\n")
         for workout_set, confidence in scored_sets:
-            verdict = "INSERT" if confidence >= pipeline.CONFIDENCE_THRESHOLD else "REVIEW"
-            print(
-                f"  [{verdict}] {confidence:.2f}  {workout_set.exercise_name} "
-                f"{workout_set.weight_kg}kg x {workout_set.reps}"
-                + ("  (warmup)" if workout_set.is_warmup else "")
-                + ("  (PAIN)" if workout_set.pain_flag else "")
-            )
+            print(format_set_line(workout_set, confidence, session_date))
         if scored_bodyweight:
             entry, confidence = scored_bodyweight
             verdict = "INSERT" if confidence >= pipeline.CONFIDENCE_THRESHOLD else "REVIEW"
