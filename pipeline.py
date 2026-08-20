@@ -35,6 +35,20 @@ except ImportError:  # pragma: no cover - Python < 3.9 is unsupported anyway
 
 logger = logging.getLogger(__name__)
 
+# Load a .env sitting next to this file, if there is one. Must happen before the
+# configuration block below, which reads these variables at import time.
+#
+# override=False means a real environment variable always wins over the file, so
+# Render's dashboard configuration is never shadowed by a stray .env in the repo.
+try:
+    from pathlib import Path
+
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+except ImportError:  # pragma: no cover - python-dotenv is optional
+    pass
+
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------

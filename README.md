@@ -49,6 +49,16 @@ cp .env.example .env      # then fill it in
 psql "$DATABASE_URL" -f schema.sql
 ```
 
+`.env` is loaded automatically at import — you do not need to export anything by
+hand. A real environment variable always wins over the file, so Render's
+dashboard configuration is never shadowed by a stray `.env`. `.env` is
+gitignored; only `.env.example` is committed.
+
+When filling it in, replace the whole `[YOUR-PASSWORD]` placeholder, **square
+brackets included** — leaving them turns the password into a literal
+`[YOUR-PASSWORD]` string, and Python's URL parser reads the brackets as an IPv6
+host and fails with a misleading error about IP addresses.
+
 `schema.sql` is safe to re-run — every object is `IF NOT EXISTS`.
 
 **Existing databases:** apply anything in `migrations/` that postdates your
