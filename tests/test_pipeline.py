@@ -489,3 +489,43 @@ class TestRealEntryNameMatching:
         assert pipeline._singularize("curls") == "curl"
         assert pipeline._singularize("raises") == "raise"
         assert pipeline._singularize("abs") == "abs"  # too short to strip
+
+
+# --------------------------------------------------------------------------
+# Connection pooling: serverless invocations must not retain a pool
+# --------------------------------------------------------------------------
+
+
+class TestEnginePooling:
+    URL = "postgresql+psycopg2://u:p@localhost:55432/db"
+
+    def test_long_running_process_uses_a_real_pool(self):
+        from sqlalchemy.pool import NullPool
+
+        engine = pipeline.get_engine(self.URL, serverless=False)
+        assert not isinstance(engine.pool, NullPool)
+
+    def test_serverless_uses_nullpool(self):
+        from sqlalchemy.pool import NullPool
+
+        engine = pipeline.get_engine(self.URL, serverless=True)
+        assert isinstance(engine.pool, NullPool)
+
+    def test_vercel_env_var_switches_it_on(self, monkeypatch):
+        monkeypatch.setenv("VERCEL", "1")
+        import importlib
+
+        reloaded = importlib.reload(pipeline)
+        try:
+            assert reloaded.SERVERLESS is True
+        finally:
+            monkeypatch.delenv("VERCEL", raising=False)
+            importlib.reload(pipeline)
+
+    def test_off_by_default(self):
+        assert pipeline.SERVERLESS is False
+
+    def test_missing_url_still_raises(self, monkeypatch):
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        with pytest.raises(RuntimeError, match="DATABASE_URL"):
+            pipeline.get_engine()
