@@ -49,6 +49,16 @@ cp .env.example .env      # then fill it in
 psql "$DATABASE_URL" -f schema.sql
 ```
 
+`.env` is loaded automatically at import — you do not need to export anything by
+hand. A real environment variable always wins over the file, so Render's
+dashboard configuration is never shadowed by a stray `.env`. `.env` is
+gitignored; only `.env.example` is committed.
+
+When filling it in, replace the whole `[YOUR-PASSWORD]` placeholder, **square
+brackets included** — leaving them turns the password into a literal
+`[YOUR-PASSWORD]` string, and Python's URL parser reads the brackets as an IPv6
+host and fails with a misleading error about IP addresses.
+
 `schema.sql` is safe to re-run — every object is `IF NOT EXISTS`.
 
 **Existing databases:** apply anything in `migrations/` that postdates your
@@ -79,6 +89,16 @@ python parse_workout_log.py sample_entry.txt 2026-08-14
 python seed_sample_data.py --reset      # three weeks of sample data
 uvicorn app:app --reload                # then open http://127.0.0.1:8000
 ```
+
+Stuck on configuration? `--check-config` reports where every setting is coming
+from and tests both connections, without printing a secret:
+
+```bash
+python parse_workout_log.py --check-config
+```
+
+It names the three things that actually go wrong: a `[YOUR-PASSWORD]` placeholder
+left in the URL, a shell variable silently shadowing `.env`, and a malformed key.
 
 `--dry-run` calls Groq and prints what came back without touching the database,
 so it needs only `GROQ_API_KEY`. It shows the resolved local time and the
@@ -274,7 +294,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-190 tests, no network and no database required — they cover the Stage A rule
+196 tests, no network and no database required — they cover the Stage A rule
 branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold) and `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp

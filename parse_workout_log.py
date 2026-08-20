@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -23,8 +24,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Parse a free-text gym journal entry into Postgres.",
     )
-    parser.add_argument("file", type=Path, help="Text file containing the journal entry")
-    parser.add_argument("date", help="Session date, YYYY-MM-DD")
+    parser.add_argument("file", nargs="?", type=Path,
+                        help="Text file containing the journal entry")
+    parser.add_argument("date", nargs="?", help="Session date, YYYY-MM-DD")
+    parser.add_argument(
+        "--check-config",
+        action="store_true",
+        help="Report where each setting comes from, test the connections, and exit",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -86,12 +93,160 @@ def _parse_date(value: str) -> date:
         raise SystemExit(2)
 
 
+SETTINGS = [
+    ("DATABASE_URL", True),
+    ("GROQ_API_KEY", True),
+    ("APP_PASSWORD", True),
+    ("LOCAL_TIMEZONE", False),
+    ("GROQ_MODEL", False),
+    ("APP_USERNAME", False),
+]
+
+
+def _mask(key: str, value: str) -> str:
+    """Render a value without exposing the secret part."""
+    if key == "DATABASE_URL":
+        try:
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(value)
+        except ValueError:
+            return "<unparseable>"
+        return value.replace(parsed.password, "***", 1) if parsed.password else value
+    if len(value) <= 8:
+        return "*" * len(value)
+    return f"{value[:4]}...{value[-2:]}  ({len(value)} chars)"
+
+
+def check_config() -> int:
+    """Report where each setting came from, then test that it works.
+
+    Exists for one failure in particular: a stale shell variable silently
+    overriding .env. The effective value looks plausible wherever you inspect
+    it, and nothing points at the shell as the culprit.
+    """
+    from pathlib import Path as _Path
+
+    env_path = _Path(pipeline.__file__).resolve().parent / ".env"
+    print("Configuration")
+    print()
+    print(f"  .env: {env_path}  ({'found' if env_path.is_file() else 'not present'})")
+    print()
+
+    file_values: dict = {}
+    if env_path.is_file():
+        try:
+            from dotenv import dotenv_values
+
+            file_values = dict(dotenv_values(env_path))
+        except ImportError:
+            print("  python-dotenv is not installed, so .env is being ignored.")
+            print("  Fix with:  pip install python-dotenv")
+            print()
+
+    shadowed: list = []
+    for key, secret in SETTINGS:
+        active = os.getenv(key)
+        in_file = file_values.get(key)
+        if active is None:
+            print(f"  {key:16} not set")
+            continue
+        if in_file is not None and in_file != active:
+            source = "SHELL (overriding .env)"
+            shadowed.append(key)
+        elif in_file is not None:
+            source = ".env"
+        else:
+            source = "environment"
+        print(f"  {key:16} {source:24} {_mask(key, active) if secret else active}")
+
+    print()
+    print("Checks")
+    print()
+    ok = True
+
+    def report(label, passed, detail=""):
+        nonlocal ok
+        ok = ok and passed
+        print(f"  [{'ok  ' if passed else 'FAIL'}] {label}" + (f" - {detail}" if detail else ""))
+
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        report("DATABASE_URL set", False, "not found in .env or the environment")
+    elif "[" in database_url or "]" in database_url:
+        report("DATABASE_URL placeholder replaced", False,
+               "still contains [...] - replace it, square brackets included")
+    else:
+        report("DATABASE_URL placeholder replaced", True)
+        try:
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(database_url)
+            report("DATABASE_URL parses", True,
+                   f"user={parsed.username} host={parsed.hostname} port={parsed.port}")
+            if not parsed.password:
+                report("password present", False, "no password in the URL")
+            if parsed.hostname and "supabase" in parsed.hostname \
+                    and "pooler" not in parsed.hostname:
+                report("Supabase pooler host", False,
+                       "this is the direct host - IPv6 only, unreachable from Render")
+        except ValueError as exc:
+            report("DATABASE_URL parses", False, str(exc))
+
+        try:
+            from sqlalchemy import create_engine as _create_engine, text as _text
+
+            # Short timeout: a diagnostic that hangs is worse than no diagnostic.
+            engine = _create_engine(database_url, connect_args={"connect_timeout": 8})
+            with engine.connect() as conn:
+                rows = conn.execute(_text("SELECT count(*) FROM workout_logs")).scalar_one()
+            report("database connection", True, f"{rows} rows in workout_logs")
+        except Exception as exc:  # noqa: BLE001 - surface whatever failed
+            report("database connection", False, str(exc).strip().splitlines()[0])
+
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        report("GROQ_API_KEY set", False, "not set")
+    elif api_key.startswith("xai-"):
+        report("GROQ_API_KEY is a Groq key", False,
+               "starts with 'xai-', which is an xAI Grok key - different service")
+    else:
+        report("GROQ_API_KEY is a Groq key", api_key.startswith("gsk_"),
+               "" if api_key.startswith("gsk_") else "expected it to start with 'gsk_'")
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        ZoneInfo(pipeline.LOCAL_TIMEZONE)
+        report("LOCAL_TIMEZONE valid", True, pipeline.LOCAL_TIMEZONE)
+        if pipeline.LOCAL_TIMEZONE == "UTC":
+            print("         note: this is still the default - set your own zone or "
+                  "session times will be stored wrong")
+    except Exception:  # noqa: BLE001
+        report("LOCAL_TIMEZONE valid", False, f"unknown zone {pipeline.LOCAL_TIMEZONE!r}")
+
+    for key in shadowed:
+        print()
+        print(f"  !  {key} is set BOTH in your shell and in .env, with different values.")
+        print(f"     The shell wins. Clear it with:  Remove-Item Env:\\{key}")
+
+    print()
+    return 0 if ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+
+    if args.check_config:
+        return check_config()
+
+    if args.file is None or args.date is None:
+        print("file and date are required unless --check-config is given", file=sys.stderr)
+        return 2
 
     if not args.file.is_file():
         print(f"No such file: {args.file}", file=sys.stderr)

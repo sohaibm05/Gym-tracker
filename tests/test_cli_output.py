@@ -98,3 +98,40 @@ class TestTimeLabel:
         monkeypatch.setattr(pipeline, "LOCAL_TIMEZONE", "UTC")
         line = line_for(logged_at_local="2026-01-01T09:00:00")
         assert "09:00" not in line
+
+
+# --------------------------------------------------------------------------
+# --check-config value masking: a diagnostic must never print a secret
+# --------------------------------------------------------------------------
+
+
+class TestMask:
+    def test_database_url_password_is_replaced(self):
+        url = "postgresql://postgres.abc:SuperSecret@host.pooler.supabase.com:5432/postgres"
+        masked = parse_workout_log._mask("DATABASE_URL", url)
+        assert "SuperSecret" not in masked
+        assert "***" in masked
+
+    def test_database_url_keeps_the_diagnosable_parts(self):
+        url = "postgresql://postgres.abc:SuperSecret@host.pooler.supabase.com:5432/postgres"
+        masked = parse_workout_log._mask("DATABASE_URL", url)
+        assert "postgres.abc" in masked
+        assert "host.pooler.supabase.com" in masked
+        assert "5432" in masked
+
+    def test_database_url_without_a_password_is_unchanged(self):
+        url = "postgresql://postgres@localhost:5432/postgres"
+        assert parse_workout_log._mask("DATABASE_URL", url) == url
+
+    def test_unparseable_database_url_does_not_leak_it(self):
+        bad = "postgresql://user:[YOUR-PASSWORD]@host:5432/db"
+        assert parse_workout_log._mask("DATABASE_URL", bad) == "<unparseable>"
+
+    def test_api_key_shows_only_its_ends(self):
+        masked = parse_workout_log._mask("GROQ_API_KEY", "gsk_abcdefghijklmnop")
+        assert "abcdefghijklmn" not in masked
+        assert masked.startswith("gsk_")
+        assert "(20 chars)" in masked
+
+    def test_short_secret_is_fully_starred(self):
+        assert parse_workout_log._mask("APP_PASSWORD", "abc123") == "******"
