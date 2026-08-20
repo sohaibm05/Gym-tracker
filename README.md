@@ -90,6 +90,16 @@ python seed_sample_data.py --reset      # three weeks of sample data
 uvicorn app:app --reload                # then open http://127.0.0.1:8000
 ```
 
+Stuck on configuration? `--check-config` reports where every setting is coming
+from and tests both connections, without printing a secret:
+
+```bash
+python parse_workout_log.py --check-config
+```
+
+It names the three things that actually go wrong: a `[YOUR-PASSWORD]` placeholder
+left in the URL, a shell variable silently shadowing `.env`, and a malformed key.
+
 `--dry-run` calls Groq and prints what came back without touching the database,
 so it needs only `GROQ_API_KEY`. It shows the resolved local time and the
 clean-rep split, which is the only way to check either before anything is
@@ -284,7 +294,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-190 tests, no network and no database required — they cover the Stage A rule
+196 tests, no network and no database required — they cover the Stage A rule
 branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold) and `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
