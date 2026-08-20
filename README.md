@@ -266,7 +266,27 @@ the pooled connection URI as `DATABASE_URL`. Free projects pause after 7 days of
 inactivity; at normal logging frequency you will not notice, but that is why the
 first request after a long gap can be slow.
 
-**Web app — Render free tier.**
+**Web app — Vercel (Hobby).** Free, no card. Vercel auto-detects the FastAPI
+`app` in `app.py`, so there is nothing to configure beyond environment variables.
+
+- Import the repo at vercel.com, accept the detected settings
+- Set `DATABASE_URL`, `GROQ_API_KEY`, `APP_USERNAME`, `APP_PASSWORD` and
+  `LOCAL_TIMEZONE` in Project Settings → Environment Variables (`.env` is
+  gitignored, so it is not deployed)
+- `vercel.json` pins `maxDuration` to 60s, which covers a Groq call plus inserts
+
+Use the Supabase **transaction pooler (port 6543)** rather than session mode
+here. Serverless gives each request its own short-lived process, and the
+transaction pooler is built for exactly that churn. Session mode on 5432 also
+works, since the app already avoids retaining a pool.
+
+That last part matters: Vercel sets `VERCEL=1`, which switches
+`pipeline.get_engine` to SQLAlchemy's `NullPool`. A pool held between requests
+can never be reused when the process does not outlive the request, and would
+just hold Postgres slots open for nothing. Set `SERVERLESS=true` by hand on any
+other serverless host.
+
+**Web app — Render free tier** (alternative; now requires a card on file).**
 
 - Build: `pip install -r requirements.txt`
 - Start: `uvicorn app:app --host 0.0.0.0 --port $PORT`
@@ -294,7 +314,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-196 tests, no network and no database required — they cover the Stage A rule
+201 tests, no network and no database required — they cover the Stage A rule
 branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold) and `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp

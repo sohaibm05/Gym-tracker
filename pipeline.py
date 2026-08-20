@@ -26,6 +26,7 @@ from typing import Any, Iterable, Optional, Sequence
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from rapidfuzz import fuzz
 from sqlalchemy import create_engine, text
+from sqlalchemy.pool import NullPool
 from sqlalchemy.engine import Connection, Engine
 
 try:  # Python 3.9+
@@ -75,6 +76,14 @@ DEFAULT_SESSION_HOUR = int(os.getenv("DEFAULT_SESSION_HOUR", "18"))
 
 # Window used by the /log duplicate-submission guard.
 DUPLICATE_WINDOW_MINUTES = int(os.getenv("DUPLICATE_WINDOW_MINUTES", "5"))
+
+# Serverless platforms hand each request its own short-lived process, so a
+# connection pool held between requests is never reused and only consumes
+# Postgres connection slots. Vercel sets VERCEL=1 itself; SERVERLESS is the
+# manual override for anywhere else.
+SERVERLESS = bool(os.getenv("VERCEL")) or os.getenv("SERVERLESS", "").strip().lower() in {
+    "1", "true", "yes", "on",
+}
 
 # Tokens that describe equipment or the muscle worked. When the ONLY difference
 # between two multi-word exercise names is tokens from this set, the names are
@@ -605,11 +614,19 @@ def _short_errors(exc: ValidationError) -> str:
 # --------------------------------------------------------------------------
 
 
-def get_engine(database_url: Optional[str] = None) -> Engine:
+def get_engine(database_url: Optional[str] = None, serverless: Optional[bool] = None) -> Engine:
     url = database_url or os.getenv("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL is not set")
-    # Free-tier Postgres drops idle connections; pre-ping avoids stale-handle errors.
+
+    if SERVERLESS if serverless is None else serverless:
+        # One connection per request, closed on release. Pooling across
+        # invocations is impossible when the process does not outlive them, and
+        # a retained pool would just hold Postgres slots open for nothing.
+        return create_engine(url, poolclass=NullPool, future=True)
+
+    # Long-running process: pool, and pre-ping because free-tier Postgres drops
+    # idle connections and a stale handle would otherwise surface as an error.
     return create_engine(url, pool_pre_ping=True, future=True)
 
 
