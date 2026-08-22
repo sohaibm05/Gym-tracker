@@ -133,6 +133,12 @@ class TestRendering:
                         "Volume by muscle group", "Pain flags"):
             assert heading in body
 
+    def test_weekly_volume_rows_name_both_ends_of_the_week(self):
+        """A Friday session lands under its Monday - the row must say so."""
+        body = charts.render_progress_body(self._data())
+        assert "2026-08-03 \u2013 2026-08-09" in body
+        assert "Week (Mon-Sun)" in body
+
     def test_every_chart_has_a_table_twin(self):
         """No value may be reachable only by hovering."""
         body = charts.render_progress_body(self._data())
