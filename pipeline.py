@@ -429,6 +429,26 @@ def local_to_utc(local_dt: datetime, timezone_name: Optional[str] = None) -> dat
     return aware.astimezone(_tz.utc)
 
 
+def local_today(timezone_name: Optional[str] = None) -> date:
+    """Today's date in the configured local zone, not the server's.
+
+    Every host this deploys to runs its containers on UTC, so `date.today()`
+    there is the UTC date - which is still yesterday for part of every local day
+    east of Greenwich. Writes and reads already route through LOCAL_TIMEZONE
+    (`local_to_utc`, `_local_day_bounds`), so the day boundary has to as well:
+    otherwise a late-night session is dated a day early, and at a Sunday
+    boundary that files it under the previous week entirely.
+
+    Resolved at call time for the same reason as `local_to_utc`.
+    """
+    from datetime import timezone as _tz
+
+    if ZoneInfo is None:  # pragma: no cover
+        raise RuntimeError("zoneinfo unavailable; Python 3.9+ required")
+    tz = ZoneInfo(timezone_name or LOCAL_TIMEZONE)
+    return datetime.now(_tz.utc).astimezone(tz).date()
+
+
 def resolve_logged_at(
     logged_at_local: Optional[str],
     session_date: date,

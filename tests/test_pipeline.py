@@ -654,6 +654,68 @@ class TestLocalDayBounds:
         assert first_end == second_start
 
 
+class TestLocalToday:
+    """The day boundary must come from LOCAL_TIMEZONE, not the server clock.
+
+    Every deploy target runs its containers on UTC, so `date.today()` there is
+    the UTC date - a day early for part of every local day east of Greenwich.
+    """
+
+    @staticmethod
+    def _frozen(moment_utc: datetime):
+        class _Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return moment_utc.astimezone(tz) if tz else moment_utc
+
+        return _Frozen
+
+    def test_utc_zone_matches_the_utc_date(self, monkeypatch):
+        monkeypatch.setattr(pipeline, "LOCAL_TIMEZONE", "UTC")
+        monkeypatch.setattr(
+            pipeline, "datetime", self._frozen(datetime(2026, 8, 21, 20, 30, tzinfo=timezone.utc))
+        )
+        assert pipeline.local_today() == date(2026, 8, 21)
+
+    def test_late_evening_utc_is_already_tomorrow_in_karachi(self, monkeypatch):
+        """20:30 UTC is 01:30 the next day in Karachi - the local date wins."""
+        monkeypatch.setattr(pipeline, "LOCAL_TIMEZONE", "Asia/Karachi")
+        monkeypatch.setattr(
+            pipeline, "datetime", self._frozen(datetime(2026, 8, 21, 20, 30, tzinfo=timezone.utc))
+        )
+        assert pipeline.local_today() == date(2026, 8, 22)
+
+    def test_a_sunday_night_session_is_not_filed_under_the_previous_week(self, monkeypatch):
+        """The failure this exists to prevent: a whole week's misplacement.
+
+        2026-08-23 is a Sunday. At 20:00 UTC it is already Monday in Karachi,
+        so the session belongs to the week starting 2026-08-24, not 2026-08-17.
+        """
+        import insights
+
+        monkeypatch.setattr(pipeline, "LOCAL_TIMEZONE", "Asia/Karachi")
+        monkeypatch.setattr(
+            pipeline, "datetime", self._frozen(datetime(2026, 8, 23, 20, 0, tzinfo=timezone.utc))
+        )
+        assert insights.week_start_for(pipeline.local_today()) == date(2026, 8, 24)
+
+    def test_zone_is_read_at_call_time_not_bound_at_import(self, monkeypatch):
+        monkeypatch.setattr(
+            pipeline, "datetime", self._frozen(datetime(2026, 8, 21, 20, 30, tzinfo=timezone.utc))
+        )
+        monkeypatch.setattr(pipeline, "LOCAL_TIMEZONE", "UTC")
+        assert pipeline.local_today() == date(2026, 8, 21)
+        monkeypatch.setattr(pipeline, "LOCAL_TIMEZONE", "Asia/Karachi")
+        assert pipeline.local_today() == date(2026, 8, 22)
+
+    def test_explicit_zone_argument_overrides_the_setting(self, monkeypatch):
+        monkeypatch.setattr(pipeline, "LOCAL_TIMEZONE", "UTC")
+        monkeypatch.setattr(
+            pipeline, "datetime", self._frozen(datetime(2026, 8, 21, 20, 30, tzinfo=timezone.utc))
+        )
+        assert pipeline.local_today("Asia/Karachi") == date(2026, 8, 22)
+
+
 class TestReplaceIsOptIn:
     def test_process_entry_defaults_to_adding(self):
         import inspect
