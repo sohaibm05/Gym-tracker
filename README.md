@@ -145,10 +145,38 @@ against a deterministic error - and `json_validate_failed` is exactly that.
 reasoning shares the completion budget with the answer. A long deliberation can
 leave nothing for the JSON, which the server then rejects as
 `json_validate_failed` with an empty `failed_generation`. `GROQ_REASONING_EFFORT`
-defaults to `low` and `GROQ_MAX_COMPLETION_TOKENS` to 8000 so there is room for
-both; extraction from text does not need deep deliberation. Both are sent via
-`extra_body`, so they work whatever `groq` SDK version is installed and are
-ignored by models that do not support them.
+defaults to `low` so there is room for both; extraction from text does not need
+deep deliberation. It is sent via `extra_body`, so it works whatever `groq` SDK
+version is installed and is ignored by models that do not support it.
+
+### The completion budget is sized per entry, not fixed
+
+Groq counts a request against the per-minute token limit as the prompt **plus
+the whole completion budget reserved** — spent or not. So a flat 8000-token
+reservation on a 1300-token prompt is a 9337-token request against the free
+tier's 8000 TPM ceiling, and it is refused with a 413 before a single token is
+generated. The size of the journal entry barely matters; almost all of that
+request is empty space held open for an answer that needs well under 2000.
+
+`completion_budget()` therefore sizes the reservation from the length of the
+entry and holds it under `GROQ_TPM_LIMIT`. A typical entry asks for roughly
+2900 tokens rather than 9337. `GROQ_MIN_COMPLETION_TOKENS` is a floor, because a
+budget too small to hold the reasoning plus the JSON truncates the answer, which
+surfaces downstream as a parse failure and hides the real cause.
+
+An entry whose prompt alone leaves no room for an answer is refused up front
+with a message saying to split it, rather than spending two calls to be told.
+
+### A rate limit is waited out, not retried into
+
+A token ceiling is a condition of the clock, so retrying instantly reproduces it
+exactly. On a 413 or 429 the retry waits — for as long as the server's
+`retry-after` advises, capped at `GROQ_MAX_RETRY_WAIT_SECONDS` so a web request
+cannot sit blocked indefinitely — and then asks for a smaller reservation as
+well, since a 413 means that one request was itself over the limit and no amount
+of waiting shrinks it. An ordinary failure retries immediately and keeps the
+full reservation: without JSON mode the model may wrap the object in prose, so
+the second attempt needs no less room than the first.
 
 ### Confidence is computed, not asked for
 
