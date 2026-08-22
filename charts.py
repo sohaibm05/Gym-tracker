@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import html
 import json
+from datetime import date, timedelta
 from typing import Any
 
 # Tokens are declared for both the OS setting and an explicit theme stamp, so a
@@ -144,6 +145,13 @@ PROGRESS_JS = """
     var d = new Date(iso + 'T00:00:00');
     return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
   }
+  // A weekly bucket is named by its Monday, so show the days it actually covers.
+  function weekRange(iso) {
+    var end = new Date(iso + 'T00:00:00');
+    end.setDate(end.getDate() + 6);
+    return shortDate(iso) + ' – ' +
+      end.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  }
   function niceMax(v) {
     if (v <= 0) return 1;
     var mag = Math.pow(10, Math.floor(Math.log10(v)));
@@ -185,7 +193,7 @@ PROGRESS_JS = """
   }
 
   // --- column chart: magnitude over time, one series ------------------------
-  function columns(host, rows, unit) {
+  function columns(host, rows, unit, labelFor) {
     var W = host.clientWidth || 320, H = 190;
     var padL = 42, padR = 10, padT = 12, padB = 26;
     var svg = el('svg', { width: W, height: H });
@@ -222,7 +230,7 @@ PROGRESS_JS = """
       // Hit target spans the whole band and the full height: ~24px minimum.
       var hit = el('rect', { x: padL + band * i, y: padT, width: band, height: ih,
         fill: 'transparent', style: 'cursor:pointer' });
-      interactive(hit, 'Week of ' + shortDate(r[0]), compact(v), unit);
+      interactive(hit, labelFor ? labelFor(r[0]) : shortDate(r[0]), compact(v), unit);
       svg.appendChild(hit);
 
       if (i === rows.length - 1 || i % Math.ceil(rows.length / 4) === 0) {
@@ -363,7 +371,7 @@ PROGRESS_JS = """
     document.querySelectorAll('[data-chart]').forEach(function (host) {
       var kind = host.getAttribute('data-chart');
       if (kind === 'volume' && DATA.weekly_volume.length) {
-        columns(host, DATA.weekly_volume, 'kg');
+        columns(host, DATA.weekly_volume, 'kg', weekRange);
       } else if (kind === 'bodyweight' && DATA.bodyweight.length) {
         lineChart(host, DATA.bodyweight, 'kg');
       } else if (kind === 'muscle' && DATA.muscle_volume.length) {
@@ -399,6 +407,17 @@ def _fmt(value: Any, digits: int = 0) -> str:
     if isinstance(value, float) and digits == 0:
         value = round(value)
     return f"{value:,.{digits}f}" if isinstance(value, (int, float)) else str(value)
+
+
+def _week_range(iso_monday: str) -> str:
+    """`2026-08-17` -> `2026-08-17 – 2026-08-23`.
+
+    A week is bucketed under the Monday it starts on, so a session logged on the
+    Friday lands under that Monday's row. Naming the row by its Monday alone
+    reads like a wrong date; naming both ends says which days it covers.
+    """
+    monday = date.fromisoformat(iso_monday)
+    return f"{iso_monday} – {(monday + timedelta(days=6)).isoformat()}"
 
 
 def _tile(label: str, value: str, delta: str = "", up_is_good: bool = False) -> str:
@@ -470,10 +489,11 @@ def render_progress_body(data: dict[str, Any]) -> str:
 
     volume_card = _card(
         "Weekly volume",
-        f"Working sets only, weight x reps. Last {data['weeks']} weeks.",
+        f"Working sets only, weight x reps. Last {data['weeks']} weeks, "
+        "each running Monday to Sunday.",
         '<div class="plot" data-chart="volume"></div>',
-        _table(["Week starting", "Volume (kg)"],
-               [[week, _fmt(value)] for week, value in data["weekly_volume"]],
+        _table(["Week (Mon-Sun)", "Volume (kg)"],
+               [[_week_range(week), _fmt(value)] for week, value in data["weekly_volume"]],
                "Table view"),
     )
 
