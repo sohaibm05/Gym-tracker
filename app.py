@@ -42,13 +42,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # the reason instead.
 _STARTUP_ERROR: Optional[str] = None
 try:
-    import insights  # noqa: E402 - must follow the sys.path bootstrap above
+    import charts  # noqa: E402 - must follow the sys.path bootstrap above
+    import insights  # noqa: E402
     import pipeline  # noqa: E402
 except Exception:  # noqa: BLE001 - report anything that stops the app booting
     import traceback
 
     _STARTUP_ERROR = traceback.format_exc()
-    insights = pipeline = None  # type: ignore[assignment]
+    charts = insights = pipeline = None  # type: ignore[assignment]
 
 logging.basicConfig(
     level=pipeline.env("LOG_LEVEL", "INFO").upper() if pipeline else "INFO",
@@ -160,7 +161,7 @@ _STYLE = """
 :root { color-scheme: light dark; }
 * { box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-       margin: 0; padding: 1rem; max-width: 40rem; margin-inline: auto; line-height: 1.5; }
+       margin: 0; padding: 1rem; max-width: 46rem; margin-inline: auto; line-height: 1.5; }
 h1 { font-size: 1.35rem; margin: 0 0 1rem; }
 h2 { font-size: 1.1rem; margin: 1.4rem 0 .5rem; }
 label { display: block; font-weight: 600; margin: .9rem 0 .3rem; }
@@ -180,17 +181,21 @@ pre { white-space: pre-wrap; word-wrap: break-word; }
 """
 
 
-def _page(title: str, body: str) -> HTMLResponse:
+def _page(title: str, body: str, extra_css: str = "", extra_js: str = "") -> HTMLResponse:
+    css = f"<style>{_STYLE}{extra_css}</style>"
+    # Deferred so the markup the charts measure exists before the script runs.
+    js = f"<script>{extra_js}</script>" if extra_js else ""
     return HTMLResponse(
         f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(title)}</title>
-<style>{_STYLE}</style>
+{css}
 </head><body>
-<nav><a href="/">Log entry</a><a href="/weekly-report">Weekly report</a></nav>
+<nav><a href="/">Log entry</a><a href="/progress">Progress</a><a href="/weekly-report">Weekly report</a></nav>
 {body}
+{js}
 </body></html>"""
     )
 
@@ -353,6 +358,21 @@ async def log_entry(
     return _page(
         "Result",
         f'<h1>Result</h1>{_render_result(result, parsed_date)}<p><a href="/">Log another</a></p>',
+    )
+
+
+@app.get("/progress", response_class=HTMLResponse)
+async def progress(_user: str = Depends(require_auth)) -> HTMLResponse:
+    """Charts over the logged data. Every figure is computed in code, as in the
+    weekly report - this page plots the same Stage A numbers."""
+    weeks = insights.ANALYSIS_WEEKS if insights.ANALYSIS_WEEKS >= 8 else 12
+    data = insights.build_dashboard(get_engine(), weeks=weeks)
+    logger.info("event=progress_rendered weeks=%d has_data=%s", weeks, data["has_data"])
+    return _page(
+        "Progress",
+        charts.render_progress_body(data),
+        extra_css=charts.PROGRESS_CSS,
+        extra_js=charts.PROGRESS_JS,
     )
 
 

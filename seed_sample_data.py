@@ -66,15 +66,19 @@ def seed(engine, week_start: date) -> None:
                 rows = [
                     {
                         "exercise_id": exercise_id, "logged_at": logged_at,
-                        "weight_kg": warmup_kg, "reps": 12, "set_number": 1,
+                        "weight_kg": warmup_kg, "reps": 12, "cheat_reps": 0, "set_number": 1,
                         "is_warmup": True, "is_dropset": False, "pain_flag": False,
                         "notes": "warm up", "raw_source": raw, "extraction_confidence": 1.0,
                     }
                 ]
                 for set_number, reps in enumerate(reps_list, start=2):
+                    # A couple of cheated reps on the last set of the isolation
+                    # lift, so the clean-rep path is exercised by seeded data too.
+                    cheat = 2 if (name == "Lateral Raise" and set_number == len(reps_list) + 1) else 0
                     rows.append({
                         "exercise_id": exercise_id, "logged_at": logged_at,
-                        "weight_kg": weight, "reps": reps, "set_number": set_number,
+                        "weight_kg": weight, "reps": reps, "cheat_reps": cheat,
+                        "set_number": set_number,
                         "is_warmup": False, "is_dropset": False, "pain_flag": pain,
                         "notes": "shoulder discomfort noted" if pain else None,
                         "raw_source": raw, "extraction_confidence": 1.0,
