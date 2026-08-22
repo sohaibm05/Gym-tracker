@@ -36,7 +36,9 @@ Notes app (unchanged)
 | `app.py` | FastAPI web app — the phone-facing form, plus the weekly-report button |
 | `insights.py` | Weekly report. Stage A computes every number; Stage B only writes prose |
 | `charts.py` | The `/progress` page - inline-SVG charts, no chart library |
+| `muscle_groups.py` | Static exercise-name -> primary muscle group tables and lookup |
 | `seed_sample_data.py` | Seeds three weeks of realistic data so the report can be tried out |
+| `backfill_muscle_groups.py` | One-off: fills `muscle_group` for exercises logged before the lookup existed |
 | `tests/` | Unit tests for the Stage A rules and the confidence / fuzzy-match logic |
 | `sample_entry.txt` | A messy journal entry in the real style, for trying the CLI |
 
@@ -218,6 +220,51 @@ Unknown words fail closed, into a separate row.
 
 Both names must have at least two tokens for the subset bonus, so "Curl" never
 absorbs "Leg Curl". Threshold is 85, tunable via `FUZZY_MATCH_THRESHOLD`.
+
+### Muscle groups come from a table, not the model
+
+`exercises.muscle_group` is written by `get_or_create_exercise` only on INSERT,
+so it is decided once per distinct movement and then never revisited — a few
+dozen decisions over the life of the tool, not one per set. That makes it a
+lookup, not a judgement, and `muscle_groups.py` holds the table.
+
+Asking the model instead would have cost nothing in tokens — the field would
+ride along in the extraction JSON that is already requested. The reason not to
+is `GROQ_REASONING_EFFORT=low`: gpt-oss shares one completion budget between its
+reasoning and its answer, so adding a *classification* subtask to an
+*extraction* task buys a `json_validate_failed` risk on long entries in exchange
+for an answer a `dict` already knows. Asking the user instead would tax every
+log for information the exercise name already carries.
+
+Resolution runs four passes, most specific first: the full name against the
+table, the name with equipment tokens stripped, a muscle named in the name, then
+the movement verb. The table is consulted first because the obvious heuristic is
+wrong on exactly the names that matter — `Chest Supported Row` is a back
+exercise, `Leg Raise` is a core exercise, and `Leg Curl` is not a biceps
+exercise. `press` and `raise` are deliberately absent from the verb fallback:
+they span chest, shoulders and legs, so a guess would mislabel about a third of
+what it caught.
+
+Unrecognized names resolve to `None`, stored as NULL and reported as
+"Unassigned" — the same fail-closed rule the qualifier allowlist uses. Nothing
+is ever guessed onto the axis the weekly report's volume figures are grouped by.
+
+**Primary mover only.** The column is a single `TEXT` and the chart sums over
+it. A bench press is chest, triceps and front delts; recording all three would
+make "volume by muscle group" stop summing to actual total volume.
+
+`EQUIPMENT_TOKENS` is looser than the identity-matching `QUALIFIER_TOKENS`
+above, on purpose: seated and standing calf raises are two exercises that must
+keep separate progress histories but share one muscle group. Stripping a token
+there never merges two exercises, it only lets them share a lookup key. Genuine
+variations — `incline`, `close grip`, `romanian` — stay out of it, because they
+change which muscle leads the lift.
+
+Exercises logged before any of this existed carry NULL. `python
+backfill_muscle_groups.py --dry-run` shows what the table would fill in;
+without the flag it writes them. It only ever touches NULL rows, so a
+hand-corrected group is never overwritten, and it lists the names it did not
+recognize — that list is what to add to `EXERCISE_MUSCLE_GROUPS`.
 
 ### Cheat reps are counted, not flagged
 
@@ -411,12 +458,14 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-201 tests, no network and no database required — they cover the Stage A rule
+545 tests, no network and no database required — they cover the Stage A rule
 branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
-threshold) and `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
-resolution, and JSON-mode retry behaviour. These are pure functions, so they are
-cheap to cover, and they are exactly the code where a silent bug produces a wrong
+threshold), `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
+resolution, and JSON-mode retry behaviour, and the muscle-group tables — both
+their resolution cases and mechanical guards that every key is in the normalized
+form lookup actually produces. These are pure functions, so they are cheap to
+cover, and they are exactly the code where a silent bug produces a wrong
 training recommendation that nobody notices.
 
 ## Not built (by design)

@@ -29,6 +29,8 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 from sqlalchemy.engine import Connection, Engine
 
+import muscle_groups
+
 try:  # Python 3.9+
     from zoneinfo import ZoneInfo
 except ImportError:  # pragma: no cover - Python < 3.9 is unsupported anyway
@@ -297,6 +299,16 @@ def normalize_tokens(name: str) -> list[str]:
 
 # Compared against singularized tokens, so the qualifier set is singularized too.
 _QUALIFIER_TOKENS_SINGULAR = frozenset(_singularize(t) for t in QUALIFIER_TOKENS)
+
+
+def resolve_muscle_group(name: str) -> Optional[str]:
+    """Primary muscle group for an exercise name, or None when unrecognized.
+
+    Table lookup only - see `muscle_groups` for why this is not asked of the
+    LLM. Normalization lives here so `muscle_groups` stays a leaf module with no
+    import back into this one.
+    """
+    return muscle_groups.group_for_tokens(normalize_tokens(name))
 
 
 def name_match_score(proposed: str, existing: str) -> float:
@@ -962,12 +974,20 @@ def get_or_create_exercise(
     if matched is not None:
         return known[matched], matched, False
 
+    # An explicit group from the caller wins; otherwise look the name up in the
+    # static table. Either may be None, which stores NULL and reports as
+    # "Unassigned" rather than a guess.
+    if not muscle_group:
+        muscle_group = resolve_muscle_group(proposed_name)
+
     row = conn.execute(
         text(
             """
             INSERT INTO exercises (name, muscle_group)
             VALUES (:name, :muscle_group)
-            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+            ON CONFLICT (name) DO UPDATE
+                SET muscle_group = COALESCE(exercises.muscle_group,
+                                            EXCLUDED.muscle_group)
             RETURNING exercise_id
             """
         ),
