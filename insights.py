@@ -887,6 +887,50 @@ def weekly_volume_series(
     return [(week, round(totals[week], 1)) for week in week_starts]
 
 
+def trend_slope_per_week(points: list[tuple[date, float]]) -> Optional[float]:
+    """Least-squares slope of a series, in units per week.
+
+    Answers "how fast am I improving on this lift", which the shape of the line
+    alone does not: two lifts can both rise while one is gaining three times as
+    fast. Returns None below two points, or when every session lands on the same
+    day and the slope would be a division by zero.
+    """
+    if len(points) < 2:
+        return None
+    origin = points[0][0]
+    xs = [(day - origin).days for day, _ in points]
+    ys = [value for _, value in points]
+    n = len(xs)
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    denominator = sum((x - mean_x) ** 2 for x in xs)
+    if denominator == 0:
+        return None
+    slope_per_day = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denominator
+    return round(slope_per_day * 7, 2)
+
+
+def trend_endpoints(
+    points: list[tuple[date, float]]
+) -> Optional[tuple[tuple[date, float], tuple[date, float]]]:
+    """The fitted line's two endpoints, from the same fit as the slope.
+
+    Computed here rather than in the browser so the line drawn and the rate
+    quoted beside it come from one calculation and cannot disagree.
+    """
+    slope = trend_slope_per_week(points)
+    if slope is None:
+        return None
+    origin = points[0][0]
+    span = (points[-1][0] - origin).days
+    mean_y = sum(value for _, value in points) / len(points)
+    mean_x = sum((day - origin).days for day, _ in points) / len(points)
+    per_day = slope / 7
+    start = mean_y + (0 - mean_x) * per_day
+    end = mean_y + (span - mean_x) * per_day
+    return (points[0][0], round(start, 2)), (points[-1][0], round(end, 2))
+
+
 def exercise_e1rm_series(
     records: Iterable[SetRecord], limit: int = 6, min_sessions: int = 2
 ) -> list[tuple[str, list[tuple[date, float]]]]:
@@ -971,7 +1015,15 @@ def build_dashboard(engine: Engine, weeks: int = 12, today: Optional[date] = Non
         "weekly_volume": [[week.isoformat(), value] for week, value in
                           weekly_volume_series(records, week_starts)],
         "exercise_e1rm": [
-            {"exercise": name, "points": [[day.isoformat(), value] for day, value in points]}
+            {
+                "exercise": name,
+                "points": [[day.isoformat(), value] for day, value in points],
+                "slope_per_week": trend_slope_per_week(points),
+                "trend": (
+                    [[day.isoformat(), value] for day, value in trend_endpoints(points)]
+                    if trend_endpoints(points) else None
+                ),
+            }
             for name, points in exercise_e1rm_series(records)
         ],
         "bodyweight": [[day.isoformat(), value] for day, value in bodyweight],

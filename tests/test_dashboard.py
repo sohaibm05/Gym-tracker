@@ -167,3 +167,78 @@ class TestRendering:
         would make the tooltip an injection point."""
         assert not re.search(r"\.innerHTML\s*[=+]", charts.PROGRESS_JS)
         assert "textContent" in charts.PROGRESS_JS
+
+
+# --------------------------------------------------------------------------
+# Trend: the rate of improvement, which the shape of a line does not give
+# --------------------------------------------------------------------------
+
+
+class TestTrendSlope:
+    def _series(self, values, step_days=7):
+        return [(MONDAY + timedelta(days=i * step_days), v) for i, v in enumerate(values)]
+
+    def test_steady_gain(self):
+        assert insights.trend_slope_per_week(self._series([60, 62.5, 65])) == 2.5
+
+    def test_flat_series_is_zero_not_none(self):
+        """Zero is a real answer - "you are not progressing" is information."""
+        assert insights.trend_slope_per_week(self._series([60, 60, 60])) == 0.0
+
+    def test_decline_is_negative(self):
+        assert insights.trend_slope_per_week(self._series([60, 58, 56])) == -2.0
+
+    def test_fits_through_noise(self):
+        """Two lifts can both end higher while one is gaining far faster; the
+        endpoints alone cannot tell them apart."""
+        slope = insights.trend_slope_per_week(self._series([60, 64, 62, 68]))
+        assert 1.5 < slope < 3.0
+
+    def test_endpoints_ignored_in_favour_of_the_whole_series(self):
+        spiky = self._series([60, 75, 61, 62])       # one outlier session
+        assert insights.trend_slope_per_week(spiky) < 5.0
+
+    def test_single_point_has_no_slope(self):
+        assert insights.trend_slope_per_week(self._series([60])) is None
+
+    def test_all_points_on_one_day_has_no_slope(self):
+        same_day = [(MONDAY, 60.0), (MONDAY, 62.0)]
+        assert insights.trend_slope_per_week(same_day) is None
+
+    def test_daily_spacing_still_reports_per_week(self):
+        daily = self._series([60, 61, 62, 63, 64, 65, 66, 67], step_days=1)
+        assert insights.trend_slope_per_week(daily) == 7.0
+
+
+class TestTrendEndpoints:
+    def test_endpoints_match_the_quoted_slope(self):
+        """Drawn line and quoted rate come from one fit, so they cannot disagree."""
+        points = [(MONDAY + timedelta(days=i * 7), v) for i, v in enumerate([60, 64, 62, 68])]
+        slope = insights.trend_slope_per_week(points)
+        (start_day, start), (end_day, end) = insights.trend_endpoints(points)
+        weeks = (end_day - start_day).days / 7
+        assert (end - start) / weeks == pytest.approx(slope, abs=0.02)
+
+    def test_none_when_there_is_no_fit(self):
+        assert insights.trend_endpoints([(MONDAY, 60.0)]) is None
+
+    def test_endpoints_span_the_series(self):
+        points = [(MONDAY + timedelta(days=i * 7), v) for i, v in enumerate([60, 62, 64])]
+        (first, _), (last, _) = insights.trend_endpoints(points)
+        assert first == points[0][0] and last == points[-1][0]
+
+
+class TestTrendRendering:
+    def test_rate_is_shown_beside_each_exercise(self):
+        data = TestRendering()._data()
+        data["exercise_e1rm"][0]["slope_per_week"] = 1.63
+        data["exercise_e1rm"][0]["trend"] = [[MONDAY.isoformat(), 80.0],
+                                             [(MONDAY + timedelta(7)).isoformat(), 82.0]]
+        body = charts.render_progress_body(data)
+        assert "+1.6 kg/week" in body
+
+    def test_missing_slope_says_so_rather_than_showing_a_number(self):
+        data = TestRendering()._data()
+        data["exercise_e1rm"][0]["slope_per_week"] = None
+        data["exercise_e1rm"][0]["trend"] = None
+        assert "not enough sessions" in charts.render_progress_body(data)

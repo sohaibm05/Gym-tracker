@@ -255,6 +255,11 @@ number on a chart and the same number in the report cannot drift apart.
 
 A few decisions that are easy to get wrong:
 
+- **Each exercise carries a fitted trend line and its slope in kg/week.** The
+  shape of a line does not give the rate: two lifts can both end higher while
+  one is gaining three times as fast. The line drawn and the rate quoted beside
+  it come from the same least-squares fit, computed server-side, so they cannot
+  disagree.
 - **Every chart plots one series**, so there is no categorical palette and no
   legend - the card title names what is plotted. The single hue is validated
   against both the light and dark chart surfaces.

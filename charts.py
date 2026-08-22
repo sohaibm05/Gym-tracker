@@ -237,7 +237,7 @@ PROGRESS_JS = """
   }
 
   // --- line chart: trend over time, one series ------------------------------
-  function lineChart(host, rows, unit, height) {
+  function lineChart(host, rows, unit, height, trend) {
     var W = host.clientWidth || 320, H = height || 190;
     var padL = 42, padR = 30, padT = 14, padB = 24;
     var svg = el('svg', { width: W, height: H });
@@ -259,6 +259,10 @@ PROGRESS_JS = """
     var Y = function (v) { return padT + ih - ((v - lo) / (hi - lo)) * ih; };
 
     var ticks = flat ? [vals[0]] : [lo, hi];
+    if (trend) {   // keep a steep fit inside the plot rather than clipping it
+      var tlo = Math.min(trend[0][1], trend[1][1]), thi = Math.max(trend[0][1], trend[1][1]);
+      if (tlo < lo) lo = tlo; if (thi > hi) hi = thi;
+    }
     ticks.forEach(function (v) {
       var y = Y(v);
       svg.appendChild(el('line', { x1: padL, y1: y, x2: W - padR, y2: y,
@@ -269,9 +273,22 @@ PROGRESS_JS = """
       svg.appendChild(t);
     });
 
+    if (trend) {
+      // Context, not a second series: de-emphasis ink, drawn under the data.
+      // The rate it represents is stated in the card subtitle, so it needs no
+      // legend entry of its own.
+      svg.appendChild(el('line', { x1: X(0), y1: Y(trend[0][1]),
+        x2: X(rows.length - 1), y2: Y(trend[1][1]),
+        stroke: tok('--ink-muted'), 'stroke-width': 2, 'stroke-linecap': 'round',
+        'stroke-opacity': 0.45 }));
+    }
     var d = rows.map(function (r, i) { return (i ? 'L' : 'M') + X(i) + ',' + Y(r[1]); }).join(' ');
-    svg.appendChild(el('path', { d: d + ' L' + X(rows.length - 1) + ',' + (padT + ih) +
-      ' L' + X(0) + ',' + (padT + ih) + ' Z', fill: tok('--series-1'), 'fill-opacity': 0.10 }));
+    if (!flat) {
+      // A constant series gets no area fill: the wash would hang below a
+      // mid-plot line and read as bottom-heavy magnitude that isn't varying.
+      svg.appendChild(el('path', { d: d + ' L' + X(rows.length - 1) + ',' + (padT + ih) +
+        ' L' + X(0) + ',' + (padT + ih) + ' Z', fill: tok('--series-1'), 'fill-opacity': 0.10 }));
+    }
     svg.appendChild(el('path', { d: d, fill: 'none', stroke: tok('--series-1'),
       'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
 
@@ -354,7 +371,7 @@ PROGRESS_JS = """
       } else if (kind.indexOf('e1rm:') === 0) {
         var idx = parseInt(kind.split(':')[1], 10);
         var s = DATA.exercise_e1rm[idx];
-        if (s) lineChart(host, s.points, 'kg', 150);
+        if (s) lineChart(host, s.points, 'kg', 150, s.trend);
       }
     });
   }
@@ -464,9 +481,12 @@ def render_progress_body(data: dict[str, Any]) -> str:
     for index, series in enumerate(data["exercise_e1rm"]):
         first, last = series["points"][0][1], series["points"][-1][1]
         change = last - first
+        slope = series.get("slope_per_week")
+        rate = f"{slope:+.1f} kg/week" if slope is not None else "not enough sessions"
         smalls.append(
             f'<div class="small"><h3>{html.escape(series["exercise"])}</h3>'
-            f'<p class="sub">{change:+.1f} kg over {len(series["points"])} sessions</p>'
+            f'<p class="sub">{rate} &middot; {change:+.1f} kg over '
+            f'{len(series["points"])} sessions</p>'
             f'<div class="plot" data-chart="e1rm:{index}"></div></div>'
         )
         for day, value in series["points"]:
@@ -474,7 +494,8 @@ def render_progress_body(data: dict[str, Any]) -> str:
 
     e1rm_card = _card(
         "Estimated 1RM by exercise",
-        "Epley, from clean reps only - cheat reps are excluded. Most-trained first.",
+        "Epley, from clean reps only. The grey line is the fitted trend; the rate "
+        "beside each name is its slope.",
         f'<div class="smalls">{"".join(smalls)}</div>' if smalls
         else '<p class="empty">Needs at least two sessions of an exercise to show a trend.</p>',
         _table(["Exercise", "Session", "e1RM (kg)"], e1rm_rows, "Table view") if e1rm_rows else "",
