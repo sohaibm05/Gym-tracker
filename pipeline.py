@@ -83,10 +83,28 @@ GROQ_MODEL = env("GROQ_MODEL", "openai/gpt-oss-120b")
 # gpt-oss models reason before answering, at "medium" effort by default. Reasoning
 # shares the completion budget with the answer, so a long deliberation can leave
 # nothing for the JSON - which the server rejects as json_validate_failed with an
-# empty failed_generation. Low effort plus a generous budget keeps room for both;
-# this is extraction from text, not a task needing deep deliberation.
+# empty failed_generation. Low effort keeps room for both; this is extraction
+# from text, not a task needing deep deliberation.
 GROQ_REASONING_EFFORT = env("GROQ_REASONING_EFFORT", "low")
+
+# Groq counts a request against the per-minute token limit as the prompt PLUS
+# the whole completion budget reserved - spent or not. A flat 8000-token
+# reservation on a ~1300-token prompt is therefore a 9337-token request against
+# an 8000 TPM ceiling: rejected with a 413 before a single token is generated,
+# on an entry whose answer needs well under 2000. So the reservation is sized
+# per entry (see completion_budget) and held under this ceiling.
+GROQ_TPM_LIMIT = int(env("GROQ_TPM_LIMIT", "8000"))
+
+# Upper and lower bounds on that per-entry reservation. The floor exists because
+# a budget too small to hold reasoning plus the JSON truncates the answer, which
+# surfaces as a confusing parse failure rather than an honest "too big".
 GROQ_MAX_COMPLETION_TOKENS = int(env("GROQ_MAX_COMPLETION_TOKENS", "8000"))
+GROQ_MIN_COMPLETION_TOKENS = int(env("GROQ_MIN_COMPLETION_TOKENS", "1200"))
+
+# Longest pause allowed before the retry when the server reports a rate limit.
+# Bounded because a web request cannot sit blocked indefinitely - Vercel cuts
+# the function off at 60s regardless.
+GROQ_MAX_RETRY_WAIT_SECONDS = float(env("GROQ_MAX_RETRY_WAIT_SECONDS", "20"))
 
 # Single fixed timezone: this is a single-user personal tool, so local wall-clock
 # time in the journal is always interpreted in this zone and stored as UTC.
@@ -124,73 +142,52 @@ QUALIFIER_TOKENS = frozenset(
 )
 
 _SYSTEM_PROMPT = """\
-You extract structured training data from messy free-text gym journal entries.
-The text is voice-to-text style: typos, missing punctuation, informal times, and
-personal commentary mixed in with the actual numbers.
+You extract structured training data from messy free-text gym journal entries:
+voice-to-text style, with typos, missing punctuation, informal times and personal
+commentary mixed in with the numbers.
 
-Return ONLY a JSON object with exactly this shape:
+Return ONLY this JSON object:
 
-{
-  "sets": [
-    {
-      "exercise_name": "Chest Bench Press",
-      "weight_kg": 24.0,
-      "reps": 12,
-      "cheat_reps": 0,
-      "set_number": 2,
-      "is_warmup": false,
-      "is_dropset": false,
-      "pain_flag": false,
-      "notes": "almost died",
-      "logged_at_local": "2026-08-14T18:20:00",
-      "raw_span": "Chest bench press 24kg 12 reps"
-    }
-  ],
-  "bodyweight": null
-}
+{"sets": [{"exercise_name": "Chest Bench Press", "weight_kg": 24.0, "reps": 12,
+"cheat_reps": 0, "set_number": 2, "is_warmup": false, "is_dropset": false,
+"pain_flag": false, "notes": "almost died", "logged_at_local":
+"2026-08-14T18:20:00", "raw_span": "Chest bench press 24kg 12 reps"}],
+"bodyweight": {"weight_kg": 82.4, "body_fat_pct": null, "notes": null,
+"logged_at_local": "2026-08-14T07:00:00", "raw_span": "was 82.4kg this morning"}}
 
-"bodyweight" is either null or:
-  {"weight_kg": 82.4, "body_fat_pct": null, "notes": null,
-   "logged_at_local": "2026-08-14T07:00:00", "raw_span": "was 82.4kg this morning"}
+"bodyweight" is null when the entry gives no bodyweight.
 
 Rules:
 - One object per SET performed. "3 sets of 10 at 40kg" is three set objects.
-- Normalize exercise names to title case and fix typos:
-  "ches bent prees" -> "Chest Bench Press", "shoulder pres" -> "Shoulder Press".
-  Use the same name for the same movement everywhere in the entry.
-- weight_kg is per-side load as written. "12.5kg each hand" -> 12.5.
-- cheat_reps: how many reps in THIS set were completed with cheating, momentum
-  or assistance. "10 reps 3 were cheat" -> reps 10, cheat_reps 3. Also covers
-  "3 cheat", "last 2 were assisted", "2 forced reps", "final rep was a grinder
-  with help". Default 0. cheat_reps must never exceed reps.
-- "each hand" / "per hand" / "each side" applies to every LATER set of the same
-  exercise in the entry even when written only once. Keep reporting the per-hand
-  number for those sets.
-- set_number counts within that exercise, starting at 1, in the order written.
-- is_warmup true when the text says warm up / warmup / "warm up ish" / similar.
-- is_dropset true only when a drop set is explicitly described.
-- pain_flag true on ANY mention of pain, discomfort, injury, tweak, strain,
-  soreness that reads as a problem, or "felt something".
-  - Effort is NOT pain. "almost died", "brutal", "killed me", "barely got it",
-    "struggled", "tough", "burned" describe how hard a set was, not an injury.
-    Leave pain_flag false for those.
-  - If the mention names an exercise, apply it to every working set of that
-    exercise.
-  - If it names no exercise ("shoulder pain noticed toward the end"), apply it
-    to the sets of the exercise described most recently BEFORE the mention in
-    the text. A body part is not an exercise: "shoulder pain" does not mean the
-    shoulder press.
-  - Never spread a single pain mention across every exercise in the entry.
-- logged_at_local: combine SESSION_DATE (given below) with any time marker in
-  the text. A bare time with no am/pm that sits in a workout sequence is
-  afternoon or evening: "4:35" -> 16:35, "6:20ish" -> 18:20. Read a time as
-  morning only when the text says so ("this morning", "am", "before work").
-  Format "YYYY-MM-DDTHH:MM:SS", no timezone. If no time marker applies to a
-  set, use null.
-- raw_span: the exact substring of the input this set was read from. Copy it
-  verbatim; do not paraphrase. This is used to verify the extraction.
-- NEVER invent data. If a weight, rep count, or exercise name is not in the
-  text, use null. Do not guess a plausible value. Missing fields are handled
+- exercise_name: title case, typos fixed ("ches bent prees" -> "Chest Bench
+  Press"). Use the same name for the same movement throughout the entry.
+- weight_kg: per-side load as written. "12.5kg each hand" -> 12.5. "each hand" /
+  "per hand" / "each side", written once, still applies to every LATER set of
+  that exercise - keep reporting the per-hand number.
+- set_number: counts within that exercise from 1, in the order written.
+- cheat_reps: reps in THIS set completed with cheating, momentum or assistance
+  ("10 reps 3 were cheat" -> reps 10, cheat_reps 3; also "last 2 were assisted",
+  "2 forced reps", "final rep was a grinder with help"). Default 0, never more
+  than reps.
+- is_warmup: true when the text says warm up / warmup / "warm up ish" / similar.
+- is_dropset: true only when a drop set is explicitly described.
+- pain_flag: true on ANY mention of pain, discomfort, injury, tweak, strain,
+  soreness that reads as a problem, or "felt something". Effort is NOT pain -
+  "almost died", "brutal", "killed me", "barely got it", "struggled", "tough",
+  "burned" describe difficulty, so leave those false. If the mention names an
+  exercise, flag every working set of it. If it names none ("shoulder pain
+  noticed toward the end"), flag the exercise described most recently BEFORE the
+  mention - a body part is not an exercise, so "shoulder pain" does not mean the
+  shoulder press. Never spread one mention across every exercise in the entry.
+- logged_at_local: SESSION_DATE combined with any time marker in the text,
+  formatted "YYYY-MM-DDTHH:MM:SS", no timezone. A bare time with no am/pm inside
+  a workout sequence is afternoon or evening: "4:35" -> 16:35, "6:20ish" ->
+  18:20. Read a time as morning only when the text says so ("this morning",
+  "am", "before work"). null when no marker applies to a set.
+- raw_span: the exact substring of the input this set was read from, copied
+  verbatim, never paraphrased. It is used to verify the extraction.
+- NEVER invent data. A weight, rep count or exercise name that is not in the
+  text is null - never a plausible guess. Missing fields are handled
   downstream; fabricated ones are not.
 - Do not report a confidence score. Confidence is computed separately.
 """
@@ -484,6 +481,79 @@ class ExtractionError(RuntimeError):
     """Raised when extraction fails after the retry."""
 
 
+# Characters per token, for sizing only. Prose runs about 4; the JSON coming
+# back is punctuation-dense and runs nearer 3. Deliberately pessimistic - an
+# over-estimate costs a little headroom, an under-estimate truncates an answer.
+_CHARS_PER_TOKEN = 3.0
+
+# Fixed cost of an answer: reasoning at low effort, plus the JSON scaffolding
+# around the sets.
+_ANSWER_FIXED_TOKENS = 700
+
+# Answer tokens per character of journal text. One terse line ("Chest bench
+# press 24kg 12 reps", 30 chars) expands into a set object of roughly 110
+# tokens, so the answer is several times the size of the text it came from.
+_ANSWER_TOKENS_PER_CHAR = 2.5
+
+# Per-request overhead of the chat template itself (role markers, and for
+# gpt-oss the harmony channel scaffolding).
+_CHAT_OVERHEAD_TOKENS = 80
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token count for a string. Budgeting only, never billing."""
+    return int(len(text) / _CHARS_PER_TOKEN) + 1
+
+
+def estimate_prompt_tokens(raw_text: str, session_date: date) -> int:
+    """What the request will cost before the completion budget is added."""
+    messages = _build_messages(raw_text, session_date)
+    return sum(estimate_tokens(m["content"]) for m in messages) + _CHAT_OVERHEAD_TOKENS
+
+
+def completion_budget(raw_text: str, prompt_tokens: int) -> int:
+    """Completion tokens to reserve for one extraction call.
+
+    Sized to the entry rather than fixed flat, then held under the per-minute
+    ceiling, because Groq counts the reservation toward TPM whether or not it is
+    spent - so an oversized one is refused before generation starts.
+
+    Only one call is fitted into the window, not the call plus its retry. Making
+    room for both would mean halving the reservation on exactly the long entries
+    that need it most, and a truncated answer costs more than a retry that has
+    to wait for the window to roll over - which extract_entities now does.
+    """
+    ceiling = GROQ_TPM_LIMIT - prompt_tokens
+    if ceiling < GROQ_MIN_COMPLETION_TOKENS:
+        # The prompt alone leaves no room for a usable answer. Reserving less
+        # than the floor would truncate it, which reads downstream as a parse
+        # failure and hides the real cause, so send the floor and let the server
+        # say plainly that the request is too large. entry_fits_in_window() is
+        # what stops extract_entities getting this far in the first place.
+        logger.warning(
+            "A ~%d-token prompt leaves only %d of the %d TPM limit for the answer, "
+            "under the %d floor; sending the floor anyway.",
+            prompt_tokens, max(0, ceiling), GROQ_TPM_LIMIT, GROQ_MIN_COMPLETION_TOKENS,
+        )
+        return GROQ_MIN_COMPLETION_TOKENS
+
+    needed = _ANSWER_FIXED_TOKENS + int(len(raw_text) * _ANSWER_TOKENS_PER_CHAR)
+    return max(
+        GROQ_MIN_COMPLETION_TOKENS,
+        min(needed, GROQ_MAX_COMPLETION_TOKENS, ceiling),
+    )
+
+
+def entry_fits_in_window(prompt_tokens: int) -> bool:
+    """Whether an entry this long can be extracted within the TPM limit at all.
+
+    An entry can be long enough that its prompt plus the smallest usable answer
+    exceeds the whole per-minute allowance. No reservation size rescues that, so
+    it is worth saying before spending a call to be told.
+    """
+    return prompt_tokens + GROQ_MIN_COMPLETION_TOKENS <= GROQ_TPM_LIMIT
+
+
 def _build_messages(raw_text: str, session_date: date) -> list[dict[str, str]]:
     return [
         {"role": "system", "content": _SYSTEM_PROMPT},
@@ -537,7 +607,7 @@ def extract_json_object(content: Optional[str]) -> dict[str, Any]:
     return payload
 
 
-def _extraction_attempts(model: str) -> list[dict[str, Any]]:
+def _extraction_attempts(model: str, budget: Optional[int] = None) -> list[dict[str, Any]]:
     """The two attempts, deliberately different from each other.
 
     At temperature 0 an identical retry reproduces an identical failure, so a
@@ -545,8 +615,14 @@ def _extraction_attempts(model: str) -> list[dict[str, Any]]:
     is exactly what json_validate_failed is. The second attempt therefore drops
     JSON mode and parses the object out of the text instead, so a failure caused
     by the server-side JSON validator has a way through.
+
+    Both carry the same completion budget. The retry is not shrunk up front:
+    without JSON mode the model may wrap the object in prose, so it needs no
+    less room than the first. extract_entities shrinks it only after a failure
+    that says the reservation itself was too large.
     """
-    extra: dict[str, Any] = {"max_completion_tokens": GROQ_MAX_COMPLETION_TOKENS}
+    budget = GROQ_MAX_COMPLETION_TOKENS if budget is None else budget
+    extra: dict[str, Any] = {"max_completion_tokens": budget}
     # Sent through extra_body rather than a named argument so it works whatever
     # groq SDK version is installed, and is simply ignored by models without it.
     if "gpt-oss" in model and GROQ_REASONING_EFFORT:
@@ -555,6 +631,108 @@ def _extraction_attempts(model: str) -> list[dict[str, Any]]:
         {"response_format": {"type": "json_object"}, "extra_body": dict(extra)},
         {"extra_body": dict(extra)},
     ]
+
+
+_UNIT_SECONDS = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+
+# Substrings Groq uses for the per-minute ceiling, matched when the exception
+# carries no usable status code - which is what a bare RuntimeError from an
+# older SDK version looks like.
+_RATE_LIMIT_MARKERS = (
+    "rate_limit_exceeded", "rate limit reached", "request too large",
+    "tokens per minute", "reduce your message size",
+)
+
+# Pause before the retry when the server reports a limit without saying for how
+# long, as the 413 "request too large" does.
+_DEFAULT_RETRY_WAIT_SECONDS = 5.0
+
+
+def _sleep(seconds: float) -> None:
+    """Indirection so tests can wait for nothing."""
+    import time as clock
+
+    clock.sleep(seconds)
+
+
+def _status_code(exc: Exception) -> Optional[int]:
+    """HTTP status off a Groq SDK exception, wherever that version keeps it."""
+    for attribute in ("status_code", "code"):
+        value = getattr(exc, attribute, None)
+        if isinstance(value, int):
+            return value
+    value = getattr(getattr(exc, "response", None), "status_code", None)
+    return value if isinstance(value, int) else None
+
+
+def is_rate_limit_error(exc: Exception) -> bool:
+    """Whether this failure is the token ceiling rather than a bad request.
+
+    413 and 429 both mean it here: 429 is "too many tokens this minute", 413 is
+    "this one request reserved more than the whole minute allows".
+    """
+    if _status_code(exc) in {413, 429}:
+        return True
+    message = str(exc).lower()
+    return any(marker in message for marker in _RATE_LIMIT_MARKERS)
+
+
+def parse_duration(value: str) -> Optional[float]:
+    """Seconds from a Groq duration: "7.66s", "2m59.56s", "1500ms", or bare."""
+    text_value = value.strip().lower()
+    if not text_value:
+        return None
+    try:
+        return float(text_value)  # a plain Retry-After, already in seconds
+    except ValueError:
+        pass
+    total, matched = 0.0, False
+    for amount, unit in re.findall(r"(\d+(?:\.\d+)?)\s*(ms|m|s|h)", text_value):
+        total += float(amount) * _UNIT_SECONDS[unit]
+        matched = True
+    return total if matched else None
+
+
+def retry_after_seconds(exc: Exception) -> Optional[float]:
+    """How long the server asked us to wait, if it said at all."""
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is not None:
+        for name in ("retry-after", "x-ratelimit-reset-tokens"):
+            raw = None
+            try:
+                raw = headers.get(name)
+            except (AttributeError, TypeError):
+                pass
+            if raw:
+                parsed = parse_duration(str(raw))
+                if parsed is not None:
+                    return parsed
+
+    # Falls back to the message, which carries the delay for a 429 ("try again
+    # in 7.66s") but not for a 413.
+    match = re.search(r"try again in ([\d.]+\s*(?:ms|m|s|h)?)", str(exc), re.I)
+    return parse_duration(match.group(1)) if match else None
+
+
+def reported_tpm_limit(exc: Exception) -> Optional[int]:
+    """The limit the server named, if it named one.
+
+    GROQ_TPM_LIMIT is what we believe the tier allows; this is what the tier
+    actually enforced. When they disagree the server is right, and saying so
+    beats repeating a configured number that is the reason for the failure.
+    """
+    match = re.search(r"limit\s+(\d[\d,]*)", str(exc), re.I)
+    return int(match.group(1).replace(",", "")) if match else None
+
+
+def _wait_out_rate_limit(exc: Exception) -> float:
+    """Pause before the retry, for as long as the server advised. Returns it."""
+    advised = retry_after_seconds(exc)
+    wait = _DEFAULT_RETRY_WAIT_SECONDS if advised is None else advised
+    wait = max(0.0, min(wait, GROQ_MAX_RETRY_WAIT_SECONDS))
+    logger.warning("Rate limited by Groq; waiting %.1fs before the retry.", wait)
+    _sleep(wait)
+    return wait
 
 
 def extract_entities(
@@ -574,8 +752,23 @@ def extract_entities(
     if client is None:
         client = get_groq_client()
 
+    prompt_tokens = estimate_prompt_tokens(raw_text, session_date)
+    if not entry_fits_in_window(prompt_tokens):
+        raise ExtractionError(
+            f"This entry is too long to extract in one request: about "
+            f"{prompt_tokens} prompt tokens, and the per-minute limit is "
+            f"{GROQ_TPM_LIMIT} with room needed for the answer on top. Split the "
+            f"session into two entries and log them separately."
+        )
+
+    budget = completion_budget(raw_text, prompt_tokens)
+    logger.debug(
+        "Extraction request: ~%d prompt tokens + %d reserved = ~%d against a %d TPM limit.",
+        prompt_tokens, budget, prompt_tokens + budget, GROQ_TPM_LIMIT,
+    )
+
     last_error: Optional[Exception] = None
-    attempts = _extraction_attempts(model)
+    attempts = _extraction_attempts(model, budget)
     for number, options in enumerate(attempts, start=1):
         try:
             response = client.chat.completions.create(
@@ -591,6 +784,29 @@ def extract_entities(
                 "Extraction attempt %d/%d failed (json_mode=%s): %s",
                 number, len(attempts), "response_format" in options, exc,
             )
+            if number < len(attempts) and is_rate_limit_error(exc):
+                # A token ceiling is a condition of the clock, so an instant
+                # retry reproduces it exactly. Wait the window out, and ask for
+                # less as well: a 413 means this one reservation was itself over
+                # the limit, and no amount of waiting shrinks it.
+                _wait_out_rate_limit(exc)
+                budget = max(GROQ_MIN_COMPLETION_TOKENS, budget // 2)
+                attempts[number]["extra_body"]["max_completion_tokens"] = budget
+
+    if last_error is not None and is_rate_limit_error(last_error):
+        served = reported_tpm_limit(last_error)
+        advice = (
+            f"Set GROQ_TPM_LIMIT to {served}, which is what your tier actually "
+            f"enforced, then resubmit."
+            if served is not None and served != GROQ_TPM_LIMIT
+            else "Wait a minute and resubmit, or raise GROQ_TPM_LIMIT if your "
+                 "Groq tier allows more."
+        )
+        raise ExtractionError(
+            f"Groq's per-minute token limit was hit on both attempts. The last one "
+            f"asked for about {prompt_tokens} prompt tokens plus a {budget}-token "
+            f"reservation, against a configured limit of {GROQ_TPM_LIMIT}. {advice}"
+        ) from last_error
 
     raise ExtractionError(f"extraction failed after retry: {last_error}")
 
