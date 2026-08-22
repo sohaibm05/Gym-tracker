@@ -417,6 +417,10 @@ first request after a long gap can be slow.
 - Set `DATABASE_URL`, `GROQ_API_KEY`, `APP_USERNAME`, `APP_PASSWORD` and
   `LOCAL_TIMEZONE` in Project Settings → Environment Variables (`.env` is
   gitignored, so it is not deployed)
+- `LOCAL_TIMEZONE` is not optional in practice. Vercel's containers run on UTC,
+  and it is what decides which day — and therefore which week — a session is
+  filed under. Leave it unset and a workout logged late at night is dated a day
+  early; on a Sunday night that puts it in the previous week's volume
 - `vercel.json` pins `maxDuration` to 60s, which covers a Groq call plus inserts
 
 Use the Supabase **transaction pooler (port 6543)** rather than session mode

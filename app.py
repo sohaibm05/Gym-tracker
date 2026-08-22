@@ -313,7 +313,7 @@ async def healthz() -> JSONResponse:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(_user: str = Depends(require_auth)) -> HTMLResponse:
-    today = date.today().isoformat()
+    today = pipeline.local_today().isoformat()
     return _page(
         "Log a workout",
         f"""
@@ -397,7 +397,7 @@ async def progress(_user: str = Depends(require_auth)) -> HTMLResponse:
 
 @app.get("/weekly-report", response_class=HTMLResponse)
 async def weekly_report_form(_user: str = Depends(require_auth)) -> HTMLResponse:
-    current_week = insights.week_start_for(date.today())
+    current_week = insights.week_start_for(pipeline.local_today())
     return _page(
         "Weekly report",
         f"""

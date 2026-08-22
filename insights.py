@@ -803,7 +803,7 @@ def generate_weekly_report(
 ) -> dict[str, Any]:
     """Stage A, then Stage B, then upsert into weekly_reports."""
     if week_start is None:
-        week_start = week_start_for(date.today())
+        week_start = week_start_for(pipeline.local_today())
     week_start = week_start_for(week_start)
 
     since = week_start - timedelta(weeks=ANALYSIS_WEEKS)
@@ -976,7 +976,7 @@ def pain_summary(records: Iterable[SetRecord]) -> list[dict[str, Any]]:
 
 def build_dashboard(engine: Engine, weeks: int = 12, today: Optional[date] = None) -> dict[str, Any]:
     """Everything the progress page plots. No LLM anywhere in here."""
-    today = today or date.today()
+    today = today or pipeline.local_today()
     this_week = week_start_for(today)
     since = this_week - timedelta(weeks=weeks - 1)
     until = this_week + timedelta(days=7)
