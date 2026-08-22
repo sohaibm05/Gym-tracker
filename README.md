@@ -236,6 +236,26 @@ worth getting looked at. That is the whole of it — the Stage B prompt forbids 
 model from going further, and a unit test asserts the note never mentions a
 diagnosis or a corrective exercise.
 
+### Two entries on the same day
+
+Logging a second time against a date that already has rows asks which you meant:
+
+- **Add** (the default) - a second session that day, or sets you forgot. Rows
+  accumulate, which is what you want for a morning and an evening session.
+- **Replace** - discard everything already logged on that date and use this
+  entry instead. For correcting a bad parse, not for adding.
+
+Replace is deliberately never the default, and never implicit. Two safeguards
+back it: the delete and the insert that follows commit in one transaction, so a
+failure mid-way cannot leave the day emptied with nothing put back; and it only
+runs when there is something to insert, so a failed extraction or an
+all-review entry leaves the existing day untouched.
+
+The delete window is a UTC range covering one *local* day, so it cannot reach
+into a neighbouring date - tested at an offset zone, not just UTC.
+
+`--replace` does the same from the CLI.
+
 ### Duplicate submissions
 
 Render's free tier cold-starts in 30–50s after idle, which is exactly when you

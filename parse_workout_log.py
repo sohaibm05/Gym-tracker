@@ -33,6 +33,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Report where each setting comes from, test the connections, and exit",
     )
     parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="Discard everything already logged on that date before inserting",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Extract and score without inserting anything",
@@ -274,12 +279,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  [REVIEW] {item.kind}: {item.reason}")
         return 0
 
-    result = pipeline.process_entry(raw_text, session_date)
+    result = pipeline.process_entry(raw_text, session_date, replace_existing=args.replace)
 
     if result.error:
         print(f"Error: {result.error}", file=sys.stderr)
 
     print(f"Session date : {session_date}")
+    if result.replaced:
+        print(f"Replaced     : removed {result.replaced['sets']} set(s), "
+              f"{result.replaced['bodyweight']} bodyweight entry/entries")
     print(f"Inserted     : {result.inserted_sets} set(s), "
           f"{result.inserted_bodyweight} bodyweight entry/entries")
 

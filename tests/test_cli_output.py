@@ -188,3 +188,30 @@ class TestVercelEntrypoint:
             Path(__file__).resolve().parent.parent / "requirements.txt"
         ).read_text()
         assert "tzdata" in requirements
+
+
+class TestSameDayMode:
+    """Replace deletes a whole day, so it must never be the default anywhere."""
+
+    def test_cli_replace_flag_defaults_off(self):
+        args = parse_workout_log.parse_args(["entry.txt", "2026-08-20"])
+        assert args.replace is False
+
+    def test_cli_replace_flag_can_be_set(self):
+        args = parse_workout_log.parse_args(["entry.txt", "2026-08-20", "--replace"])
+        assert args.replace is True
+
+    def test_form_offers_both_modes_with_add_selected(self):
+        import app as app_module
+
+        page = app_module._page("t", "").body.decode()
+        assert 'name="mode"' not in page   # the nav page has no form
+
+    def test_form_markup_defaults_to_add(self):
+        import inspect
+
+        import app as app_module
+
+        source = inspect.getsource(app_module.index)
+        assert 'value="add" selected' in source
+        assert 'value="replace"' in source
