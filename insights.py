@@ -26,6 +26,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 import pipeline
+from pipeline import env
 
 logger = logging.getLogger(__name__)
 
@@ -36,32 +37,32 @@ logger = logging.getLogger(__name__)
 # Program-level stagnation is meaningless on a handful of exercises: with 2-3
 # logged, "60% plateaued" is noise. Require at least this many regularly-trained
 # exercises before the check runs at all.
-PROGRAM_STAGNATION_MIN_EXERCISES = int(os.getenv("PROGRAM_STAGNATION_MIN_EXERCISES", "4"))
+PROGRAM_STAGNATION_MIN_EXERCISES = int(env("PROGRAM_STAGNATION_MIN_EXERCISES", "4"))
 
 # Fraction of regularly-trained exercises that must be simultaneously plateaued.
-PROGRAM_STAGNATION_FRACTION = float(os.getenv("PROGRAM_STAGNATION_FRACTION", "0.6"))
+PROGRAM_STAGNATION_FRACTION = float(env("PROGRAM_STAGNATION_FRACTION", "0.6"))
 
 # Pain safeguard defaults to ON. Only an explicit env var turns it off; no code
 # path may skip the check on its own.
-PAIN_SAFEGUARD_ENABLED = os.getenv("PAIN_SAFEGUARD_ENABLED", "true").strip().lower() not in {
+PAIN_SAFEGUARD_ENABLED = env("PAIN_SAFEGUARD_ENABLED", "true").lower() not in {
     "false", "0", "no", "off",
 }
 
 # Working rep range used by the progressive-overload rules.
-WORKING_REP_RANGE_LOW = int(os.getenv("WORKING_REP_RANGE_LOW", "6"))
-WORKING_REP_RANGE_HIGH = int(os.getenv("WORKING_REP_RANGE_HIGH", "12"))
+WORKING_REP_RANGE_LOW = int(env("WORKING_REP_RANGE_LOW", "6"))
+WORKING_REP_RANGE_HIGH = int(env("WORKING_REP_RANGE_HIGH", "12"))
 
 # Smallest real load change available in the gym, in kg.
-PLATE_INCREMENT_KG = float(os.getenv("PLATE_INCREMENT_KG", "2.5"))
+PLATE_INCREMENT_KG = float(env("PLATE_INCREMENT_KG", "2.5"))
 
 # How much history each report considers.
-ANALYSIS_WEEKS = int(os.getenv("ANALYSIS_WEEKS", "6"))
+ANALYSIS_WEEKS = int(env("ANALYSIS_WEEKS", "6"))
 
 # Sessions of flat-or-declining e1RM that count as a per-exercise plateau.
-PLATEAU_MIN_SESSIONS = int(os.getenv("PLATEAU_MIN_SESSIONS", "3"))
+PLATEAU_MIN_SESSIONS = int(env("PLATEAU_MIN_SESSIONS", "3"))
 
 # Growth below this fraction over the window still counts as flat.
-PLATEAU_TOLERANCE = float(os.getenv("PLATEAU_TOLERANCE", "0.01"))
+PLATEAU_TOLERANCE = float(env("PLATEAU_TOLERANCE", "0.01"))
 
 GROQ_MODEL = pipeline.GROQ_MODEL
 
