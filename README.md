@@ -6,8 +6,9 @@ generates a weekly progress report on top of them.
 You keep logging in your phone's Notes app exactly as you do now — typos,
 voice-to-text run-ons, times like "6:20ish", commentary like "almost died" —
 then paste the text into a small web form. The pipeline extracts the sets,
-validates them, scores how much it trusts each one, and inserts only what clears
-the bar. Everything else is listed for you to look at rather than quietly saved.
+validates them, scores how much it trusts each one, and shows you every row it
+is about to write — editable, with anything missing or invalid marked in red.
+Nothing reaches the database until you have looked at it and pressed save.
 
 Power BI connects straight to the Postgres tables. That side is out of scope
 here; the schema is just shaped for it.
@@ -16,15 +17,22 @@ here; the schema is just shaped for it.
 
 ```
 Notes app (unchanged)
-  -> paste into the mobile web form            app.py
+  -> paste into the mobile web form            app.py            POST /log
   -> Groq extraction, JSON mode, 1 retry       pipeline.extract_entities
-  -> Pydantic validation                       pipeline.validate_extraction
-  -> computed confidence heuristic             pipeline.compute_confidence
+  -> Pydantic validation + computed score      pipeline.build_draft
+  -> editable preview of every prospective row review.render_review_body
+       anything missing or invalid is red, and a row the database would
+       reject cannot be saved until it is fixed or unticked
+  -> you edit, untick, and press save          app.py            POST /save
+  -> rescored against what you actually typed  review.draft_from_form
   -> fuzzy match against existing exercises    pipeline.find_matching_exercise
-  -> below threshold? -> review list, not inserted
-  -> above threshold? -> parameterized INSERT into Postgres
+  -> parameterized INSERT into Postgres        pipeline.commit_draft
   -> Power BI reads Postgres directly (later, not part of this build)
 ```
+
+The CLI has no reviewer, so it keeps the older unattended behaviour: anything
+below the confidence threshold is reported rather than saved
+(`pipeline.process_entry`).
 
 ## Files
 
@@ -34,6 +42,7 @@ Notes app (unchanged)
 | `pipeline.py` | All extraction / validation / insert logic. The CLI and web app both import this; neither reimplements any of it |
 | `parse_workout_log.py` | CLI: `python parse_workout_log.py <file> <date>` |
 | `app.py` | FastAPI web app — the phone-facing form, plus the weekly-report button |
+| `review.py` | The review screen: renders a draft as an editable form and reads the submission back |
 | `insights.py` | Weekly report. Stage A computes every number; Stage B only writes prose |
 | `charts.py` | The `/progress` page - inline-SVG charts, no chart library |
 | `seed_sample_data.py` | Seeds three weeks of realistic data so the report can be tried out |
@@ -178,6 +187,41 @@ of waiting shrinks it. An ordinary failure retries immediately and keeps the
 full reservation: without JSON mode the model may wrap the object in prose, so
 the second attempt needs no less room than the first.
 
+### Nothing is saved before you have seen it
+
+The model is good at reading a run-on note and bad at knowing when it has
+misread one. The failure that matters is not a wrong number on screen — it is a
+wrong number in a chart four weeks later, with no way to tell which of thirty
+sets it came from.
+
+So `/log` extracts and writes nothing. It renders every prospective row as an
+editable form — the same columns the database has, filled with the values that
+would be stored — and only `/save` inserts. Two colours of problem are marked:
+
+- **Blocking** — a value the database would reject: a rep count of `"eleven"`,
+  more cheat reps than reps, a blank exercise name. The field is outlined in
+  red, the message says what is wrong, and the save is refused until it is fixed
+  or the row is unticked. Bad input is kept in the box rather than dropped to
+  null, because a field silently emptied is a mistake you never see.
+- **Missing or weakly grounded** — no weight, no rep count, a name that does not
+  match the text it was read from, a score below the threshold. Marked in the
+  same red, but savable: a set with no recorded load is still a set that
+  happened, and that is your call rather than the parser's.
+
+Each row shows the span of your entry it was read from, so a suspicious value
+can be checked without scrolling back. Every row also carries a Save tick;
+unticking one drops it.
+
+The submission is rescored from what you actually typed, not from the
+extraction — so correcting a field clears its mark, and breaking one adds a mark
+where there was none. The round trip is exact: a form rendered and posted back
+untouched produces the same values, with no row falsely recorded as edited.
+
+`review.py` owns both halves of that round trip and nothing else; it holds no
+state between the two requests. The draft travels in the form itself, which is
+why the flow works unchanged on a serverless deploy where the two requests may
+not reach the same process.
+
 ### Confidence is computed, not asked for
 
 LLMs are badly calibrated at rating their own certainty, so the model is
@@ -189,10 +233,18 @@ one from things that can actually be checked:
 - does the exercise name actually match the text span it was supposedly read
   from — the check that catches a name the model invented rather than read.
 
-Below `CONFIDENCE_THRESHOLD` (0.7) an entry goes to the review list and is not
-inserted. A set missing its weight or reps lands at 0.65 and so is always
-surfaced. That is deliberate: a set with no load recorded is not much use for
-progression, and a bodyweight exercise logged this way is worth a glance.
+Below `CONFIDENCE_THRESHOLD` (0.7) a row is marked in red on the review screen.
+A set missing its weight or reps lands at 0.65 and so is always surfaced. That is
+deliberate: a set with no load recorded is not much use for progression, and a
+bodyweight exercise logged this way is worth a glance.
+
+In the web app the threshold marks rows rather than dropping them — you are
+looking at all of them anyway, and a set you can see and correct is worth more
+than one silently withheld. It still gates the CLI, which has nobody watching.
+
+A row you edit is stored at confidence 1.0. The score measures how well an
+extraction is grounded in the source text; once you have corrected a field by
+hand, your correction is better evidence than any grounding heuristic.
 
 ### Exercise names are fuzzy-matched before a new row is created
 
@@ -291,11 +343,12 @@ Logging a second time against a date that already has rows asks which you meant:
 - **Replace** - discard everything already logged on that date and use this
   entry instead. For correcting a bad parse, not for adding.
 
-Replace is deliberately never the default, and never implicit. Two safeguards
-back it: the delete and the insert that follows commit in one transaction, so a
+Replace is deliberately never the default, and never implicit. Three safeguards
+back it: the review screen says how many rows the save will delete before you
+press it; the delete and the insert that follows commit in one transaction, so a
 failure mid-way cannot leave the day emptied with nothing put back; and it only
-runs when there is something to insert, so a failed extraction or an
-all-review entry leaves the existing day untouched.
+runs when there is something to insert, so a failed extraction or a draft with
+every row unticked leaves the existing day untouched.
 
 The delete window is a UTC range covering one *local* day, so it cannot reach
 into a neighbouring date - tested at an offset zone, not just UTC.
@@ -305,9 +358,10 @@ into a neighbouring date - tested at an offset zone, not just UTC.
 ### Duplicate submissions
 
 Render's free tier cold-starts in 30–50s after idle, which is exactly when you
-double-tap submit. Before extracting anything, `/log` checks whether the same raw
-text was inserted in the last `DUPLICATE_WINDOW_MINUTES` (5) and returns the
-earlier result instead of re-running the model and re-inserting.
+double-tap submit. The check sits on `/save`, the step that writes: it looks for
+the same raw text inserted in the last `DUPLICATE_WINDOW_MINUTES` (5) and returns
+the earlier result rather than inserting the entry twice. `/log` writes nothing,
+so re-running it costs only another extraction.
 
 ## Charts
 
@@ -411,13 +465,14 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-201 tests, no network and no database required — they cover the Stage A rule
+393 tests, no network and no database required — they cover the Stage A rule
 branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
-threshold) and `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
-resolution, and JSON-mode retry behaviour. These are pure functions, so they are
-cheap to cover, and they are exactly the code where a silent bug produces a wrong
-training recommendation that nobody notices.
+threshold), `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
+resolution and JSON-mode retry behaviour, and the review screen's draft/edit/save
+round trip. These are pure functions, so they are cheap to cover, and they are
+exactly the code where a silent bug produces a wrong training recommendation, or
+a saved row that does not match what was on screen, and nobody notices.
 
 ## Not built (by design)
 

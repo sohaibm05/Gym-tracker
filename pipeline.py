@@ -262,10 +262,142 @@ class PipelineResult:
     duplicate_of_recent: bool = False
     replaced: Optional[dict[str, int]] = None
     error: Optional[str] = None
+    # Rows the user unticked on the review screen. Distinct from review_items,
+    # which are rows the pipeline itself held back.
+    skipped_sets: int = 0
+    skipped_bodyweight: int = 0
 
     @property
     def total_inserted(self) -> int:
         return self.inserted_sets + self.inserted_bodyweight
+
+
+# --------------------------------------------------------------------------
+# Editable draft — what the review screen shows before anything is written
+# --------------------------------------------------------------------------
+
+# The editable columns of each row, in the order the review screen lays them
+# out. `raw_span` is carried but never edited: it is the evidence the row was
+# read from, and rewriting it would rewrite the audit trail.
+SET_COLUMNS: tuple[str, ...] = (
+    "exercise_name",
+    "weight_kg",
+    "reps",
+    "cheat_reps",
+    "set_number",
+    "logged_at_local",
+    "muscle_group",
+    "is_warmup",
+    "is_dropset",
+    "pain_flag",
+    "notes",
+    "raw_span",
+)
+
+BODYWEIGHT_COLUMNS: tuple[str, ...] = (
+    "weight_kg",
+    "body_fat_pct",
+    "logged_at_local",
+    "notes",
+    "raw_span",
+)
+
+
+@dataclass
+class DraftIssue:
+    """Something wrong with a drafted row, addressed to the person reviewing it.
+
+    `blocking` separates the two kinds the review screen treats differently:
+    a blocking issue is one the database would reject, so the row cannot be
+    saved until it is fixed; a non-blocking one is missing or weakly grounded
+    information, which is flagged but savable — a set with no recorded weight
+    is still a set that happened.
+    """
+
+    message: str
+    field: Optional[str] = None  # column it belongs to; None = the whole row
+    blocking: bool = False
+
+
+@dataclass
+class DraftRow:
+    """One prospective database row, as extracted and possibly since edited."""
+
+    kind: str  # "workout_set" | "bodyweight"
+    values: dict[str, Any] = field(default_factory=dict)
+    confidence: Optional[float] = None
+    issues: list[DraftIssue] = field(default_factory=list)
+    include: bool = True
+    edited: bool = False  # a person changed a value on the review screen
+    # The exact wording `process_entry` used before the review screen existed,
+    # kept so the CLI and the unattended path still report failures the same way.
+    validation_error: Optional[str] = None
+
+    @property
+    def blocking(self) -> bool:
+        return any(issue.blocking for issue in self.issues)
+
+    @property
+    def flagged(self) -> bool:
+        return bool(self.issues)
+
+    def issues_for(self, column: str) -> list[DraftIssue]:
+        return [issue for issue in self.issues if issue.field == column]
+
+    @property
+    def row_issues(self) -> list[DraftIssue]:
+        """Issues that belong to no single column."""
+        return [issue for issue in self.issues if issue.field is None]
+
+    def legacy_reason(self, confidence_threshold: float) -> str:
+        """Why an unattended run would have held this row back."""
+        if self.validation_error:
+            return self.validation_error
+        return (
+            f"confidence {self.confidence or 0.0:.2f} below "
+            f"threshold {confidence_threshold:.2f}"
+        )
+
+
+@dataclass
+class EntryDraft:
+    """Everything one journal entry would write, before any of it is written."""
+
+    raw_text: str
+    session_date: date
+    sets: list[DraftRow] = field(default_factory=list)
+    bodyweight: Optional[DraftRow] = None
+    # Fragments of the extraction that are not editable rows at all — a `sets`
+    # key that came back as a string, say. Nothing can be done with these on the
+    # review screen, so they pass straight through to the result.
+    review_items: list[ReviewItem] = field(default_factory=list)
+    error: Optional[str] = None
+    replace_existing: bool = False
+
+    @property
+    def rows(self) -> list[DraftRow]:
+        return self.sets + ([self.bodyweight] if self.bodyweight is not None else [])
+
+    @property
+    def included(self) -> list[DraftRow]:
+        return [row for row in self.rows if row.include]
+
+    @property
+    def flagged_count(self) -> int:
+        return sum(1 for row in self.rows if row.flagged)
+
+    @property
+    def blocked_count(self) -> int:
+        return sum(1 for row in self.included if row.blocking)
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.rows
+
+    @property
+    def ready(self) -> bool:
+        """True when saving would not be rejected by the database."""
+        return self.error is None and self.blocked_count == 0
 
 
 # --------------------------------------------------------------------------
@@ -821,6 +953,44 @@ def get_groq_client() -> Any:
     return Groq(api_key=api_key)
 
 
+def score_set(
+    item: dict[str, Any],
+    raw_text: str,
+) -> tuple[Optional[WorkoutSet], float, Optional[ValidationError]]:
+    """Validate and score one raw set object.
+
+    The single place a set is turned into a model and given a confidence, so the
+    review screen, the CLI dry run and the insert path can never disagree about
+    what is wrong with a row. Returns (model, confidence, error); exactly one of
+    model and error is None.
+    """
+    try:
+        workout_set = WorkoutSet.model_validate(item)
+    except ValidationError as exc:
+        return None, compute_confidence(None, None, None, None, raw_text, validation_ok=False), exc
+
+    confidence = compute_confidence(
+        workout_set.exercise_name,
+        workout_set.weight_kg,
+        workout_set.reps,
+        workout_set.raw_span,
+        raw_text,
+    )
+    return workout_set, confidence, None
+
+
+def score_bodyweight(
+    item: dict[str, Any],
+    raw_text: str,
+) -> tuple[Optional[BodyweightEntry], float, Optional[ValidationError]]:
+    """`score_set`, for the bodyweight reading."""
+    try:
+        entry = BodyweightEntry.model_validate(item)
+    except ValidationError as exc:
+        return None, 0.0, exc
+    return entry, compute_bodyweight_confidence(entry, raw_text), None
+
+
 def validate_extraction(
     payload: dict[str, Any],
     raw_text: str,
@@ -841,39 +1011,29 @@ def validate_extraction(
             review.append(ReviewItem("workout_set", f"set {index} was not an object", 0.0,
                                      {"raw": str(item)[:500]}))
             continue
-        try:
-            workout_set = WorkoutSet.model_validate(item)
-        except ValidationError as exc:
+        workout_set, confidence, exc = score_set(item, raw_text)
+        if exc is not None:
             review.append(
                 ReviewItem(
                     "workout_set",
                     f"failed validation: {_short_errors(exc)}",
-                    compute_confidence(None, None, None, None, raw_text, validation_ok=False),
+                    confidence,
                     item,
                 )
             )
             continue
-
-        confidence = compute_confidence(
-            workout_set.exercise_name,
-            workout_set.weight_kg,
-            workout_set.reps,
-            workout_set.raw_span,
-            raw_text,
-        )
         scored_sets.append((workout_set, confidence))
 
     scored_bodyweight: Optional[tuple[BodyweightEntry, float]] = None
     raw_bodyweight = payload.get("bodyweight")
     if isinstance(raw_bodyweight, dict):
-        try:
-            entry = BodyweightEntry.model_validate(raw_bodyweight)
-        except ValidationError as exc:
+        entry, bodyweight_confidence, exc = score_bodyweight(raw_bodyweight, raw_text)
+        if exc is not None:
             review.append(
                 ReviewItem("bodyweight", f"failed validation: {_short_errors(exc)}", 0.0, raw_bodyweight)
             )
         else:
-            scored_bodyweight = (entry, compute_bodyweight_confidence(entry, raw_text))
+            scored_bodyweight = (entry, bodyweight_confidence)
     elif raw_bodyweight not in (None, ""):
         review.append(
             ReviewItem("bodyweight", "'bodyweight' was neither null nor an object", 0.0,
@@ -920,6 +1080,227 @@ def compute_bodyweight_confidence(entry: BodyweightEntry, raw_text: str) -> floa
 def _short_errors(exc: ValidationError) -> str:
     parts = [f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()[:3]]
     return "; ".join(parts)
+
+
+# --------------------------------------------------------------------------
+# Draft building (extraction -> editable rows, still nothing written)
+# --------------------------------------------------------------------------
+
+
+def _clean_message(message: str) -> str:
+    """Pydantic prefixes custom validator failures; the prefix means nothing here."""
+    return re.sub(r"^(Value|Assertion) error, ", "", message).strip()
+
+
+def _named_column(message: str, columns: Sequence[str]) -> Optional[str]:
+    """The column a whole-model validation message is about, if it names one.
+
+    Pydantic reports a `model_validator` failure against no field at all, which
+    would leave the form saying a row is unsaveable without marking anything on
+    it. These messages are ours, so the column they name is reliable.
+    """
+    lowered = message.lower()
+    # Longest first, so "cheat_reps exceeds reps" points at cheat_reps, the
+    # column that is actually out of range, rather than the one it is compared to.
+    matches = sorted((c for c in columns if c in lowered), key=len, reverse=True)
+    return matches[0] if matches else None
+
+
+def _field_issues(exc: ValidationError, columns: Sequence[str]) -> list[DraftIssue]:
+    """Turn a validation failure into per-column issues the form can highlight."""
+    issues: list[DraftIssue] = []
+    for error in exc.errors():
+        message = _clean_message(error["msg"])
+        location = str(error["loc"][0]) if error["loc"] else None
+        column = location if location in columns else _named_column(message, columns)
+        issues.append(DraftIssue(message, column, blocking=True))
+    return issues
+
+
+def _column_defaults(model: type[BaseModel], columns: Sequence[str]) -> dict[str, Any]:
+    """What each column falls back to when the extraction leaves it out.
+
+    Read off the models rather than restated, so the review screen shows the
+    value the database would actually store — `cheat_reps` absent means 0, not
+    null, and null is what the column rejects.
+    """
+    defaults: dict[str, Any] = {}
+    for column in columns:
+        info = model.model_fields.get(column)
+        defaults[column] = (
+            None if info is None or info.is_required()
+            else info.get_default(call_default_factory=True)
+        )
+    return defaults
+
+
+SET_DEFAULTS = _column_defaults(WorkoutSet, SET_COLUMNS)
+BODYWEIGHT_DEFAULTS = _column_defaults(BodyweightEntry, BODYWEIGHT_COLUMNS)
+
+
+def _pick(
+    values: dict[str, Any], columns: Sequence[str], defaults: dict[str, Any]
+) -> dict[str, Any]:
+    """Keep only the editable columns, filling omissions with the column default.
+
+    A missing key and an explicit null are treated alike: models routinely emit
+    one or the other for a flag they had nothing to say about, and neither means
+    "store null in a NOT NULL column".
+    """
+    picked: dict[str, Any] = {}
+    for column in columns:
+        value = values.get(column)
+        picked[column] = defaults[column] if value is None else value
+    return picked
+
+
+def draft_set_row(
+    values: dict[str, Any],
+    raw_text: str,
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    edited: bool = False,
+) -> DraftRow:
+    """Score one set and describe everything a person should look at before saving."""
+    row = DraftRow("workout_set", _pick(values, SET_COLUMNS, SET_DEFAULTS), edited=edited)
+    workout_set, confidence, exc = score_set(row.values, raw_text)
+    row.confidence = confidence
+
+    if exc is not None:
+        row.validation_error = f"failed validation: {_short_errors(exc)}"
+        row.issues = _field_issues(exc, SET_COLUMNS)
+        return row
+
+    # Show the coerced values, so what the screen displays is what gets stored.
+    row.values = _pick(workout_set.model_dump(), SET_COLUMNS, SET_DEFAULTS)
+
+    if workout_set.weight_kg is None:
+        row.issues.append(
+            DraftIssue("no weight found in your entry — saved blank unless you fill it in",
+                       "weight_kg")
+        )
+    if workout_set.reps is None:
+        row.issues.append(
+            DraftIssue("no rep count found in your entry — saved blank unless you fill it in",
+                       "reps")
+        )
+    if _grounding_similarity(workout_set.exercise_name, workout_set.raw_span or raw_text) < 0.5:
+        row.issues.append(
+            DraftIssue("this name does not closely match the text it was read from",
+                       "exercise_name")
+        )
+
+    # Only worth saying when nothing more specific already explains the score.
+    if confidence < confidence_threshold and not row.issues and not edited:
+        row.issues.append(
+            DraftIssue(
+                f"confidence {confidence:.2f}, below the {confidence_threshold:.2f} "
+                "threshold — check it against your entry"
+            )
+        )
+    return row
+
+
+def draft_bodyweight_row(
+    values: dict[str, Any],
+    raw_text: str,
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    edited: bool = False,
+) -> DraftRow:
+    """`draft_set_row`, for the bodyweight reading."""
+    row = DraftRow("bodyweight", _pick(values, BODYWEIGHT_COLUMNS, BODYWEIGHT_DEFAULTS), edited=edited)
+    entry, confidence, exc = score_bodyweight(row.values, raw_text)
+    row.confidence = confidence
+
+    if exc is not None:
+        row.validation_error = f"failed validation: {_short_errors(exc)}"
+        row.issues = _field_issues(exc, BODYWEIGHT_COLUMNS)
+        return row
+
+    row.values = _pick(entry.model_dump(), BODYWEIGHT_COLUMNS, BODYWEIGHT_DEFAULTS)
+    haystack = _normalize_numeric_text(entry.raw_span or raw_text)
+    if not _number_appears_in(float(entry.weight_kg), haystack):
+        row.issues.append(
+            DraftIssue("this number does not appear in your entry", "weight_kg")
+        )
+    if confidence < confidence_threshold and not row.issues and not edited:
+        row.issues.append(
+            DraftIssue(
+                f"confidence {confidence:.2f}, below the {confidence_threshold:.2f} "
+                "threshold — check it against your entry"
+            )
+        )
+    return row
+
+
+def draft_from_payload(
+    payload: dict[str, Any],
+    raw_text: str,
+    session_date: date,
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+) -> EntryDraft:
+    """Turn a raw extraction into editable rows, keeping the ones that failed.
+
+    `validate_extraction` drops invalid sets into a review list; here they are
+    kept as rows, because a set the model got half right is exactly the one a
+    person wants to correct rather than retype.
+    """
+    draft = EntryDraft(raw_text=raw_text, session_date=session_date)
+
+    raw_sets = payload.get("sets") or []
+    if not isinstance(raw_sets, list):
+        draft.review_items.append(
+            ReviewItem("extraction", "'sets' was not a list", None, {"sets": str(raw_sets)[:500]})
+        )
+        raw_sets = []
+
+    for index, item in enumerate(raw_sets):
+        if not isinstance(item, dict):
+            draft.review_items.append(
+                ReviewItem("workout_set", f"set {index} was not an object", 0.0,
+                           {"raw": str(item)[:500]})
+            )
+            continue
+        draft.sets.append(draft_set_row(item, raw_text, confidence_threshold))
+
+    raw_bodyweight = payload.get("bodyweight")
+    if isinstance(raw_bodyweight, dict):
+        draft.bodyweight = draft_bodyweight_row(raw_bodyweight, raw_text, confidence_threshold)
+    elif raw_bodyweight not in (None, ""):
+        draft.review_items.append(
+            ReviewItem("bodyweight", "'bodyweight' was neither null nor an object", 0.0,
+                       {"raw": str(raw_bodyweight)[:500]})
+        )
+
+    return draft
+
+
+def build_draft(
+    raw_text: str,
+    session_date: date,
+    client: Any = None,
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+) -> EntryDraft:
+    """Extract one journal entry into a draft. Touches the model, not the database."""
+    raw_text = (raw_text or "").strip()
+    if not raw_text:
+        return EntryDraft(
+            raw_text=raw_text,
+            session_date=session_date,
+            error="Empty entry — nothing to parse.",
+        )
+
+    try:
+        payload = extract_entities(raw_text, session_date, client=client)
+    except ExtractionError as exc:
+        logger.error("Extraction failed: %s", exc)
+        return EntryDraft(
+            raw_text=raw_text,
+            session_date=session_date,
+            error="Extraction failed after one retry — entry not inserted.",
+            review_items=[ReviewItem("extraction", str(exc), None, {"raw_text": raw_text})],
+        )
+
+    return draft_from_payload(payload, raw_text, session_date, confidence_threshold)
 
 
 # --------------------------------------------------------------------------
@@ -1086,6 +1467,144 @@ def find_recent_submission(
 # --------------------------------------------------------------------------
 
 
+def commit_draft(
+    draft: EntryDraft,
+    engine: Optional[Engine] = None,
+    check_duplicates: bool = False,
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    review_excluded: bool = False,
+) -> PipelineResult:
+    """Write the ticked rows of a draft. The only function that inserts.
+
+    A row that reaches here has either been looked at on the review screen or
+    cleared the threshold unattended, so the threshold is not applied again —
+    `include` is the decision. `review_excluded` makes the rows left out come
+    back as review items, which is what the unattended path reports.
+
+    Confidence is recomputed from the values as they stand. A row a person
+    edited is stored at 1.0: the score measures how well an extraction is
+    grounded in the source text, and a human correction is better evidence
+    than any grounding heuristic.
+    """
+    if engine is None:
+        engine = get_engine()
+
+    result = PipelineResult(review_items=list(draft.review_items))
+    if draft.error:
+        result.error = draft.error
+        return result
+
+    if check_duplicates:
+        prior = find_recent_submission(engine, draft.raw_text)
+        if prior is not None:
+            logger.info("Duplicate submission suppressed (%s)", prior)
+            return PipelineResult(
+                inserted_sets=prior["inserted_sets"],
+                inserted_bodyweight=prior["inserted_bodyweight"],
+                duplicate_of_recent=True,
+            )
+
+    accepted_sets: list[tuple[WorkoutSet, float]] = []
+    for row in draft.sets:
+        if not row.include:
+            result.skipped_sets += 1
+            if review_excluded:
+                result.review_items.append(
+                    ReviewItem(
+                        "workout_set",
+                        row.legacy_reason(confidence_threshold),
+                        row.confidence,
+                        dict(row.values),
+                    )
+                )
+            continue
+        workout_set, confidence, exc = score_set(row.values, draft.raw_text)
+        if exc is not None:
+            # Callers check `draft.ready` first, so this is a guard rather than a
+            # path: a row the database would reject is never silently dropped.
+            result.review_items.append(
+                ReviewItem("workout_set", f"failed validation: {_short_errors(exc)}",
+                           row.confidence, dict(row.values))
+            )
+            continue
+        accepted_sets.append((workout_set, 1.0 if row.edited else confidence))
+
+    accepted_bodyweight: Optional[tuple[BodyweightEntry, float]] = None
+    if draft.bodyweight is not None:
+        row = draft.bodyweight
+        if not row.include:
+            result.skipped_bodyweight += 1
+            if review_excluded:
+                result.review_items.append(
+                    ReviewItem("bodyweight", row.legacy_reason(confidence_threshold),
+                               row.confidence, dict(row.values))
+                )
+        else:
+            entry, confidence, exc = score_bodyweight(row.values, draft.raw_text)
+            if exc is not None:
+                result.review_items.append(
+                    ReviewItem("bodyweight", f"failed validation: {_short_errors(exc)}",
+                               row.confidence, dict(row.values))
+                )
+            else:
+                accepted_bodyweight = (entry, 1.0 if row.edited else confidence)
+
+    if not accepted_sets and accepted_bodyweight is None:
+        return result
+
+    with engine.begin() as conn:
+        if draft.replace_existing:
+            # Only reached when there is something to put back - the early
+            # return above means a failed extraction never empties the day.
+            result.replaced = delete_entries_for_date(conn, draft.session_date)
+            logger.info("Replaced %s on %s", result.replaced, draft.session_date)
+        known = load_exercise_names(conn)
+        for workout_set, confidence in accepted_sets:
+            exercise_id, matched_name, created = get_or_create_exercise(
+                conn, workout_set.exercise_name, workout_set.muscle_group, known
+            )
+            if created:
+                result.exercises_created.append(workout_set.exercise_name)
+            elif matched_name and matched_name != workout_set.exercise_name:
+                result.exercises_matched.append((workout_set.exercise_name, matched_name))
+
+            conn.execute(
+                _INSERT_WORKOUT_SET,
+                {
+                    "exercise_id": exercise_id,
+                    "logged_at": resolve_logged_at(workout_set.logged_at_local, draft.session_date),
+                    "weight_kg": workout_set.weight_kg,
+                    "reps": workout_set.reps,
+                    "cheat_reps": workout_set.cheat_reps,
+                    "set_number": workout_set.set_number,
+                    "is_warmup": workout_set.is_warmup,
+                    "is_dropset": workout_set.is_dropset,
+                    "pain_flag": workout_set.pain_flag,
+                    "notes": workout_set.notes,
+                    "raw_source": draft.raw_text,
+                    "extraction_confidence": confidence,
+                },
+            )
+            result.inserted_sets += 1
+
+        if accepted_bodyweight is not None:
+            entry, confidence = accepted_bodyweight
+            conn.execute(
+                _INSERT_BODYWEIGHT,
+                {
+                    "logged_at": resolve_logged_at(entry.logged_at_local, draft.session_date),
+                    "weight_kg": entry.weight_kg,
+                    "body_fat_pct": entry.body_fat_pct,
+                    "notes": entry.notes,
+                    "raw_source": draft.raw_text,
+                    "extraction_confidence": confidence,
+                },
+            )
+            result.inserted_bodyweight += 1
+
+    return result
+
+
 def process_entry(
     raw_text: str,
     session_date: date,
@@ -1095,10 +1614,12 @@ def process_entry(
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
     replace_existing: bool = False,
 ) -> PipelineResult:
-    """Run the full pipeline for one journal entry.
+    """Extract and insert one journal entry with nobody watching.
 
-    Called by both the CLI and the web app. `check_duplicates` is enabled by the
-    web app, where a double-tapped submit is a real risk.
+    The CLI path: no review screen, so the confidence threshold does the
+    deciding and anything under it is reported rather than saved. The web app
+    goes through `build_draft` and `commit_draft` instead, and lets the person
+    who wrote the entry make that call.
     """
     raw_text = (raw_text or "").strip()
     if not raw_text:
@@ -1117,98 +1638,18 @@ def process_entry(
                 duplicate_of_recent=True,
             )
 
-    try:
-        payload = extract_entities(raw_text, session_date, client=client)
-    except ExtractionError as exc:
-        logger.error("Extraction failed: %s", exc)
-        return PipelineResult(
-            error="Extraction failed after one retry — entry not inserted.",
-            review_items=[ReviewItem("extraction", str(exc), None, {"raw_text": raw_text})],
-        )
+    draft = build_draft(raw_text, session_date, client=client,
+                        confidence_threshold=confidence_threshold)
+    if draft.error:
+        return PipelineResult(error=draft.error, review_items=list(draft.review_items))
 
-    scored_sets, scored_bodyweight, review = validate_extraction(payload, raw_text)
-    result = PipelineResult(review_items=list(review))
+    draft.replace_existing = replace_existing
+    for row in draft.rows:
+        row.include = not row.blocking and (row.confidence or 0.0) >= confidence_threshold
 
-    accepted_sets = []
-    for workout_set, confidence in scored_sets:
-        if confidence < confidence_threshold:
-            result.review_items.append(
-                ReviewItem(
-                    "workout_set",
-                    f"confidence {confidence:.2f} below threshold {confidence_threshold:.2f}",
-                    confidence,
-                    workout_set.model_dump(),
-                )
-            )
-        else:
-            accepted_sets.append((workout_set, confidence))
-
-    accepted_bodyweight = None
-    if scored_bodyweight is not None:
-        entry, confidence = scored_bodyweight
-        if confidence < confidence_threshold:
-            result.review_items.append(
-                ReviewItem(
-                    "bodyweight",
-                    f"confidence {confidence:.2f} below threshold {confidence_threshold:.2f}",
-                    confidence,
-                    entry.model_dump(),
-                )
-            )
-        else:
-            accepted_bodyweight = (entry, confidence)
-
-    if not accepted_sets and accepted_bodyweight is None:
-        return result
-
-    with engine.begin() as conn:
-        if replace_existing:
-            # Only reached when there is something to put back - the early
-            # return above means a failed extraction never empties the day.
-            result.replaced = delete_entries_for_date(conn, session_date)
-            logger.info("Replaced %s on %s", result.replaced, session_date)
-        known = load_exercise_names(conn)
-        for workout_set, confidence in accepted_sets:
-            exercise_id, matched_name, created = get_or_create_exercise(
-                conn, workout_set.exercise_name, workout_set.muscle_group, known
-            )
-            if created:
-                result.exercises_created.append(workout_set.exercise_name)
-            elif matched_name and matched_name != workout_set.exercise_name:
-                result.exercises_matched.append((workout_set.exercise_name, matched_name))
-
-            conn.execute(
-                _INSERT_WORKOUT_SET,
-                {
-                    "exercise_id": exercise_id,
-                    "logged_at": resolve_logged_at(workout_set.logged_at_local, session_date),
-                    "weight_kg": workout_set.weight_kg,
-                    "reps": workout_set.reps,
-                    "cheat_reps": workout_set.cheat_reps,
-                    "set_number": workout_set.set_number,
-                    "is_warmup": workout_set.is_warmup,
-                    "is_dropset": workout_set.is_dropset,
-                    "pain_flag": workout_set.pain_flag,
-                    "notes": workout_set.notes,
-                    "raw_source": raw_text,
-                    "extraction_confidence": confidence,
-                },
-            )
-            result.inserted_sets += 1
-
-        if accepted_bodyweight is not None:
-            entry, confidence = accepted_bodyweight
-            conn.execute(
-                _INSERT_BODYWEIGHT,
-                {
-                    "logged_at": resolve_logged_at(entry.logged_at_local, session_date),
-                    "weight_kg": entry.weight_kg,
-                    "body_fat_pct": entry.body_fat_pct,
-                    "notes": entry.notes,
-                    "raw_source": raw_text,
-                    "extraction_confidence": confidence,
-                },
-            )
-            result.inserted_bodyweight += 1
-
-    return result
+    return commit_draft(
+        draft,
+        engine=engine,
+        confidence_threshold=confidence_threshold,
+        review_excluded=True,
+    )
