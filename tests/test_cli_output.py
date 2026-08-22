@@ -168,6 +168,22 @@ class TestVercelEntrypoint:
         assert config["rewrites"][0]["destination"] == "/api/index"
         assert "api/index.py" in config["functions"]
 
+    def test_probe_is_excluded_from_the_catch_all_rewrite(self):
+        """/api/ping must reach its own handler, not the application."""
+        import json
+        import re
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        config = json.loads((root / "vercel.json").read_text())
+        source = config["rewrites"][0]["source"]
+        pattern = re.compile("^" + source.replace("/((?!api/ping).*)", "/(?!api/ping).*") + "$")
+
+        assert pattern.match("/")
+        assert pattern.match("/log")
+        assert not pattern.match("/api/ping")
+        assert (root / "api" / "ping.py").is_file()
+
     def test_tzdata_is_pinned(self):
         """zoneinfo reads the OS tz database; slim images often lack it."""
         from pathlib import Path
