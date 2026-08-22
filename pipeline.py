@@ -54,28 +54,41 @@ except ImportError:  # pragma: no cover - python-dotenv is optional
 # Configuration
 # --------------------------------------------------------------------------
 
+
+def env(name: str, default: str) -> str:
+    """Environment value, treating an empty or blank one as absent.
+
+    os.getenv returns "" for a variable that exists but has no value, so the
+    default never applies and float("") raises at import. Hosting dashboards
+    make that easy to do by accident, and the resulting crash happens before
+    any request is served, with no obvious link to the blank field.
+    """
+    value = os.getenv(name)
+    return value.strip() if value and value.strip() else default
+
+
 # Entries scoring below this are surfaced for manual review and NOT inserted.
-CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.7"))
+CONFIDENCE_THRESHOLD = float(env("CONFIDENCE_THRESHOLD", "0.7"))
 
 # rapidfuzz score (0-100) at or above which a proposed exercise name is treated
 # as the same exercise as an existing row.
-FUZZY_MATCH_THRESHOLD = float(os.getenv("FUZZY_MATCH_THRESHOLD", "85"))
+FUZZY_MATCH_THRESHOLD = float(env("FUZZY_MATCH_THRESHOLD", "85"))
 
 # Groq's Llama chat models (llama-3.3-70b-versatile, llama-3.1-8b-instant) were
 # deprecated for free/developer tiers on 2026-06-17. openai/gpt-oss-120b is the
 # recommended general-purpose replacement. Re-check console.groq.com/docs/models
 # before assuming this is still current.
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_MODEL = env("GROQ_MODEL", "openai/gpt-oss-120b")
 
 # Single fixed timezone: this is a single-user personal tool, so local wall-clock
 # time in the journal is always interpreted in this zone and stored as UTC.
-LOCAL_TIMEZONE = os.getenv("LOCAL_TIMEZONE", "UTC")
+LOCAL_TIMEZONE = env("LOCAL_TIMEZONE", "UTC")
 
 # Wall-clock time assumed for a session when the text carries no time marker.
-DEFAULT_SESSION_HOUR = int(os.getenv("DEFAULT_SESSION_HOUR", "18"))
+DEFAULT_SESSION_HOUR = int(env("DEFAULT_SESSION_HOUR", "18"))
 
 # Window used by the /log duplicate-submission guard.
-DUPLICATE_WINDOW_MINUTES = int(os.getenv("DUPLICATE_WINDOW_MINUTES", "5"))
+DUPLICATE_WINDOW_MINUTES = int(env("DUPLICATE_WINDOW_MINUTES", "5"))
 
 # Serverless platforms hand each request its own short-lived process, so a
 # connection pool held between requests is never reused and only consumes

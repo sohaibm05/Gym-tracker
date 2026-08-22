@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 # Serverless loaders import this file by path rather than as part of a package,
@@ -34,11 +34,24 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 # running normally, where the directory is already there.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import insights  # noqa: E402 - must follow the sys.path bootstrap above
-import pipeline  # noqa: E402
+# These imports are the ones that break on a misconfigured serverless deploy,
+# either because the sibling files were not bundled or because the loader did
+# not put this directory on the path. Left unguarded the whole module fails to
+# import and the platform reports an opaque "function crashed" with the real
+# reason buried in provider logs. Capturing it here lets the running app serve
+# the reason instead.
+_STARTUP_ERROR: Optional[str] = None
+try:
+    import insights  # noqa: E402 - must follow the sys.path bootstrap above
+    import pipeline  # noqa: E402
+except Exception:  # noqa: BLE001 - report anything that stops the app booting
+    import traceback
+
+    _STARTUP_ERROR = traceback.format_exc()
+    insights = pipeline = None  # type: ignore[assignment]
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=pipeline.env("LOG_LEVEL", "INFO").upper() if pipeline else "INFO",
     format='%(asctime)s level=%(levelname)s logger=%(name)s %(message)s',
 )
 logger = logging.getLogger("gym_tracker.app")
@@ -105,6 +118,17 @@ def require_auth(request: Request, credentials: HTTPBasicCredentials = Depends(s
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
+    if _STARTUP_ERROR is not None:
+        # Every route depends on the modules that failed to import, so serve the
+        # reason rather than a stack-less 500 from the platform.
+        logger.error("event=startup_failed path=%s", request.url.path)
+        return PlainTextResponse(
+            "The application failed to start.\n\n"
+            "This is an import error, not a configuration one - no secrets are "
+            "shown below.\n\n" + _STARTUP_ERROR,
+            status_code=500,
+        )
+
     started = time.perf_counter()
     try:
         response = await call_next(request)

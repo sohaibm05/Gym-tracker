@@ -8,6 +8,7 @@ bad fuzzy match fragments an exercise's progress history across several rows.
 from __future__ import annotations
 
 import json
+import os
 from datetime import date, datetime, timezone
 
 import pytest
@@ -529,3 +530,83 @@ class TestEnginePooling:
         monkeypatch.delenv("DATABASE_URL", raising=False)
         with pytest.raises(RuntimeError, match="DATABASE_URL"):
             pipeline.get_engine()
+
+
+# --------------------------------------------------------------------------
+# Empty environment variables must not crash the app at import
+# --------------------------------------------------------------------------
+
+
+class TestEnvHelper:
+    """os.getenv returns "" for a variable that exists but is blank, so the
+    default never applies. On Vercel that made float("") raise at import, which
+    the platform reported only as an opaque function crash."""
+
+    def test_unset_falls_back_to_the_default(self, monkeypatch):
+        monkeypatch.delenv("SOME_SETTING", raising=False)
+        assert pipeline.env("SOME_SETTING", "0.7") == "0.7"
+
+    def test_empty_string_falls_back_to_the_default(self, monkeypatch):
+        monkeypatch.setenv("SOME_SETTING", "")
+        assert pipeline.env("SOME_SETTING", "0.7") == "0.7"
+
+    def test_whitespace_only_falls_back_to_the_default(self, monkeypatch):
+        monkeypatch.setenv("SOME_SETTING", "   ")
+        assert pipeline.env("SOME_SETTING", "0.7") == "0.7"
+
+    def test_a_real_value_wins(self, monkeypatch):
+        monkeypatch.setenv("SOME_SETTING", "0.9")
+        assert pipeline.env("SOME_SETTING", "0.7") == "0.9"
+
+    def test_surrounding_whitespace_is_stripped(self, monkeypatch):
+        """Dashboard fields pick up stray spaces on paste."""
+        monkeypatch.setenv("SOME_SETTING", "  0.9  ")
+        assert pipeline.env("SOME_SETTING", "0.7") == "0.9"
+
+    @pytest.mark.parametrize(
+        "name,default",
+        [
+            ("CONFIDENCE_THRESHOLD", "0.7"),
+            ("FUZZY_MATCH_THRESHOLD", "85"),
+            ("DEFAULT_SESSION_HOUR", "18"),
+            ("DUPLICATE_WINDOW_MINUTES", "5"),
+            ("PLATE_INCREMENT_KG", "2.5"),
+            ("PLATEAU_TOLERANCE", "0.01"),
+        ],
+    )
+    def test_every_numeric_setting_survives_being_blank(self, name, default, monkeypatch):
+        monkeypatch.setenv(name, "")
+        assert float(pipeline.env(name, default)) == float(default)
+
+    def test_modules_import_with_every_setting_blank(self, monkeypatch):
+        """The regression: a blank value anywhere must not stop the app booting."""
+        import importlib
+
+        for name in (
+            "CONFIDENCE_THRESHOLD", "FUZZY_MATCH_THRESHOLD", "GROQ_MODEL",
+            "LOCAL_TIMEZONE", "DEFAULT_SESSION_HOUR", "DUPLICATE_WINDOW_MINUTES",
+            "PLATE_INCREMENT_KG", "ANALYSIS_WEEKS", "PLATEAU_MIN_SESSIONS",
+            "PLATEAU_TOLERANCE", "WORKING_REP_RANGE_LOW", "WORKING_REP_RANGE_HIGH",
+            "PROGRAM_STAGNATION_MIN_EXERCISES", "PROGRAM_STAGNATION_FRACTION",
+            "PAIN_SAFEGUARD_ENABLED", "LOG_LEVEL",
+        ):
+            monkeypatch.setenv(name, "")
+
+        import insights
+
+        reloaded_pipeline = importlib.reload(pipeline)
+        reloaded_insights = importlib.reload(insights)
+        try:
+            assert reloaded_pipeline.CONFIDENCE_THRESHOLD == 0.7
+            assert reloaded_pipeline.LOCAL_TIMEZONE == "UTC"
+            assert reloaded_insights.PLATE_INCREMENT_KG == 2.5
+            # Blank must not silently disable the safeguard.
+            assert reloaded_insights.PAIN_SAFEGUARD_ENABLED is True
+        finally:
+            for name in list(os.environ):
+                if name.startswith(("CONFIDENCE", "FUZZY", "GROQ", "LOCAL", "DEFAULT",
+                                    "DUPLICATE", "PLATE", "ANALYSIS", "PLATEAU",
+                                    "WORKING", "PROGRAM", "PAIN", "LOG_LEVEL")):
+                    monkeypatch.delenv(name, raising=False)
+            importlib.reload(pipeline)
+            importlib.reload(insights)
