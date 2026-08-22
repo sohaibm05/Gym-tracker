@@ -2,13 +2,20 @@
 
 Routes:
     GET  /               mobile-friendly entry form
-    POST /log            run the pipeline on a pasted journal entry
+    POST /log            parse a pasted journal entry into an editable review form
+    POST /save           write the reviewed rows to the database
     GET  /weekly-report  report page with a "Generate weekly report" button
     POST /weekly-report  run Stage A + Stage B and upsert the report
     GET  /healthz        unauthenticated liveness probe
 
+Saving is deliberately two steps. POST /log only extracts; it renders every
+prospective database row for editing, with anything missing or invalid marked in
+red. Nothing is written until POST /save, and what it writes is the reviewed
+form, not the raw extraction.
+
 All extraction/validation/insert logic is imported from pipeline.py; all report
-logic from insights.py. Nothing is reimplemented here.
+logic from insights.py; the review form from review.py. Nothing is
+reimplemented here.
 """
 
 from __future__ import annotations
@@ -45,11 +52,12 @@ try:
     import charts  # noqa: E402 - must follow the sys.path bootstrap above
     import insights  # noqa: E402
     import pipeline  # noqa: E402
+    import review  # noqa: E402
 except Exception:  # noqa: BLE001 - report anything that stops the app booting
     import traceback
 
     _STARTUP_ERROR = traceback.format_exc()
-    charts = insights = pipeline = None  # type: ignore[assignment]
+    charts = insights = pipeline = review = None  # type: ignore[assignment]
 
 logging.basicConfig(
     level=pipeline.env("LOG_LEVEL", "INFO").upper() if pipeline else "INFO",
@@ -277,6 +285,13 @@ def _render_result(result: pipeline.PipelineResult, session_date: date) -> str:
         )
         parts.append(f'<div class="card muted"><strong>Fuzzy-matched names</strong><ul>{rows}</ul></div>')
 
+    skipped = result.skipped_sets + result.skipped_bodyweight
+    if skipped:
+        parts.append(
+            f'<div class="card muted">You unticked {skipped} row(s) on the review '
+            "screen, so they were not saved.</div>"
+        )
+
     if result.review_items:
         rows = []
         for item in result.review_items:
@@ -292,11 +307,12 @@ def _render_result(result: pipeline.PipelineResult, session_date: date) -> str:
                 f"{html.escape(item.reason)}</li>"
             )
         parts.append(
-            '<div class="card warn"><strong>Needs manual review '
-            f"({len(result.review_items)}) &mdash; not inserted</strong><ul>{''.join(rows)}</ul></div>"
+            '<div class="card err"><strong>Could not be saved '
+            f"({len(result.review_items)})</strong> &mdash; these parts of the entry "
+            f"could not be turned into editable rows.<ul>{''.join(rows)}</ul></div>"
         )
-    elif not result.error and not result.duplicate_of_recent:
-        parts.append('<div class="card muted">Nothing needed review.</div>')
+    elif not result.error and not result.duplicate_of_recent and not skipped:
+        parts.append('<div class="card muted">Everything you ticked was saved.</div>')
 
     return "".join(parts)
 
@@ -329,14 +345,52 @@ async def index(_user: str = Depends(require_auth)) -> HTMLResponse:
     <option value="add" selected>Add to them &mdash; a second session, or more sets</option>
     <option value="replace">Replace them &mdash; discard that day and use this instead</option>
   </select>
-  <button type="submit">Parse &amp; save</button>
+  <button type="submit">Parse &amp; review</button>
 </form>
-<p class="muted">Sets below the confidence threshold
-({pipeline.CONFIDENCE_THRESHOLD:.0%}) are listed for review instead of being saved.
-Bodyweight mentions in the same entry are picked up automatically.
-<strong>Replace</strong> deletes everything already logged on that date, so use it to
-correct a bad entry &mdash; not to add an evening session.</p>
+<p class="muted">Parsing shows you every row it is about to write, with anything
+missing or invalid marked in red. Nothing is saved until you have looked at it
+and pressed save. Bodyweight mentions in the same entry are picked up
+automatically. <strong>Replace</strong> deletes everything already logged on that
+date, so use it to correct a bad entry &mdash; not to add an evening session.</p>
 """,
+    )
+
+
+def _parse_session_date(value: str) -> Optional[date]:
+    try:
+        return datetime.strptime((value or "").strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _invalid_date_page() -> HTMLResponse:
+    return _page(
+        "Invalid date",
+        '<h1>Result</h1><div class="card err">Session date must be YYYY-MM-DD.</div>'
+        '<p><a href="/">Back</a></p>',
+    )
+
+
+def _existing_counts(session_date: date) -> Optional[dict[str, int]]:
+    """What is already logged on that date, for the review banner.
+
+    Best effort: this only decorates the page, so a database that is briefly
+    unreachable should not cost the user the extraction they just paid for.
+    """
+    try:
+        return pipeline.count_entries_for_date(get_engine(), session_date)
+    except Exception:  # noqa: BLE001 - the save step will surface a real outage
+        logger.warning("event=existing_counts_failed date=%s", session_date, exc_info=True)
+        return None
+
+
+def _review_page(draft: pipeline.EntryDraft) -> HTMLResponse:
+    return _page(
+        "Check before saving",
+        review.render_review_body(
+            draft, _existing_counts(draft.session_date), pipeline.CONFIDENCE_THRESHOLD
+        ),
+        extra_css=review.REVIEW_CSS,
     )
 
 
@@ -347,36 +401,82 @@ async def log_entry(
     mode: str = Form("add"),
     _user: str = Depends(require_auth),
 ) -> HTMLResponse:
-    try:
-        parsed_date = datetime.strptime(session_date.strip(), "%Y-%m-%d").date()
-    except ValueError:
+    """Extract only. Nothing reaches the database until POST /save."""
+    parsed_date = _parse_session_date(session_date)
+    if parsed_date is None:
+        return _invalid_date_page()
+
+    draft = pipeline.build_draft(raw_text, parsed_date)
+    draft.replace_existing = mode == "replace"
+    logger.info(
+        "event=entry_drafted date=%s mode=%s sets=%d bodyweight=%s flagged=%d blocked=%d error=%s",
+        parsed_date,
+        mode,
+        len(draft.sets),
+        draft.bodyweight is not None,
+        draft.flagged_count,
+        draft.blocked_count,
+        bool(draft.error),
+    )
+
+    if draft.error:
+        notes = "".join(
+            f'<div class="card muted">{html.escape(item.reason)}</div>'
+            for item in draft.review_items
+        )
         return _page(
-            "Invalid date",
-            '<h1>Result</h1><div class="card err">Session date must be YYYY-MM-DD.</div>'
+            "Could not parse",
+            f'<h1>Could not parse that entry</h1>'
+            f'<div class="card err">{html.escape(draft.error)}</div>{notes}'
+            '<p class="muted">Nothing was saved. Go back and try again — the entry '
+            "is unchanged.</p>"
             '<p><a href="/">Back</a></p>',
         )
 
-    result = pipeline.process_entry(
-        raw_text,
-        parsed_date,
-        engine=get_engine(),
-        check_duplicates=True,
-        replace_existing=(mode == "replace"),
-    )
+    return _review_page(draft)
+
+
+@app.post("/save", response_class=HTMLResponse)
+async def save_reviewed(request: Request, _user: str = Depends(require_auth)) -> HTMLResponse:
+    """Write the reviewed form, or hand it back with one more empty slot.
+
+    The rows are rescored from the submitted values rather than from the
+    extraction, so a corrected field is judged on what the user actually typed.
+    A row the database would still reject sends the whole form back for another
+    pass instead of being quietly dropped.
+    """
+    form = await request.form()
+    try:
+        draft = review.draft_from_form(form)
+    except ValueError:
+        return _invalid_date_page()
+
+    # "Add a set" posts the same form; it hands back the draft plus an empty slot
+    # rather than saving, so a half-corrected row is not judged in passing.
+    if review.add_row(draft, str(form.get("action", "save"))):
+        return _review_page(draft)
+
+    if not draft.ready:
+        logger.info("event=save_blocked date=%s blocked=%d", draft.session_date, draft.blocked_count)
+        return _review_page(draft)
+
+    result = pipeline.commit_draft(draft, engine=get_engine(), check_duplicates=True)
     logger.info(
-        "event=log_processed date=%s mode=%s inserted_sets=%d inserted_bodyweight=%d "
-        "review=%d duplicate=%s replaced=%s",
-        parsed_date,
-        mode,
+        "event=entry_saved date=%s replace=%s inserted_sets=%d inserted_bodyweight=%d "
+        "skipped=%d review=%d duplicate=%s replaced=%s",
+        draft.session_date,
+        draft.replace_existing,
         result.inserted_sets,
         result.inserted_bodyweight,
+        result.skipped_sets + result.skipped_bodyweight,
         len(result.review_items),
         result.duplicate_of_recent,
         result.replaced,
     )
     return _page(
-        "Result",
-        f'<h1>Result</h1>{_render_result(result, parsed_date)}<p><a href="/">Log another</a></p>',
+        "Saved",
+        f'<h1>Saved</h1>{_render_result(result, draft.session_date)}'
+        '<p><a href="/">Log another</a></p>',
     )
 
 
