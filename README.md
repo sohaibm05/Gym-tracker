@@ -132,6 +132,24 @@ create or second-guess a recommendation. If the Groq call fails, you get
 `fallback_summary()` — the same numbers, less polish. A failed narration never
 costs you the report and never tempts anyone into letting the model fill a gap.
 
+### The two extraction attempts are deliberately different
+
+The first call uses Groq's JSON mode. The second drops it and parses the object
+out of the text.
+
+That is not belt-and-braces, it is the point. At `temperature=0` an identical
+retry reproduces an identical failure, so repeating the first call buys nothing
+against a deterministic error - and `json_validate_failed` is exactly that.
+
+`gpt-oss` models also reason before answering, at medium effort by default, and
+reasoning shares the completion budget with the answer. A long deliberation can
+leave nothing for the JSON, which the server then rejects as
+`json_validate_failed` with an empty `failed_generation`. `GROQ_REASONING_EFFORT`
+defaults to `low` and `GROQ_MAX_COMPLETION_TOKENS` to 8000 so there is room for
+both; extraction from text does not need deep deliberation. Both are sent via
+`extra_body`, so they work whatever `groq` SDK version is installed and are
+ignored by models that do not support them.
+
 ### Confidence is computed, not asked for
 
 LLMs are badly calibrated at rating their own certainty, so the model is

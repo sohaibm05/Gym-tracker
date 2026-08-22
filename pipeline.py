@@ -80,6 +80,14 @@ FUZZY_MATCH_THRESHOLD = float(env("FUZZY_MATCH_THRESHOLD", "85"))
 # before assuming this is still current.
 GROQ_MODEL = env("GROQ_MODEL", "openai/gpt-oss-120b")
 
+# gpt-oss models reason before answering, at "medium" effort by default. Reasoning
+# shares the completion budget with the answer, so a long deliberation can leave
+# nothing for the JSON - which the server rejects as json_validate_failed with an
+# empty failed_generation. Low effort plus a generous budget keeps room for both;
+# this is extraction from text, not a task needing deep deliberation.
+GROQ_REASONING_EFFORT = env("GROQ_REASONING_EFFORT", "low")
+GROQ_MAX_COMPLETION_TOKENS = int(env("GROQ_MAX_COMPLETION_TOKENS", "8000"))
+
 # Single fixed timezone: this is a single-user personal tool, so local wall-clock
 # time in the journal is always interpreted in this zone and stored as UTC.
 LOCAL_TIMEZONE = env("LOCAL_TIMEZONE", "UTC")
@@ -486,38 +494,103 @@ def _build_messages(raw_text: str, session_date: date) -> list[dict[str, str]]:
     ]
 
 
+def extract_json_object(content: Optional[str]) -> dict[str, Any]:
+    """Parse a JSON object from a model response, tolerating surrounding text.
+
+    Used by the fallback attempt, which runs without JSON mode and so may get
+    prose or a fenced block around the object. Scans for the first balanced
+    top-level {...}, ignoring braces inside strings.
+    """
+    if not content or not content.strip():
+        raise ValueError("model returned an empty response")
+    text_value = content.strip()
+    try:
+        payload = json.loads(text_value)
+    except json.JSONDecodeError:
+        start = text_value.find("{")
+        if start == -1:
+            raise ValueError("no JSON object in the response")
+        depth, in_string, escaped, end = 0, False, False, -1
+        for index in range(start, len(text_value)):
+            char = text_value[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+            elif char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index + 1
+                    break
+        if end == -1:
+            raise ValueError("unterminated JSON object in the response")
+        payload = json.loads(text_value[start:end])
+    if not isinstance(payload, dict):
+        raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
+    return payload
+
+
+def _extraction_attempts(model: str) -> list[dict[str, Any]]:
+    """The two attempts, deliberately different from each other.
+
+    At temperature 0 an identical retry reproduces an identical failure, so a
+    repeat of the first call buys nothing against a deterministic error - which
+    is exactly what json_validate_failed is. The second attempt therefore drops
+    JSON mode and parses the object out of the text instead, so a failure caused
+    by the server-side JSON validator has a way through.
+    """
+    extra: dict[str, Any] = {"max_completion_tokens": GROQ_MAX_COMPLETION_TOKENS}
+    # Sent through extra_body rather than a named argument so it works whatever
+    # groq SDK version is installed, and is simply ignored by models without it.
+    if "gpt-oss" in model and GROQ_REASONING_EFFORT:
+        extra["reasoning_effort"] = GROQ_REASONING_EFFORT
+    return [
+        {"response_format": {"type": "json_object"}, "extra_body": dict(extra)},
+        {"extra_body": dict(extra)},
+    ]
+
+
 def extract_entities(
     raw_text: str,
     session_date: date,
     client: Any = None,
     model: str = GROQ_MODEL,
 ) -> dict[str, Any]:
-    """Call Groq in JSON mode and return the parsed object.
+    """Call Groq and return the parsed object.
 
-    JSON mode (`response_format={"type": "json_object"}`) is used rather than
-    trusting the prompt to produce valid JSON. One retry is attempted on an API
-    error or a parse failure; after that the caller routes the entry to review.
+    The first attempt uses JSON mode (`response_format={"type": "json_object"}`)
+    rather than trusting the prompt alone. The second drops it and parses the
+    object out of the text, because the failure JSON mode produces most often -
+    the server rejecting an empty generation - repeats identically at
+    temperature 0. After both, the caller routes the entry to manual review.
     """
     if client is None:
         client = get_groq_client()
 
     last_error: Optional[Exception] = None
-    for attempt in (1, 2):
+    attempts = _extraction_attempts(model)
+    for number, options in enumerate(attempts, start=1):
         try:
             response = client.chat.completions.create(
                 model=model,
                 messages=_build_messages(raw_text, session_date),
-                response_format={"type": "json_object"},
                 temperature=0,
+                **options,
             )
-            content = response.choices[0].message.content
-            payload = json.loads(content)
-            if not isinstance(payload, dict):
-                raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
-            return payload
-        except Exception as exc:  # noqa: BLE001 - retry once on anything
+            return extract_json_object(response.choices[0].message.content)
+        except Exception as exc:  # noqa: BLE001 - fall through to the next attempt
             last_error = exc
-            logger.warning("Extraction attempt %d/2 failed: %s", attempt, exc)
+            logger.warning(
+                "Extraction attempt %d/%d failed (json_mode=%s): %s",
+                number, len(attempts), "response_format" in options, exc,
+            )
 
     raise ExtractionError(f"extraction failed after retry: {last_error}")
 

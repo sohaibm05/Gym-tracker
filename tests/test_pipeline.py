@@ -661,3 +661,111 @@ class TestReplaceIsOptIn:
         """Nothing to insert means nothing should have been deleted."""
         result = pipeline.process_entry("   ", date(2026, 8, 20))
         assert result.replaced is None and result.error
+
+
+# --------------------------------------------------------------------------
+# Extraction transport, after json_validate_failed on a reasoning model
+# --------------------------------------------------------------------------
+
+
+class TestJsonObjectExtraction:
+    """The fallback attempt runs without JSON mode, so the reply can carry
+    prose or a fenced block around the object."""
+
+    def test_plain_object(self):
+        assert pipeline.extract_json_object('{"sets": []}') == {"sets": []}
+
+    def test_fenced_block(self):
+        raw = '```json\n{"sets": [1]}\n```'
+        assert pipeline.extract_json_object(raw) == {"sets": [1]}
+
+    def test_prose_either_side(self):
+        raw = 'Here is the data:\n{"sets": [2]}\nHope that helps.'
+        assert pipeline.extract_json_object(raw) == {"sets": [2]}
+
+    def test_a_brace_inside_a_string_does_not_end_the_object(self):
+        raw = '{"sets": [], "note": "a } brace"}'
+        assert pipeline.extract_json_object(raw)["note"] == "a } brace"
+
+    def test_nested_objects(self):
+        assert pipeline.extract_json_object('{"a": {"b": {"c": 1}}}') == {"a": {"b": {"c": 1}}}
+
+    @pytest.mark.parametrize("value", ["", "   ", None])
+    def test_empty_response_is_rejected(self, value):
+        """The exact failure seen in production: the model emitted nothing."""
+        with pytest.raises(ValueError, match="empty"):
+            pipeline.extract_json_object(value)
+
+    def test_no_object_is_rejected(self):
+        with pytest.raises(ValueError, match="no JSON object"):
+            pipeline.extract_json_object("I could not parse that")
+
+    def test_array_is_rejected(self):
+        with pytest.raises(ValueError, match="expected a JSON object"):
+            pipeline.extract_json_object("[1, 2, 3]")
+
+    def test_unterminated_object_is_rejected(self):
+        with pytest.raises(ValueError, match="unterminated"):
+            pipeline.extract_json_object('{"sets": [1, 2')
+
+
+class TestExtractionAttemptsDiffer:
+    """At temperature 0 an identical retry reproduces an identical failure, so
+    the second attempt has to change something to be worth making."""
+
+    def test_first_attempt_uses_json_mode_and_the_second_does_not(self):
+        first, second = pipeline._extraction_attempts("openai/gpt-oss-120b")
+        assert first["response_format"] == {"type": "json_object"}
+        assert "response_format" not in second
+
+    def test_reasoning_effort_is_sent_for_gpt_oss(self):
+        """Reasoning shares the completion budget with the answer; at the
+        default effort it can consume all of it and emit nothing."""
+        for options in pipeline._extraction_attempts("openai/gpt-oss-120b"):
+            assert options["extra_body"]["reasoning_effort"] == "low"
+
+    def test_reasoning_effort_is_omitted_for_other_models(self):
+        for options in pipeline._extraction_attempts("llama-3.3-70b-versatile"):
+            assert "reasoning_effort" not in options["extra_body"]
+
+    def test_a_completion_budget_is_always_set(self):
+        for options in pipeline._extraction_attempts("openai/gpt-oss-120b"):
+            assert options["extra_body"]["max_completion_tokens"] > 0
+
+    def test_attempts_do_not_share_a_mutable_body(self):
+        first, second = pipeline._extraction_attempts("openai/gpt-oss-120b")
+        first["extra_body"]["max_completion_tokens"] = 1
+        assert second["extra_body"]["max_completion_tokens"] != 1
+
+
+class TestExtractionFallback:
+    def test_falls_back_to_text_parsing_when_json_mode_fails(self):
+        """json_validate_failed on the first call must not doom the entry."""
+        client = FakeClient([
+            RuntimeError("400 json_validate_failed ... 'failed_generation': ''"),
+            'Sure:\n```json\n{"sets": [], "bodyweight": null}\n```',
+        ])
+        result = extract_entities(RAW_ENTRY, date(2026, 8, 14), client=client)
+        assert result == {"sets": [], "bodyweight": None}
+        assert len(client.completions.calls) == 2
+
+    def test_the_second_call_really_drops_json_mode(self):
+        client = FakeClient([RuntimeError("json_validate_failed"), '{"sets": []}'])
+        extract_entities(RAW_ENTRY, date(2026, 8, 14), client=client)
+        assert "response_format" in client.completions.calls[0]
+        assert "response_format" not in client.completions.calls[1]
+
+    # These go through the module rather than the names imported at the top of
+    # this file: another test reloads pipeline, which rebinds its classes, so a
+    # name captured at import time would no longer be the class actually raised.
+    def test_an_empty_generation_on_both_attempts_goes_to_review(self):
+        client = FakeClient(["", ""])
+        with pytest.raises(pipeline.ExtractionError):
+            pipeline.extract_entities(RAW_ENTRY, date(2026, 8, 14), client=client)
+        assert len(client.completions.calls) == 2
+
+    def test_still_only_two_calls_in_total(self):
+        client = FakeClient([RuntimeError("a"), RuntimeError("b")])
+        with pytest.raises(pipeline.ExtractionError):
+            pipeline.extract_entities(RAW_ENTRY, date(2026, 8, 14), client=client)
+        assert len(client.completions.calls) == 2
