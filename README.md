@@ -23,7 +23,7 @@ Notes app (unchanged)
   -> editable preview of every prospective row review.render_review_body
        anything missing or invalid is red, and a row the database would
        reject cannot be saved until it is fixed or unticked
-  -> you edit, untick, and press save          app.py            POST /save
+  -> you edit, untick, add missed sets, save   app.py            POST /save
   -> rescored against what you actually typed  review.draft_from_form
   -> fuzzy match against existing exercises    pipeline.find_matching_exercise
   -> parameterized INSERT into Postgres        pipeline.commit_draft
@@ -42,7 +42,7 @@ below the confidence threshold is reported rather than saved
 | `pipeline.py` | All extraction / validation / insert logic. The CLI and web app both import this; neither reimplements any of it |
 | `parse_workout_log.py` | CLI: `python parse_workout_log.py <file> <date>` |
 | `app.py` | FastAPI web app — the phone-facing form, plus the weekly-report button |
-| `review.py` | The review screen: renders a draft as an editable form and reads the submission back |
+| `review.py` | The review screen: renders a draft as an editable form, reads the submission back, and adds empty slots on request |
 | `insights.py` | Weekly report. Stage A computes every number; Stage B only writes prose |
 | `charts.py` | The `/progress` page - inline-SVG charts, no chart library |
 | `seed_sample_data.py` | Seeds three weeks of realistic data so the report can be tried out |
@@ -212,6 +212,19 @@ Each row shows the span of your entry it was read from, so a suspicious value
 can be checked without scrolling back. Every row also carries a Save tick;
 unticking one drops it.
 
+**Add a set** appends an empty slot for something the parser missed entirely —
+a set you forgot to write down, or one lost in a run-on sentence. Adding is a
+round trip rather than a script: the form already carries the whole draft, so
+the server hands back the same state plus a slot, and the page stays
+JavaScript-free like the rest of the app. An empty slot is not a row: it is
+neither saved nor complained about, so there is no penalty for adding one and
+changing your mind. A slot you do fill in is validated like any other row, but
+not scored on grounding — it was never read out of the entry, so there is
+nothing to ground it in — and it is stored at confidence 1.0. The same applies
+to a bodyweight reading your entry never mentioned. If the extraction comes back
+with nothing at all, the add buttons are still there, so a failed parse is not a
+dead end.
+
 The submission is rescored from what you actually typed, not from the
 extraction — so correcting a field clears its mark, and breaking one adds a mark
 where there was none. The round trip is exact: a form rendered and posted back
@@ -242,9 +255,10 @@ In the web app the threshold marks rows rather than dropping them — you are
 looking at all of them anyway, and a set you can see and correct is worth more
 than one silently withheld. It still gates the CLI, which has nobody watching.
 
-A row you edit is stored at confidence 1.0. The score measures how well an
-extraction is grounded in the source text; once you have corrected a field by
-hand, your correction is better evidence than any grounding heuristic.
+A row you edit — or type in yourself — is stored at confidence 1.0. The score
+measures how well an extraction is grounded in the source text; once you have
+corrected a field by hand your correction is better evidence than any grounding
+heuristic, and for a hand-entered row there is no extraction to score at all.
 
 ### Exercise names are fuzzy-matched before a new row is created
 
@@ -465,7 +479,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-393 tests, no network and no database required — they cover the Stage A rule
+412 tests, no network and no database required — they cover the Stage A rule
 branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold), `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp

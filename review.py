@@ -60,6 +60,7 @@ body { max-width: 60rem; }
          padding: .6rem .8rem .8rem; margin: .7rem 0; }
 .draft.flagged { border-left-color: #dc2626; }
 .draft.dropped { opacity: .55; }
+.draft.blank { border-style: dashed; }
 .draft-head { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
               margin-bottom: .5rem; }
 .draft-head .name { font-weight: 600; }
@@ -68,6 +69,7 @@ body { max-width: 60rem; }
 .save-toggle input { width: 1.05rem; height: 1.05rem; margin: 0; accent-color: #2563eb; }
 .chip { font-size: .78rem; padding: .1rem .45rem; border-radius: 1rem;
         border: 1px solid #8886; opacity: .85; }
+.chip.chip-bad { border-color: #dc2626; color: #dc2626; opacity: 1; }
 .chip.bad { border-color: #dc2626; color: #dc2626; opacity: 1; }
 .chip.edited { border-color: #2563eb; color: #2563eb; opacity: 1; }
 .draft-grid { display: grid; gap: .5rem .6rem; grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -94,7 +96,8 @@ body { max-width: 60rem; }
 .evidence { margin: .5rem 0 0; font-size: .82rem; opacity: .65; }
 .actions { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-top: 1.2rem; }
 .actions button { margin-top: 0; width: auto; padding: .7rem 1.4rem; }
-.actions button[disabled] { background: #8886; cursor: not-allowed; }
+.actions button.secondary { background: transparent; color: inherit; border: 1px solid #8886; }
+.actions button.secondary:active { background: #8882; }
 details.entry summary { cursor: pointer; font-weight: 600; }
 details.entry pre { margin: .6rem 0 0; font-size: .9rem; opacity: .85; }
 """
@@ -169,9 +172,11 @@ def _row_card(
         # "confidence 0.00" on a row that never validated says nothing useful.
         chips.append('<span class="chip bad">cannot be saved yet</span>')
     elif row.confidence is not None:
-        bad = " bad" if row.confidence < confidence_threshold else ""
+        bad = " chip-bad" if row.confidence < confidence_threshold else ""
         chips.append(f'<span class="chip{bad}">confidence {row.confidence:.2f}</span>')
-    if row.edited:
+    if row.added:
+        chips.append('<span class="chip edited">typed in by you</span>')
+    elif row.edited:
         chips.append('<span class="chip edited">edited</span>')
 
     grid = "".join(
@@ -198,14 +203,27 @@ def _row_card(
     if span:
         evidence = f'<p class="evidence">Read from: &ldquo;{html.escape(span)}&rdquo;</p>'
 
+    if row.blank:
+        problems = (
+            '<p class="evidence">Fill this in to add something the parser missed. '
+            "Left empty, it is ignored.</p>"
+        )
+
     hidden = (
         f'<input type="hidden" name="{html.escape(prefix)}.raw_span" '
         f'value="{html.escape(display_value(row.values.get("raw_span")))}">'
         f'<input type="hidden" name="{html.escape(prefix)}.origin" '
         f'value="{html.escape(_origin_blob(row, columns))}">'
+        + (f'<input type="hidden" name="{html.escape(prefix)}.added" value="1">'
+           if row.added else "")
     )
 
-    classes = "draft" + (" flagged" if row.flagged else "") + ("" if row.include else " dropped")
+    classes = (
+        "draft"
+        + (" flagged" if row.flagged else "")
+        + (" blank" if row.blank else "")
+        + ("" if row.include else " dropped")
+    )
     return (
         f'<div class="{classes}">'
         f'<div class="draft-head">'
@@ -216,6 +234,29 @@ def _row_card(
         f"{flags}{problems}{evidence}{hidden}"
         f"</div>"
     )
+
+
+def _add_buttons(draft: EntryDraft, standalone: bool = True) -> str:
+    """Submit buttons that re-render the form with one more empty slot.
+
+    Adding a row is a round trip rather than a script: the form already carries
+    the whole draft, so the server can hand back the same state plus a slot, and
+    the page stays JavaScript-free like the rest of the app.
+
+    Save comes first in the markup on the full form, because pressing Enter in a
+    text field submits via the first button — and that should save, not add.
+    """
+    buttons = [
+        '<button type="submit" class="secondary" name="action" value="add_set">'
+        "Add a set</button>"
+    ]
+    if draft.bodyweight is None:
+        buttons.append(
+            '<button type="submit" class="secondary" name="action" value="add_bodyweight">'
+            "Add bodyweight</button>"
+        )
+    joined = "".join(buttons)
+    return f'<div class="actions">{joined}</div>' if standalone else joined
 
 
 def _banner(draft: EntryDraft, existing: Optional[Mapping[str, int]]) -> str:
@@ -287,19 +328,21 @@ def render_review_body(
     )
 
     if draft.is_empty:
+        # A dead end otherwise: the parser found nothing, but the workout still
+        # happened, so the same add buttons are offered without any rows above them.
         return (
             "<h1>Nothing to save</h1>"
             '<div class="card err">No sets or bodyweight readings came back from '
-            "that entry.</div>"
+            "that entry. You can still enter them by hand.</div>"
             f"{_banner(draft, existing)}{entry}"
-            '<p><a href="/">Back</a></p>'
+            f'<form method="post" action="/save">{hidden}{_add_buttons(draft)}</form>'
         )
 
     cards = "".join(
         _row_card(
             row,
             f"s{index}",
-            f"Set {index + 1}",
+            "New set" if row.blank else f"Set {index + 1}",
             SET_FIELDS,
             pipeline.SET_COLUMNS,
             SET_CHECKBOXES,
@@ -313,7 +356,7 @@ def render_review_body(
         bodyweight = "<h2>Bodyweight</h2>" + _row_card(
             draft.bodyweight,
             "bw",
-            "Bodyweight",
+            "New bodyweight reading" if draft.bodyweight.blank else "Bodyweight",
             BODYWEIGHT_FIELDS,
             pipeline.BODYWEIGHT_COLUMNS,
             (),
@@ -322,7 +365,7 @@ def render_review_body(
 
     # The button label stays static: the page carries no JavaScript, so a count
     # baked in at render time would go stale the moment a box is unticked.
-    total = len(draft.rows)
+    total = len(draft.included)
 
     return f"""
 <h1>Check before saving</h1>
@@ -333,14 +376,16 @@ untick anything that should not be saved, then save. Nothing has been stored yet
 {entry}
 <form method="post" action="/save">
 {hidden}
-<h2>Sets ({len(draft.sets)})</h2>
+<h2>Sets ({sum(1 for row in draft.sets if not row.blank)})</h2>
 {cards}
 {bodyweight}
 <div class="actions">
-  <button type="submit">Save to database</button>
+  <button type="submit" name="action" value="save">Save to database</button>
+  {_add_buttons(draft, standalone=False)}
   <a href="/">Discard and start over</a>
 </div>
-<p class="muted">{total} row(s) drafted. Only the ticked ones are saved.</p>
+<p class="muted">{total} row(s) drafted. Only the ticked ones are saved; an empty
+slot is ignored.</p>
 </form>
 """
 
@@ -424,7 +469,11 @@ def draft_from_form(
         prefix = f"s{index}"
         values = _row_values(form, prefix, pipeline.SET_COLUMNS, checkbox_columns)
         row = pipeline.draft_set_row(
-            values, raw_text, confidence_threshold, edited=_was_edited(form, prefix, values)
+            values,
+            raw_text,
+            confidence_threshold,
+            edited=_was_edited(form, prefix, values),
+            added=f"{prefix}.added" in form,
         )
         row.include = f"{prefix}.include" in form
         draft.sets.append(row)
@@ -432,9 +481,28 @@ def draft_from_form(
     if str(form.get("has_bodyweight", "")).strip():
         values = _row_values(form, "bw", pipeline.BODYWEIGHT_COLUMNS, ())
         row = pipeline.draft_bodyweight_row(
-            values, raw_text, confidence_threshold, edited=_was_edited(form, "bw", values)
+            values,
+            raw_text,
+            confidence_threshold,
+            edited=_was_edited(form, "bw", values),
+            added="bw.added" in form,
         )
         row.include = "bw.include" in form
         draft.bodyweight = row
 
     return draft
+
+
+def add_row(draft: EntryDraft, action: str) -> bool:
+    """Give the draft one more empty slot. True when `action` asked for one.
+
+    Adding never validates or saves — the user may well be part way through
+    fixing something else on the same form.
+    """
+    if action == "add_set":
+        draft.sets.append(pipeline.blank_set_row())
+        return True
+    if action == "add_bodyweight" and draft.bodyweight is None:
+        draft.bodyweight = pipeline.blank_bodyweight_row()
+        return True
+    return False

@@ -438,7 +438,7 @@ async def log_entry(
 
 @app.post("/save", response_class=HTMLResponse)
 async def save_reviewed(request: Request, _user: str = Depends(require_auth)) -> HTMLResponse:
-    """Write the reviewed form. The only route that inserts.
+    """Write the reviewed form, or hand it back with one more empty slot.
 
     The rows are rescored from the submitted values rather than from the
     extraction, so a corrected field is judged on what the user actually typed.
@@ -450,6 +450,11 @@ async def save_reviewed(request: Request, _user: str = Depends(require_auth)) ->
         draft = review.draft_from_form(form)
     except ValueError:
         return _invalid_date_page()
+
+    # "Add a set" posts the same form; it hands back the draft plus an empty slot
+    # rather than saving, so a half-corrected row is not judged in passing.
+    if review.add_row(draft, str(form.get("action", "save"))):
+        return _review_page(draft)
 
     if not draft.ready:
         logger.info("event=save_blocked date=%s blocked=%d", draft.session_date, draft.blocked_count)

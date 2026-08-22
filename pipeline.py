@@ -329,6 +329,12 @@ class DraftRow:
     issues: list[DraftIssue] = field(default_factory=list)
     include: bool = True
     edited: bool = False  # a person changed a value on the review screen
+    # Typed in on the review screen rather than read out of the entry. Such a row
+    # has no source text behind it, so the grounding checks do not apply to it.
+    added: bool = False
+    # An added row nobody has filled in yet: not a row at all, so it is neither
+    # saved nor complained about.
+    blank: bool = False
     # The exact wording `process_entry` used before the review screen existed,
     # kept so the CLI and the unattended path still report failures the same way.
     validation_error: Optional[str] = None
@@ -380,7 +386,7 @@ class EntryDraft:
 
     @property
     def included(self) -> list[DraftRow]:
-        return [row for row in self.rows if row.include]
+        return [row for row in self.rows if row.include and not row.blank]
 
     @property
     def flagged_count(self) -> int:
@@ -1154,16 +1160,45 @@ def _pick(
     return picked
 
 
+def _is_blank(values: dict[str, Any], defaults: dict[str, Any]) -> bool:
+    """True when nothing has been entered — every column still holds its default.
+
+    Compared as text as well as by value, because anything that has been through
+    a form arrives as a string: an untouched cheat-rep box submits "0", not 0,
+    and an empty slot that failed this check would fail validation on its blank
+    exercise name instead of being ignored.
+    """
+    return all(
+        value == defaults[column] or str(value).strip() == str(defaults[column])
+        for column, value in values.items()
+    )
+
+
 def draft_set_row(
     values: dict[str, Any],
     raw_text: str,
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
     edited: bool = False,
+    added: bool = False,
 ) -> DraftRow:
-    """Score one set and describe everything a person should look at before saving."""
-    row = DraftRow("workout_set", _pick(values, SET_COLUMNS, SET_DEFAULTS), edited=edited)
+    """Score one set and describe everything a person should look at before saving.
+
+    `added` marks a row typed in on the review screen rather than read out of the
+    entry. There is no source text behind such a row, so the grounding checks —
+    which ask how well a reading is supported by what was written — would be
+    measuring nothing. Missing weights and reps are still worth pointing out.
+    """
+    row = DraftRow(
+        "workout_set", _pick(values, SET_COLUMNS, SET_DEFAULTS), edited=edited, added=added
+    )
+    if _is_blank(row.values, SET_DEFAULTS):
+        # An empty slot the user has not filled in. Not a row, so it is neither
+        # saved nor complained about.
+        row.blank = True
+        return row
+
     workout_set, confidence, exc = score_set(row.values, raw_text)
-    row.confidence = confidence
+    row.confidence = 1.0 if added else confidence
 
     if exc is not None:
         row.validation_error = f"failed validation: {_short_errors(exc)}"
@@ -1175,14 +1210,15 @@ def draft_set_row(
 
     if workout_set.weight_kg is None:
         row.issues.append(
-            DraftIssue("no weight found in your entry — saved blank unless you fill it in",
-                       "weight_kg")
+            DraftIssue("no weight recorded — saved blank unless you fill it in", "weight_kg")
         )
     if workout_set.reps is None:
         row.issues.append(
-            DraftIssue("no rep count found in your entry — saved blank unless you fill it in",
-                       "reps")
+            DraftIssue("no rep count recorded — saved blank unless you fill it in", "reps")
         )
+    if added:
+        return row
+
     if _grounding_similarity(workout_set.exercise_name, workout_set.raw_span or raw_text) < 0.5:
         row.issues.append(
             DraftIssue("this name does not closely match the text it was read from",
@@ -1205,11 +1241,21 @@ def draft_bodyweight_row(
     raw_text: str,
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
     edited: bool = False,
+    added: bool = False,
 ) -> DraftRow:
     """`draft_set_row`, for the bodyweight reading."""
-    row = DraftRow("bodyweight", _pick(values, BODYWEIGHT_COLUMNS, BODYWEIGHT_DEFAULTS), edited=edited)
+    row = DraftRow(
+        "bodyweight",
+        _pick(values, BODYWEIGHT_COLUMNS, BODYWEIGHT_DEFAULTS),
+        edited=edited,
+        added=added,
+    )
+    if _is_blank(row.values, BODYWEIGHT_DEFAULTS):
+        row.blank = True
+        return row
+
     entry, confidence, exc = score_bodyweight(row.values, raw_text)
-    row.confidence = confidence
+    row.confidence = 1.0 if added else confidence
 
     if exc is not None:
         row.validation_error = f"failed validation: {_short_errors(exc)}"
@@ -1217,6 +1263,9 @@ def draft_bodyweight_row(
         return row
 
     row.values = _pick(entry.model_dump(), BODYWEIGHT_COLUMNS, BODYWEIGHT_DEFAULTS)
+    if added:
+        return row
+
     haystack = _normalize_numeric_text(entry.raw_span or raw_text)
     if not _number_appears_in(float(entry.weight_kg), haystack):
         row.issues.append(
@@ -1230,6 +1279,16 @@ def draft_bodyweight_row(
             )
         )
     return row
+
+
+def blank_set_row() -> DraftRow:
+    """An empty slot for a set the extraction missed entirely."""
+    return DraftRow("workout_set", dict(SET_DEFAULTS), added=True, blank=True)
+
+
+def blank_bodyweight_row() -> DraftRow:
+    """An empty slot for a bodyweight reading the entry never mentioned."""
+    return DraftRow("bodyweight", dict(BODYWEIGHT_DEFAULTS), added=True, blank=True)
 
 
 def draft_from_payload(
@@ -1482,9 +1541,13 @@ def commit_draft(
     back as review items, which is what the unattended path reports.
 
     Confidence is recomputed from the values as they stand. A row a person
-    edited is stored at 1.0: the score measures how well an extraction is
-    grounded in the source text, and a human correction is better evidence
-    than any grounding heuristic.
+    edited or typed in themselves is stored at 1.0: the score measures how well
+    an extraction is grounded in the source text, and a human correction is
+    better evidence than any grounding heuristic — for a hand-entered row there
+    is no extraction to score at all.
+
+    Blank slots are skipped in silence. They are offers to add a row that nobody
+    took up, so they are neither saved nor reported as left out.
     """
     if engine is None:
         engine = get_engine()
@@ -1506,6 +1569,8 @@ def commit_draft(
 
     accepted_sets: list[tuple[WorkoutSet, float]] = []
     for row in draft.sets:
+        if row.blank:
+            continue
         if not row.include:
             result.skipped_sets += 1
             if review_excluded:
@@ -1527,10 +1592,10 @@ def commit_draft(
                            row.confidence, dict(row.values))
             )
             continue
-        accepted_sets.append((workout_set, 1.0 if row.edited else confidence))
+        accepted_sets.append((workout_set, 1.0 if row.edited or row.added else confidence))
 
     accepted_bodyweight: Optional[tuple[BodyweightEntry, float]] = None
-    if draft.bodyweight is not None:
+    if draft.bodyweight is not None and not draft.bodyweight.blank:
         row = draft.bodyweight
         if not row.include:
             result.skipped_bodyweight += 1
@@ -1547,7 +1612,7 @@ def commit_draft(
                                row.confidence, dict(row.values))
                 )
             else:
-                accepted_bodyweight = (entry, 1.0 if row.edited else confidence)
+                accepted_bodyweight = (entry, 1.0 if row.edited or row.added else confidence)
 
     if not accepted_sets and accepted_bodyweight is None:
         return result

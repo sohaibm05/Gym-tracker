@@ -188,7 +188,7 @@ class TestRendering:
         assert 'name="s0.reps" class=""' in page
 
     def test_the_issue_is_spelled_out_next_to_the_row(self):
-        assert "no rep count found" in review.render_review_body(draft_for())
+        assert "no rep count recorded" in review.render_review_body(draft_for())
 
     def test_a_row_that_cannot_be_saved_says_so_instead_of_showing_a_zero_score(self):
         payload = {"sets": [{"exercise_name": "Bench", "reps": "eleven"}]}
@@ -220,9 +220,19 @@ class TestRendering:
         page = review.render_review_body(draft, {"sets": 12, "bodyweight": 1})
         assert "deletes the 12 set(s)" in page
 
-    def test_an_empty_draft_offers_no_form(self):
+    def test_an_empty_draft_still_offers_a_way_in(self):
+        """The parser finding nothing does not mean the workout did not happen."""
         page = review.render_review_body(draft_for({"sets": [], "bodyweight": None}))
-        assert "Nothing to save" in page and "<form" not in page
+        assert "Nothing to save" in page and 'value="add_set"' in page
+
+    def test_save_is_the_first_button_so_enter_does_not_add_a_row(self):
+        page = review.render_review_body(draft_for())
+        assert page.index('value="save"') < page.index('value="add_set"')
+
+    def test_bodyweight_can_only_be_added_when_there_is_none(self):
+        assert 'value="add_bodyweight"' not in review.render_review_body(draft_for())
+        without = draft_for({"sets": PAYLOAD["sets"], "bodyweight": None})
+        assert 'value="add_bodyweight"' in review.render_review_body(without)
 
 
 # --------------------------------------------------------------------------
@@ -335,6 +345,89 @@ class TestEditing:
         corrected = review.draft_from_form(form)
         again = review.draft_from_form(submitted(corrected))
         assert [row.values for row in again.sets] == [row.values for row in corrected.sets]
+
+
+class TestAddingRows:
+    """A set the parser missed entirely is typed in on the same form. Adding is a
+    round trip rather than a script, so the state has to survive the extra hop."""
+
+    def add(self, draft, action="add_set"):
+        returned = review.draft_from_form(submitted(draft))
+        assert review.add_row(returned, action)
+        return returned
+
+    def test_an_empty_slot_is_appended(self):
+        assert len(self.add(draft_for()).sets) == 4
+
+    def test_an_unknown_action_adds_nothing(self):
+        draft = draft_for()
+        assert not review.add_row(draft, "save") and len(draft.sets) == 3
+
+    def test_bodyweight_is_not_added_twice(self):
+        draft = draft_for()
+        assert not review.add_row(draft, "add_bodyweight")
+
+    def test_an_empty_slot_is_not_a_row(self):
+        draft = self.add(draft_for())
+        assert draft.sets[3].blank and len(draft.included) == 4
+
+    def test_an_empty_slot_does_not_block_the_save(self):
+        """A blank exercise name would otherwise fail validation on sight."""
+        draft = self.add(draft_for())
+        assert draft.ready and draft.flagged_count == 2
+
+    def test_an_empty_slot_survives_the_round_trip_still_empty(self):
+        draft = review.draft_from_form(submitted(self.add(draft_for())))
+        assert len(draft.sets) == 4 and draft.sets[3].blank
+
+    def test_filling_a_slot_in_makes_it_a_row(self):
+        form = submitted(self.add(draft_for()))
+        form["s3.exercise_name"] = "Face Pull"
+        form["s3.weight_kg"] = "15"
+        form["s3.reps"] = "12"
+        row = review.draft_from_form(form).sets[3]
+        assert not row.blank and row.added and row.values["exercise_name"] == "Face Pull"
+
+    def test_a_typed_row_is_not_judged_on_grounding(self):
+        """It was never read out of the entry, so there is nothing to ground it in."""
+        form = submitted(self.add(draft_for()))
+        form["s3.exercise_name"] = "Bulgarian Split Squat"
+        form["s3.weight_kg"] = "20"
+        form["s3.reps"] = "10"
+        row = review.draft_from_form(form).sets[3]
+        assert row.issues == [] and row.confidence == 1.0
+
+    def test_a_typed_row_still_says_what_is_missing(self):
+        form = submitted(self.add(draft_for()))
+        form["s3.exercise_name"] = "Face Pull"
+        assert review.draft_from_form(form).sets[3].issues_for("weight_kg")
+
+    def test_a_typed_row_is_still_validated(self):
+        form = submitted(self.add(draft_for()))
+        form["s3.exercise_name"] = "Face Pull"
+        form["s3.reps"] = "twelve"
+        returned = review.draft_from_form(form)
+        assert not returned.ready and returned.sets[3].issues_for("reps")
+
+    def test_a_typed_bodyweight_reading_survives(self):
+        without = draft_for({"sets": PAYLOAD["sets"], "bodyweight": None})
+        form = submitted(self.add(without, "add_bodyweight"))
+        form["bw.weight_kg"] = "81.2"
+        row = review.draft_from_form(form).bodyweight
+        assert row.added and not row.blank and row.values["weight_kg"] == 81.2
+
+    def test_a_typed_bodyweight_reading_is_not_judged_on_grounding(self):
+        without = draft_for({"sets": PAYLOAD["sets"], "bodyweight": None})
+        form = submitted(self.add(without, "add_bodyweight"))
+        form["bw.weight_kg"] = "81.2"
+        assert review.draft_from_form(form).bodyweight.issues == []
+
+    def test_an_empty_slot_reads_as_an_invitation_not_a_fault(self):
+        page = review.render_review_body(self.add(draft_for()))
+        assert "New set" in page and "cannot be saved yet" not in page
+
+    def test_an_empty_slot_is_not_counted_as_a_set(self):
+        assert "<h2>Sets (3)</h2>" in review.render_review_body(self.add(draft_for()))
 
 
 # --------------------------------------------------------------------------
@@ -460,6 +553,27 @@ class TestCommitting:
         draft = draft_for({"sets": ["a bare string"], "bodyweight": None})
         result, _ = commit(draft)
         assert len(result.review_items) == 1
+
+    def test_an_empty_slot_is_neither_saved_nor_reported(self):
+        draft = draft_for()
+        draft.sets.append(pipeline.blank_set_row())
+        result, engine = commit(draft)
+        assert len(engine.inserted) == 4
+        assert result.skipped_sets == 0 and result.review_items == []
+
+    def test_an_empty_bodyweight_slot_is_ignored(self):
+        draft = draft_for({"sets": PAYLOAD["sets"], "bodyweight": None})
+        draft.bodyweight = pipeline.blank_bodyweight_row()
+        result, _ = commit(draft)
+        assert result.inserted_bodyweight == 0 and result.skipped_bodyweight == 0
+
+    def test_a_typed_row_is_written(self):
+        draft = draft_for()
+        draft.sets.append(pipeline.draft_set_row(
+            {"exercise_name": "Face Pull", "weight_kg": 15, "reps": 12}, RAW_ENTRY, added=True))
+        result, engine = commit(draft)
+        assert result.inserted_sets == 4
+        assert engine.inserted[3]["extraction_confidence"] == 1.0
 
     def test_an_extraction_failure_writes_nothing(self):
         draft = pipeline.EntryDraft(RAW_ENTRY, SESSION, error="Extraction failed")
