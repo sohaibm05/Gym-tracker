@@ -135,3 +135,44 @@ class TestMask:
 
     def test_short_secret_is_fully_starred(self):
         assert parse_workout_log._mask("APP_PASSWORD", "abc123") == "******"
+
+
+# --------------------------------------------------------------------------
+# Vercel entrypoint: api/index.py must expose the same app, importable from api/
+# --------------------------------------------------------------------------
+
+
+class TestVercelEntrypoint:
+    def test_entrypoint_exports_the_same_app(self):
+        import importlib.util
+        from pathlib import Path
+
+        entry = Path(__file__).resolve().parent.parent / "api" / "index.py"
+        assert entry.is_file(), "api/index.py is the Vercel entrypoint and must exist"
+
+        spec = importlib.util.spec_from_file_location("vercel_entry", entry)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        import app as app_module
+
+        assert module.app is app_module.app
+
+    def test_vercel_json_routes_to_the_entrypoint(self):
+        import json
+        from pathlib import Path
+
+        config = json.loads(
+            (Path(__file__).resolve().parent.parent / "vercel.json").read_text()
+        )
+        assert config["rewrites"][0]["destination"] == "/api/index"
+        assert "api/index.py" in config["functions"]
+
+    def test_tzdata_is_pinned(self):
+        """zoneinfo reads the OS tz database; slim images often lack it."""
+        from pathlib import Path
+
+        requirements = (
+            Path(__file__).resolve().parent.parent / "requirements.txt"
+        ).read_text()
+        assert "tzdata" in requirements

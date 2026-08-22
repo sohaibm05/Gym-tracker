@@ -7,3 +7,6 @@ uvicorn[standard]>=0.30
 python-multipart>=0.0.9
 rapidfuzz>=3.9
 python-dotenv>=1.0
+# zoneinfo reads the IANA database from the OS. Slim serverless images often
+# ship without it, which makes ZoneInfo("Asia/Karachi") raise at runtime.
+tzdata>=2024.1
