@@ -110,11 +110,11 @@ class TestDraftBuilding:
 class TestFlagging:
     def test_missing_weight_is_flagged_on_its_own_field(self):
         row = draft_for().sets[2]
-        assert [issue.field for issue in row.issues] == ["weight_kg"]
+        assert "weight_kg" in [issue.field for issue in row.issues]
 
     def test_missing_reps_is_flagged_on_its_own_field(self):
         row = draft_for().sets[1]
-        assert [issue.field for issue in row.issues] == ["reps"]
+        assert "reps" in [issue.field for issue in row.issues]
 
     def test_missing_information_does_not_block_the_save(self):
         """A set with no recorded weight is still a set that happened."""
@@ -166,6 +166,93 @@ class TestBlockingIssues:
     def test_a_blank_name_blocks_rather_than_inserting_an_empty_exercise(self):
         payload = {"sets": [{"exercise_name": "   ", "weight_kg": 20, "reps": 10}]}
         assert draft_for(payload).sets[0].blocking
+
+
+class TestMuscleGroupSuggestion:
+    """The entry never mentions a muscle group and the extraction is not asked
+    for one, so it is suggested — which makes it exactly the kind of value that
+    has to be visible and correctable rather than decided off-screen."""
+
+    def test_a_recognised_name_is_filled_in(self):
+        assert draft_for().sets[0].values["muscle_group"] == "Chest"
+
+    def test_a_recognised_name_is_not_flagged(self):
+        assert draft_for().sets[0].issues_for("muscle_group") == []
+
+    def test_a_name_the_table_does_not_know_is_flagged(self):
+        """Left alone it becomes "Unassigned" in the volume chart, silently."""
+        row = draft_for().sets[1]
+        assert row.values["muscle_group"] is None
+        assert "Unassigned" in row.issues_for("muscle_group")[0].message
+
+    def test_an_unknown_group_does_not_block_the_save(self):
+        assert draft_for().ready
+
+    def test_what_the_exercise_is_already_filed_under_wins(self):
+        """`get_or_create_exercise` never revises a stored group on its own, so
+        offering a table answer that disagreed would be offering a lie."""
+        known = {"Chest Bench Press": "Shoulders"}
+        row = pipeline.draft_set_row(PAYLOAD["sets"][0], RAW_ENTRY, known_groups=known)
+        assert row.values["muscle_group"] == "Shoulders"
+
+    def test_a_stored_group_is_found_through_a_reworded_name(self):
+        known = {"Chest Bench Press": "Chest"}
+        row = pipeline.draft_set_row(
+            {"exercise_name": "Barbell Chest Bench Press", "weight_kg": 28, "reps": 11},
+            RAW_ENTRY, known_groups=known)
+        assert row.values["muscle_group"] == "Chest"
+
+    def test_a_stored_blank_falls_through_to_the_table(self):
+        known = {"Chest Bench Press": None}
+        row = pipeline.draft_set_row(PAYLOAD["sets"][0], RAW_ENTRY, known_groups=known)
+        assert row.values["muscle_group"] == "Chest"
+
+    def test_an_extracted_group_is_kept(self):
+        payload = {"sets": [dict(PAYLOAD["sets"][0], muscle_group="Triceps")]}
+        assert draft_for(payload).sets[0].values["muscle_group"] == "Triceps"
+
+
+class TestMuscleGroupEditing:
+    def test_a_correction_is_taken(self):
+        form = submitted(draft_for())
+        form["s1.muscle_group"] = "Back"
+        row = review.draft_from_form(form).sets[1]
+        assert row.values["muscle_group"] == "Back" and row.issues_for("muscle_group") == []
+
+    def test_a_correction_is_recorded_as_chosen_by_the_user(self):
+        form = submitted(draft_for())
+        form["s1.muscle_group"] = "Back"
+        assert "muscle_group" in review.draft_from_form(form).sets[1].edited_fields
+
+    def test_a_suggestion_left_alone_is_not_chosen_by_the_user(self):
+        form = submitted(draft_for())
+        assert "muscle_group" not in review.draft_from_form(form).sets[0].edited_fields
+
+    def test_a_group_the_user_clears_is_not_suggested_again(self):
+        """Otherwise the box could never be emptied on purpose."""
+        form = submitted(draft_for())
+        form["s0.muscle_group"] = ""
+        row = review.draft_from_form(form).sets[0]
+        assert row.values["muscle_group"] is None
+        assert "muscle_group" in row.edited_fields
+
+    def test_renaming_the_exercise_reanswers_an_untouched_group(self):
+        """The old suggestion belongs to the old name."""
+        form = submitted(draft_for())
+        form["s0.exercise_name"] = "Preacher Curl"
+        assert review.draft_from_form(form).sets[0].values["muscle_group"] == "Biceps"
+
+    def test_a_non_standard_group_is_flagged_but_savable(self):
+        form = submitted(draft_for())
+        form["s0.muscle_group"] = "Pecs"
+        returned = review.draft_from_form(form)
+        assert returned.sets[0].issues_for("muscle_group") and returned.ready
+
+    def test_the_standard_groups_are_offered_as_a_pick_list(self):
+        page = review.render_review_body(draft_for())
+        assert '<datalist id="muscle-groups">' in page
+        assert 'list="muscle-groups"' in page
+        assert '<option value="Glutes">' in page
 
 
 # --------------------------------------------------------------------------
@@ -282,7 +369,7 @@ class TestEditing:
     def test_correcting_a_field_clears_its_mark(self):
         form = submitted(draft_for())
         form["s1.reps"] = "9"
-        assert review.draft_from_form(form).sets[1].issues == []
+        assert review.draft_from_form(form).sets[1].issues_for("reps") == []
 
     def test_a_corrected_row_is_recorded_as_edited(self):
         form = submitted(draft_for())
@@ -396,6 +483,7 @@ class TestAddingRows:
         form["s3.reps"] = "10"
         row = review.draft_from_form(form).sets[3]
         assert row.issues == [] and row.confidence == 1.0
+        assert row.values["muscle_group"] == "Legs"
 
     def test_a_typed_row_still_says_what_is_missing(self):
         form = submitted(self.add(draft_for()))

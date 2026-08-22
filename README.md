@@ -237,6 +237,36 @@ state between the two requests. The draft travels in the form itself, which is
 why the flow works unchanged on a serverless deploy where the two requests may
 not reach the same process.
 
+### Muscle group is suggested, then reviewed
+
+Nobody writes "chest" in a gym journal, and the extraction is never asked for a
+muscle group — so the column filled itself in silently from the static table and
+nothing ever showed you the answer. `exercises.muscle_group` is written once per
+distinct movement and then never revisited, and `insights.volume_by_muscle_group`
+buckets on it exactly as stored, so a wrong or blank one is a chart that quietly
+misreports for months.
+
+It is now suggested into the review form like any other value, and correctable
+there. The suggestion comes from what the exercise is **already filed under**
+first — matched the same fuzzy way the insert path matches names, so a reworded
+name still finds its own row — and falls back to the table. Stored wins because
+`get_or_create_exercise` never revises a stored group on its own: offering a
+table answer that disagreed with one would be offering an edit that saving
+ignores.
+
+Two things are marked in red: a name the table cannot place (left alone it
+becomes "Unassigned" in the volume chart), and a group outside the ten canonical
+ones (it would become its own bucket). Neither blocks the save — muscle group is
+a filing decision, not a fact about the set. The ten standard groups are offered
+as a pick list, which is a `<datalist>`, so it suggests without refusing
+anything you insist on.
+
+A group **you type** is treated differently from one the app suggested: it is
+the only thing that will re-file an exercise that already exists. That
+distinction is why edits are tracked per field rather than per row. Without it
+correcting a group on an exercise you had logged before would appear to work and
+change nothing.
+
 ### Confidence is computed, not asked for
 
 LLMs are badly calibrated at rating their own certainty, so the model is
@@ -526,11 +556,11 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-628 tests, no network and no database required — they cover the Stage A
+643 tests, no network and no database required — they cover the Stage A
 rule branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold), `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
-resolution and JSON-mode retry behaviour, the muscle-group tables — both their
+resolution and JSON-mode retry behaviour, the muscle-group tables and how their answer is suggested and overridden — both their
 resolution cases and mechanical guards that every key is in the normalized form
 lookup actually produces — and the review screen's draft/edit/save round trip.
 These are pure functions, so they are cheap to cover, and they are exactly the

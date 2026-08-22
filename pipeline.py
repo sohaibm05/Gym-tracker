@@ -21,7 +21,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from rapidfuzz import fuzz
@@ -331,6 +331,10 @@ class DraftRow:
     issues: list[DraftIssue] = field(default_factory=list)
     include: bool = True
     edited: bool = False  # a person changed a value on the review screen
+    # Which columns they changed. Muscle group needs this: a value the user
+    # chose may overwrite what is on record for an exercise, a suggestion the
+    # app filled in must not.
+    edited_fields: frozenset[str] = frozenset()
     # Typed in on the review screen rather than read out of the entry. Such a row
     # has no source text behind it, so the grounding checks do not apply to it.
     added: bool = False
@@ -1186,12 +1190,34 @@ def _is_blank(values: dict[str, Any], defaults: dict[str, Any]) -> bool:
     )
 
 
+def suggest_muscle_group(
+    exercise_name: str,
+    known_groups: Optional[Mapping[str, Optional[str]]] = None,
+) -> Optional[str]:
+    """The muscle group to offer for an exercise name, or None if nothing fits.
+
+    What is already on record wins over the table. `get_or_create_exercise`
+    never revises a stored group on its own, so offering a table answer that
+    disagrees with one would show the user a value that saving quietly ignores.
+    The name is fuzzy-matched the same way the insert path matches it, so a
+    reworded name still finds its own row.
+    """
+    if known_groups:
+        matched = find_matching_exercise(exercise_name, known_groups.keys())
+        if matched is not None and known_groups[matched]:
+            return known_groups[matched]
+    return resolve_muscle_group(exercise_name)
+
+
 def draft_set_row(
     values: dict[str, Any],
     raw_text: str,
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
     edited: bool = False,
     added: bool = False,
+    edited_fields: frozenset[str] = frozenset(),
+    known_groups: Optional[Mapping[str, Optional[str]]] = None,
+    resuggest_muscle_group: bool = False,
 ) -> DraftRow:
     """Score one set and describe everything a person should look at before saving.
 
@@ -1201,7 +1227,11 @@ def draft_set_row(
     measuring nothing. Missing weights and reps are still worth pointing out.
     """
     row = DraftRow(
-        "workout_set", _pick(values, SET_COLUMNS, SET_DEFAULTS), edited=edited, added=added
+        "workout_set",
+        _pick(values, SET_COLUMNS, SET_DEFAULTS),
+        edited=edited,
+        added=added,
+        edited_fields=edited_fields,
     )
     if _is_blank(row.values, SET_DEFAULTS):
         # An empty slot the user has not filled in. Not a row, so it is neither
@@ -1228,6 +1258,20 @@ def draft_set_row(
         row.issues.append(
             DraftIssue("no rep count recorded — saved blank unless you fill it in", "reps")
         )
+
+    # Suggested rather than read: the extraction is never asked for a muscle
+    # group. A value already there is kept on the way in, so the rare one a model
+    # does volunteer still counts; on the way back from the review screen it is
+    # recomputed unless the user took the field over, because by then the value
+    # sitting in the box is this function's own last answer — and renaming the
+    # exercise has to re-answer it rather than leave the old name's group behind.
+    if "muscle_group" not in row.edited_fields:
+        current = None if resuggest_muscle_group else row.values.get("muscle_group")
+        row.values["muscle_group"] = current or suggest_muscle_group(
+            workout_set.exercise_name, known_groups
+        )
+    _flag_muscle_group(row)
+
     if added:
         return row
 
@@ -1246,6 +1290,34 @@ def draft_set_row(
             )
         )
     return row
+
+
+def _flag_muscle_group(row: DraftRow) -> None:
+    """Mark a muscle group that nothing can be done with downstream.
+
+    `insights.volume_by_muscle_group` buckets on this column exactly as stored,
+    so a blank one silently becomes "Unassigned" and a typo becomes its own
+    bucket. Neither is an error the database would catch, which is why both are
+    flagged here rather than left to be discovered in a chart.
+    """
+    group = (row.values.get("muscle_group") or "").strip()
+    if not group:
+        row.issues.append(
+            DraftIssue(
+                "no muscle group matched this name — volume by muscle group will "
+                "count it as Unassigned",
+                "muscle_group",
+            )
+        )
+    elif group not in muscle_groups.CANONICAL_GROUPS:
+        row.issues.append(
+            DraftIssue(
+                f"“{group}” is not one of the standard groups "
+                f"({', '.join(muscle_groups.CANONICAL_GROUPS)}) — it will be "
+                "counted as its own bucket",
+                "muscle_group",
+            )
+        )
 
 
 def draft_bodyweight_row(
@@ -1293,6 +1365,12 @@ def draft_bodyweight_row(
     return row
 
 
+def load_exercise_groups(conn: Connection) -> dict[str, Optional[str]]:
+    """Every known exercise name and the muscle group it is filed under."""
+    rows = conn.execute(text("SELECT name, muscle_group FROM exercises")).fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
 def blank_set_row() -> DraftRow:
     """An empty slot for a set the extraction missed entirely."""
     return DraftRow("workout_set", dict(SET_DEFAULTS), added=True, blank=True)
@@ -1308,6 +1386,7 @@ def draft_from_payload(
     raw_text: str,
     session_date: date,
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    known_groups: Optional[Mapping[str, Optional[str]]] = None,
 ) -> EntryDraft:
     """Turn a raw extraction into editable rows, keeping the ones that failed.
 
@@ -1331,7 +1410,9 @@ def draft_from_payload(
                            {"raw": str(item)[:500]})
             )
             continue
-        draft.sets.append(draft_set_row(item, raw_text, confidence_threshold))
+        draft.sets.append(
+            draft_set_row(item, raw_text, confidence_threshold, known_groups=known_groups)
+        )
 
     raw_bodyweight = payload.get("bodyweight")
     if isinstance(raw_bodyweight, dict):
@@ -1350,8 +1431,14 @@ def build_draft(
     session_date: date,
     client: Any = None,
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    known_groups: Optional[Mapping[str, Optional[str]]] = None,
 ) -> EntryDraft:
-    """Extract one journal entry into a draft. Touches the model, not the database."""
+    """Extract one journal entry into a draft. Touches the model, not the database.
+
+    `known_groups` is what the `exercises` table already records, so the muscle
+    group offered for an exercise you have logged before is the one it is
+    actually filed under.
+    """
     raw_text = (raw_text or "").strip()
     if not raw_text:
         return EntryDraft(
@@ -1371,7 +1458,9 @@ def build_draft(
             review_items=[ReviewItem("extraction", str(exc), None, {"raw_text": raw_text})],
         )
 
-    return draft_from_payload(payload, raw_text, session_date, confidence_threshold)
+    return draft_from_payload(
+        payload, raw_text, session_date, confidence_threshold, known_groups
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1405,14 +1494,29 @@ def get_or_create_exercise(
     proposed_name: str,
     muscle_group: Optional[str],
     known: dict[str, int],
+    chosen_group: bool = False,
 ) -> tuple[int, Optional[str], bool]:
     """Resolve an exercise name to an id, fuzzy-matching before inserting.
 
     Returns (exercise_id, matched_existing_name_or_None, created).
+
+    `chosen_group` says the muscle group came from a person on the review
+    screen rather than from the table. Only then is an existing exercise's group
+    revised: a suggestion must never quietly overwrite a filing decision that
+    has already been made, but a correction the user typed has to stick, or the
+    review screen would be offering an edit that does nothing.
     """
     matched = find_matching_exercise(proposed_name, known.keys())
     if matched is not None:
-        return known[matched], matched, False
+        exercise_id = known[matched]
+        if chosen_group:
+            conn.execute(
+                text("UPDATE exercises SET muscle_group = :muscle_group "
+                     "WHERE exercise_id = :exercise_id "
+                     "AND muscle_group IS DISTINCT FROM :muscle_group"),
+                {"muscle_group": muscle_group, "exercise_id": exercise_id},
+            )
+        return exercise_id, matched, False
 
     # An explicit group from the caller wins; otherwise look the name up in the
     # static table. Either may be None, which stores NULL and reports as
@@ -1587,7 +1691,8 @@ def commit_draft(
                 duplicate_of_recent=True,
             )
 
-    accepted_sets: list[tuple[WorkoutSet, float]] = []
+    # (model, confidence, the muscle group was chosen by the user not suggested)
+    accepted_sets: list[tuple[WorkoutSet, float, bool]] = []
     for row in draft.sets:
         if row.blank:
             continue
@@ -1612,7 +1717,11 @@ def commit_draft(
                            row.confidence, dict(row.values))
             )
             continue
-        accepted_sets.append((workout_set, 1.0 if row.edited or row.added else confidence))
+        accepted_sets.append((
+            workout_set,
+            1.0 if row.edited or row.added else confidence,
+            "muscle_group" in row.edited_fields,
+        ))
 
     accepted_bodyweight: Optional[tuple[BodyweightEntry, float]] = None
     if draft.bodyweight is not None and not draft.bodyweight.blank:
@@ -1644,9 +1753,10 @@ def commit_draft(
             result.replaced = delete_entries_for_date(conn, draft.session_date)
             logger.info("Replaced %s on %s", result.replaced, draft.session_date)
         known = load_exercise_names(conn)
-        for workout_set, confidence in accepted_sets:
+        for workout_set, confidence, chosen_group in accepted_sets:
             exercise_id, matched_name, created = get_or_create_exercise(
-                conn, workout_set.exercise_name, workout_set.muscle_group, known
+                conn, workout_set.exercise_name, workout_set.muscle_group, known,
+                chosen_group=chosen_group,
             )
             if created:
                 result.exercises_created.append(workout_set.exercise_name)
