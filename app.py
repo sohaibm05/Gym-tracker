@@ -18,16 +18,24 @@ import logging
 import os
 import re
 import secrets
+import sys
 import time
 from datetime import date, datetime
+from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-import insights
-import pipeline
+# Serverless loaders import this file by path rather than as part of a package,
+# and do not necessarily put its own directory on sys.path. Without this the
+# sibling imports below raise ModuleNotFoundError at cold start. No effect when
+# running normally, where the directory is already there.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import insights  # noqa: E402 - must follow the sys.path bootstrap above
+import pipeline  # noqa: E402
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),

@@ -143,46 +143,42 @@ class TestMask:
 
 
 class TestVercelEntrypoint:
-    def test_entrypoint_exports_the_same_app(self):
+    """Regression tests for the serverless cold-start import failure.
+
+    Vercel loads app.py by path as `__vc_module`, without putting its own
+    directory on sys.path. That made `import insights` raise
+    ModuleNotFoundError on every invocation while the build itself succeeded,
+    so the only symptom was FUNCTION_INVOCATION_FAILED with no local repro.
+    """
+
+    def test_app_imports_when_loaded_by_path(self):
+        """The exact thing Vercel does. Fails without the sys.path bootstrap."""
         import importlib.util
         from pathlib import Path
 
-        entry = Path(__file__).resolve().parent.parent / "api" / "index.py"
-        assert entry.is_file(), "api/index.py is the Vercel entrypoint and must exist"
-
-        spec = importlib.util.spec_from_file_location("vercel_entry", entry)
+        entry = Path(__file__).resolve().parent.parent / "app.py"
+        spec = importlib.util.spec_from_file_location("vc_module_probe", entry)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
-        import app as app_module
+        assert type(module.app).__name__ == "FastAPI"
+        paths = {r.path for r in module.app.routes if hasattr(r, "path")}
+        assert {"/", "/log", "/weekly-report", "/healthz"} <= paths
 
-        assert module.app is app_module.app
-
-    def test_vercel_json_routes_to_the_entrypoint(self):
+    def test_vercel_json_declares_the_app_function(self):
         import json
         from pathlib import Path
 
         config = json.loads(
             (Path(__file__).resolve().parent.parent / "vercel.json").read_text()
         )
-        assert config["rewrites"][0]["destination"] == "/api/index"
-        assert "api/index.py" in config["functions"]
+        assert "app.py" in config["functions"]
+        assert config["functions"]["app.py"]["maxDuration"] == 60
 
-    def test_probe_is_excluded_from_the_catch_all_rewrite(self):
-        """/api/ping must reach its own handler, not the application."""
-        import json
-        import re
+    def test_probe_exists_for_bisecting_deploys(self):
         from pathlib import Path
 
-        root = Path(__file__).resolve().parent.parent
-        config = json.loads((root / "vercel.json").read_text())
-        source = config["rewrites"][0]["source"]
-        pattern = re.compile("^" + source.replace("/((?!api/ping).*)", "/(?!api/ping).*") + "$")
-
-        assert pattern.match("/")
-        assert pattern.match("/log")
-        assert not pattern.match("/api/ping")
-        assert (root / "api" / "ping.py").is_file()
+        assert (Path(__file__).resolve().parent.parent / "api" / "ping.py").is_file()
 
     def test_tzdata_is_pinned(self):
         """zoneinfo reads the OS tz database; slim images often lack it."""
