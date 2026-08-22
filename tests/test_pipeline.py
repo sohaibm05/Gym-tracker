@@ -8,6 +8,7 @@ bad fuzzy match fragments an exercise's progress history across several rows.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import date, datetime, timedelta, timezone
 
@@ -572,6 +573,10 @@ class TestEnvHelper:
             ("DUPLICATE_WINDOW_MINUTES", "5"),
             ("PLATE_INCREMENT_KG", "2.5"),
             ("PLATEAU_TOLERANCE", "0.01"),
+            ("GROQ_TPM_LIMIT", "8000"),
+            ("GROQ_MAX_COMPLETION_TOKENS", "8000"),
+            ("GROQ_MIN_COMPLETION_TOKENS", "1200"),
+            ("GROQ_MAX_RETRY_WAIT_SECONDS", "20"),
         ],
     )
     def test_every_numeric_setting_survives_being_blank(self, name, default, monkeypatch):
@@ -584,6 +589,8 @@ class TestEnvHelper:
 
         for name in (
             "CONFIDENCE_THRESHOLD", "FUZZY_MATCH_THRESHOLD", "GROQ_MODEL",
+            "GROQ_TPM_LIMIT", "GROQ_MAX_COMPLETION_TOKENS",
+            "GROQ_MIN_COMPLETION_TOKENS", "GROQ_MAX_RETRY_WAIT_SECONDS",
             "LOCAL_TIMEZONE", "DEFAULT_SESSION_HOUR", "DUPLICATE_WINDOW_MINUTES",
             "PLATE_INCREMENT_KG", "ANALYSIS_WEEKS", "PLATEAU_MIN_SESSIONS",
             "PLATEAU_TOLERANCE", "WORKING_REP_RANGE_LOW", "WORKING_REP_RANGE_HIGH",
@@ -769,3 +776,266 @@ class TestExtractionFallback:
         with pytest.raises(pipeline.ExtractionError):
             pipeline.extract_entities(RAW_ENTRY, date(2026, 8, 14), client=client)
         assert len(client.completions.calls) == 2
+
+
+# --------------------------------------------------------------------------
+# Token budgeting
+# --------------------------------------------------------------------------
+
+
+class RateLimited(Exception):
+    """Stand-in for the Groq SDK's rate-limit exception.
+
+    The real one carries the status on the exception and the delay in a header;
+    older SDK versions surface neither, so both paths are exercised.
+    """
+
+    def __init__(self, message, status_code=None, headers=None):
+        super().__init__(message)
+        self.status_code = status_code
+        if headers is not None:
+            self.response = type("Response", (), {"headers": headers, "status_code": status_code})()
+
+
+TPM_413 = (
+    "Error code: 413 - {'error': {'message': 'Request too large for model "
+    "`openai/gpt-oss-120b` in organization org_x service tier `on_demand` on tokens "
+    "per minute (TPM): Limit 8000, Requested 9337, please reduce your message size "
+    "and try again.', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}"
+)
+
+
+class TestCompletionBudget:
+    """The 413 regression: Groq counts the reserved completion budget toward the
+    per-minute limit, so a flat 8000-token reservation on a 1300-token prompt is
+    a 9337-token request against an 8000 ceiling - rejected before generation."""
+
+    def _requested(self, text):
+        session_date = date(2026, 8, 14)
+        prompt = pipeline.estimate_prompt_tokens(text, session_date)
+        return prompt + pipeline.completion_budget(text, prompt)
+
+    @pytest.mark.parametrize("chars", [0, 50, 200, 400, 1000, 2000, 4000, 8000, 15000])
+    def test_a_request_never_exceeds_the_minute_limit(self, chars):
+        """The whole point. Any entry that can be extracted at all has to fit."""
+        assert pipeline.entry_fits_in_window(
+            pipeline.estimate_prompt_tokens("x" * chars, date(2026, 8, 14))
+        )
+        assert self._requested("x" * chars) <= pipeline.GROQ_TPM_LIMIT
+
+    def test_an_entry_too_long_for_the_window_is_refused_before_the_call(self):
+        """No reservation size rescues a prompt that fills the whole allowance,
+        so say so rather than spending two calls being told."""
+        enormous = "x" * 30_000
+        client = FakeClient([VALID_JSON])
+        with pytest.raises(pipeline.ExtractionError, match="too long"):
+            pipeline.extract_entities(enormous, date(2026, 8, 14), client=client)
+        assert client.completions.calls == []
+
+    def test_the_failing_entry_now_fits(self):
+        entry = (
+            "Chest bench press 20kg 12 reps warm up. Chest bench press 24kg 12 reps. "
+            "Chest bench press 28kg 11 reps almost died. 6:20ish Dumbbell bench press "
+            "12.5kg each hand 11 reps warm up ish. Dumbell bench press 15kg each hand "
+            "10 reps. Dumbbell bench press 15kg each hand 9 reps. Shoulder pain noticed "
+            "toward the end. Was 82.4kg this morning btw. Finished with some cable "
+            "flys, forgot the weight."
+        )
+        assert self._requested(entry) <= pipeline.GROQ_TPM_LIMIT
+
+    def test_a_short_entry_reserves_far_less_than_the_flat_maximum(self):
+        prompt = pipeline.estimate_prompt_tokens(RAW_ENTRY, date(2026, 8, 14))
+        budget = pipeline.completion_budget(RAW_ENTRY, prompt)
+        assert budget < pipeline.GROQ_MAX_COMPLETION_TOKENS / 2
+
+    def test_a_longer_entry_reserves_more(self):
+        short = pipeline.completion_budget("x" * 200, 1200)
+        longer = pipeline.completion_budget("x" * 1500, 1200)
+        assert longer > short
+
+    def test_the_reservation_never_drops_below_the_floor(self):
+        """Too small a budget truncates the answer, which reads downstream as a
+        parse failure and hides the real cause."""
+        assert pipeline.completion_budget("", 999_999) == pipeline.GROQ_MIN_COMPLETION_TOKENS
+
+    def test_the_flat_maximum_is_still_an_upper_bound(self, monkeypatch):
+        monkeypatch.setattr(pipeline, "GROQ_TPM_LIMIT", 10_000_000)
+        assert pipeline.completion_budget("x" * 500_000, 100) == pipeline.GROQ_MAX_COMPLETION_TOKENS
+
+    def test_an_ordinary_entry_does_not_warn(self, caplog):
+        """The floor warning means "the limit is squeezing the answer". An entry
+        that simply needs less than the floor is not that."""
+        with caplog.at_level(logging.WARNING, logger="pipeline"):
+            pipeline.completion_budget(RAW_ENTRY, 1200)
+        assert caplog.records == []
+
+    def test_a_squeezed_window_does_warn(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="pipeline"):
+            pipeline.completion_budget("x" * 100, pipeline.GROQ_TPM_LIMIT - 10)
+        assert any("floor" in record.getMessage() for record in caplog.records)
+
+    def test_the_estimate_tracks_the_real_prompt_size(self):
+        """Estimated ~1337 tokens is what the failing request actually reported;
+        being a little over is safe, being under is what causes a 413."""
+        estimated = pipeline.estimate_prompt_tokens("x" * 387, date(2026, 8, 22))
+        assert 1000 <= estimated <= 1600
+
+
+class TestRateLimitDetection:
+    def test_a_413_is_a_rate_limit(self):
+        assert pipeline.is_rate_limit_error(RateLimited(TPM_413, status_code=413))
+
+    def test_a_429_is_a_rate_limit(self):
+        assert pipeline.is_rate_limit_error(RateLimited("slow down", status_code=429))
+
+    def test_the_message_alone_is_enough(self):
+        """An older SDK surfaces the failure as a bare error with no status."""
+        assert pipeline.is_rate_limit_error(RuntimeError(TPM_413))
+
+    def test_an_unrelated_failure_is_not_a_rate_limit(self):
+        assert not pipeline.is_rate_limit_error(RuntimeError("json_validate_failed"))
+
+    def test_a_400_is_not_a_rate_limit(self):
+        assert not pipeline.is_rate_limit_error(RateLimited("bad request", status_code=400))
+
+
+class TestParseDuration:
+    @pytest.mark.parametrize("value,expected", [
+        ("7.66s", 7.66),
+        ("2m59.56s", 179.56),
+        ("1500ms", 1.5),
+        ("30", 30.0),
+        ("1h", 3600.0),
+    ])
+    def test_groq_duration_formats(self, value, expected):
+        assert pipeline.parse_duration(value) == pytest.approx(expected)
+
+    @pytest.mark.parametrize("value", ["", "   ", "soon"])
+    def test_unparseable_values_give_none(self, value):
+        assert pipeline.parse_duration(value) is None
+
+
+class TestRetryAfter:
+    def test_reads_the_retry_after_header(self):
+        exc = RateLimited("slow down", status_code=429, headers={"retry-after": "12"})
+        assert pipeline.retry_after_seconds(exc) == 12.0
+
+    def test_falls_back_to_the_token_reset_header(self):
+        exc = RateLimited("slow down", status_code=429,
+                          headers={"x-ratelimit-reset-tokens": "2m59.56s"})
+        assert pipeline.retry_after_seconds(exc) == pytest.approx(179.56)
+
+    def test_reads_the_delay_out_of_the_message(self):
+        exc = RuntimeError("Rate limit reached. Please try again in 7.66s.")
+        assert pipeline.retry_after_seconds(exc) == pytest.approx(7.66)
+
+    def test_a_413_carries_no_delay(self):
+        """"Reduce your message size" names no time, so the caller picks one."""
+        assert pipeline.retry_after_seconds(RuntimeError(TPM_413)) is None
+
+
+class TestExtractionWaitsOutRateLimits:
+    """A token ceiling is a condition of the clock. Retrying instantly - which
+    is what the original code did - reproduces it exactly."""
+
+    @pytest.fixture
+    def slept(self, monkeypatch):
+        recorded = []
+        monkeypatch.setattr(pipeline, "_sleep", recorded.append)
+        return recorded
+
+    def test_it_waits_before_retrying_a_rate_limited_call(self, slept):
+        client = FakeClient([RateLimited(TPM_413, status_code=413), VALID_JSON])
+        pipeline.extract_entities(RAW_ENTRY, date(2026, 8, 14), client=client)
+        assert len(slept) == 1 and slept[0] > 0
+
+    def test_it_waits_as_long_as_the_server_asked(self, slept):
+        client = FakeClient([
+            RateLimited("try again in 7.66s", status_code=429), VALID_JSON,
+        ])
+        pipeline.extract_entities(RAW_ENTRY, date(2026, 8, 14), client=client)
+        assert slept == [pytest.approx(7.66)]
+
+    def test_the_wait_is_capped(self, slept):
+        """A web request cannot sit blocked for three minutes."""
+        client = FakeClient([
+            RateLimited("try again in 2m59.56s", status_code=429), VALID_JSON,
+        ])
+        pipeline.extract_entities(RAW_ENTRY, date(2026, 8, 14), client=client)
+        assert slept == [pipeline.GROQ_MAX_RETRY_WAIT_SECONDS]
+
+    def test_the_retry_asks_for_a_smaller_reservation(self, slept):
+        """Waiting alone cannot fix a 413: that one request was itself over the
+        limit, so the retry has to ask for less."""
+        entry = RAW_ENTRY * 12  # long enough to reserve well above the floor
+        client = FakeClient([RateLimited(TPM_413, status_code=413), VALID_JSON])
+        pipeline.extract_entities(entry, date(2026, 8, 14), client=client)
+        first, second = client.completions.calls
+        assert (second["extra_body"]["max_completion_tokens"]
+                < first["extra_body"]["max_completion_tokens"])
+
+    def test_the_retry_never_shrinks_below_the_floor(self, slept):
+        """A short entry already sits on the floor; halving it would only
+        guarantee a truncated answer on top of the rate limit."""
+        client = FakeClient([RateLimited(TPM_413, status_code=413), VALID_JSON])
+        pipeline.extract_entities(RAW_ENTRY, date(2026, 8, 14), client=client)
+        _, second = client.completions.calls
+        assert (second["extra_body"]["max_completion_tokens"]
+                >= pipeline.GROQ_MIN_COMPLETION_TOKENS)
+
+    def test_an_ordinary_failure_does_not_wait(self, slept):
+        client = FakeClient([RuntimeError("json_validate_failed"), VALID_JSON])
+        pipeline.extract_entities(RAW_ENTRY, date(2026, 8, 14), client=client)
+        assert slept == []
+
+    def test_an_ordinary_retry_keeps_the_full_reservation(self, slept):
+        """Without JSON mode the model may wrap the object in prose, so the
+        second attempt needs no less room than the first."""
+        client = FakeClient([RuntimeError("json_validate_failed"), VALID_JSON])
+        pipeline.extract_entities(RAW_ENTRY, date(2026, 8, 14), client=client)
+        first, second = client.completions.calls
+        assert (second["extra_body"]["max_completion_tokens"]
+                == first["extra_body"]["max_completion_tokens"])
+
+    def test_two_rate_limits_give_a_readable_error(self, slept):
+        """The raw Groq JSON blob ended up in the review panel verbatim."""
+        client = FakeClient([
+            RateLimited(TPM_413, status_code=413), RateLimited(TPM_413, status_code=413),
+        ])
+        with pytest.raises(pipeline.ExtractionError) as caught:
+            pipeline.extract_entities(RAW_ENTRY, date(2026, 8, 14), client=client)
+        message = str(caught.value)
+        assert "per-minute token limit" in message
+        assert "Wait a minute and resubmit" in message
+        assert "'error':" not in message
+
+    def test_the_underlying_error_is_still_chained(self, slept):
+        client = FakeClient([
+            RateLimited(TPM_413, status_code=413), RateLimited(TPM_413, status_code=413),
+        ])
+        with pytest.raises(pipeline.ExtractionError) as caught:
+            pipeline.extract_entities(RAW_ENTRY, date(2026, 8, 14), client=client)
+        assert isinstance(caught.value.__cause__, RateLimited)
+
+    def test_it_reports_the_limit_the_server_actually_enforced(self, slept):
+        """GROQ_TPM_LIMIT is what we believe the tier allows; when the server
+        names a different one, repeating our number hides the cause."""
+        wrong_limit = (
+            "Error code: 413 - on tokens per minute (TPM): Limit 6000, "
+            "Requested 9337, please reduce your message size and try again."
+        )
+        client = FakeClient([
+            RateLimited(wrong_limit, status_code=413),
+            RateLimited(wrong_limit, status_code=413),
+        ])
+        with pytest.raises(pipeline.ExtractionError) as caught:
+            pipeline.extract_entities(RAW_ENTRY, date(2026, 8, 14), client=client)
+        assert "GROQ_TPM_LIMIT to 6000" in str(caught.value)
+
+    def test_it_keeps_the_generic_advice_when_the_limits_agree(self, slept):
+        client = FakeClient([
+            RateLimited(TPM_413, status_code=413), RateLimited(TPM_413, status_code=413),
+        ])
+        with pytest.raises(pipeline.ExtractionError) as caught:
+            pipeline.extract_entities(RAW_ENTRY, date(2026, 8, 14), client=client)
+        assert "Wait a minute and resubmit" in str(caught.value)
