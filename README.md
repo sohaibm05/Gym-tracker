@@ -35,6 +35,7 @@ Notes app (unchanged)
 | `parse_workout_log.py` | CLI: `python parse_workout_log.py <file> <date>` |
 | `app.py` | FastAPI web app — the phone-facing form, plus the weekly-report button |
 | `insights.py` | Weekly report. Stage A computes every number; Stage B only writes prose |
+| `charts.py` | The `/progress` page - inline-SVG charts, no chart library |
 | `seed_sample_data.py` | Seeds three weeks of realistic data so the report can be tried out |
 | `tests/` | Unit tests for the Stage A rules and the confidence / fuzzy-match logic |
 | `sample_entry.txt` | A messy journal entry in the real style, for trying the CLI |
@@ -241,6 +242,31 @@ Render's free tier cold-starts in 30–50s after idle, which is exactly when you
 double-tap submit. Before extracting anything, `/log` checks whether the same raw
 text was inserted in the last `DUPLICATE_WINDOW_MINUTES` (5) and returns the
 earlier result instead of re-running the model and re-inserting.
+
+## Charts
+
+`/progress` plots the logged data: weekly volume, estimated 1RM per exercise as
+small multiples, bodyweight, volume by muscle group, and a pain-flag view. Drawn
+as inline SVG from a JSON blob, so there is no chart library, no external
+request, and nothing added to `requirements.txt`.
+
+Every figure comes from the same Stage A functions the weekly report uses, so a
+number on a chart and the same number in the report cannot drift apart.
+
+A few decisions that are easy to get wrong:
+
+- **Every chart plots one series**, so there is no categorical palette and no
+  legend - the card title names what is plotted. The single hue is validated
+  against both the light and dark chart surfaces.
+- **Muscle groups all share one colour.** They are nominal categories, so
+  colouring them darker-where-bigger would double-encode bar length as hue and
+  spend the only free channel on information the bar already shows.
+- **A constant series shows one axis tick, at its actual value.** Scaling a flat
+  line to fill the plot invents ticks that appear nowhere in the data - a lift
+  held at 65kg must not be labelled 63.7 and 66.3.
+- **Pain uses the reserved status palette, never colour alone** - each row
+  carries an icon and a word.
+- **Every chart has a table twin**, so no value is reachable only by hovering.
 
 ## Security
 

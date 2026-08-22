@@ -846,3 +846,138 @@ def generate_weekly_report(
         "narration_error": narration_error,
         "record_count": len(records),
     }
+
+
+# --------------------------------------------------------------------------
+# Dashboard data
+#
+# Everything here is derived from the same Stage A functions the weekly report
+# uses, so a number on a chart and the same number in the report cannot drift.
+# --------------------------------------------------------------------------
+
+
+def load_bodyweight(engine: Engine, since: date, until: date) -> list[tuple[date, float]]:
+    """Bodyweight readings in [since, until), oldest first, as local dates."""
+    from zoneinfo import ZoneInfo
+
+    query = text(
+        """
+        SELECT logged_at, weight_kg FROM bodyweight_logs
+        WHERE logged_at >= :since AND logged_at < :until
+        ORDER BY logged_at
+        """
+    )
+    since_utc = pipeline.local_to_utc(datetime.combine(since, datetime.min.time()))
+    until_utc = pipeline.local_to_utc(datetime.combine(until, datetime.min.time()))
+    zone = ZoneInfo(pipeline.LOCAL_TIMEZONE)
+    with engine.connect() as conn:
+        rows = conn.execute(query, {"since": since_utc, "until": until_utc}).fetchall()
+    return [(logged_at.astimezone(zone).date(), float(weight)) for logged_at, weight in rows]
+
+
+def weekly_volume_series(
+    records: Iterable[SetRecord], week_starts: list[date]
+) -> list[tuple[date, float]]:
+    """Total working volume per week, zero-filled so gaps stay visible."""
+    totals: dict[date, float] = {week: 0.0 for week in week_starts}
+    for record in records:
+        bucket = week_start_for(record.session_date)
+        if bucket in totals:
+            totals[bucket] += set_volume(record)
+    return [(week, round(totals[week], 1)) for week in week_starts]
+
+
+def exercise_e1rm_series(
+    records: Iterable[SetRecord], limit: int = 6, min_sessions: int = 2
+) -> list[tuple[str, list[tuple[date, float]]]]:
+    """Per-exercise best-e1RM series, most-trained first.
+
+    Exercises with a single session are dropped: a one-point line shows nothing,
+    and the slots are better spent on lifts with a trend to read.
+    """
+    grouped = group_by_exercise_session(records)
+    series: list[tuple[str, list[tuple[date, float]]]] = []
+    for name, sessions in grouped.items():
+        points = e1rm_series(sessions)
+        if len(points) >= min_sessions:
+            series.append((name, [(day, round(value, 1)) for day, value in points]))
+    series.sort(key=lambda pair: (-len(pair[1]), pair[0]))
+    return series[:limit]
+
+
+def pain_summary(records: Iterable[SetRecord]) -> list[dict[str, Any]]:
+    """Exercises carrying pain flags, worst streak first.
+
+    Mirrors the safeguard's own thresholds so the view and the recommendation
+    can never disagree: 3+ consecutive sessions is the escalation point.
+    """
+    summary = []
+    for name, sessions in group_by_exercise_session(records).items():
+        flagged = pain_sessions(sessions)
+        if not flagged:
+            continue
+        streak = trailing_pain_streak(sessions)
+        summary.append(
+            {
+                "exercise": name,
+                "sessions_flagged": len(flagged),
+                "last_flagged": flagged[-1].isoformat(),
+                "streak": streak,
+                "status": "serious" if streak >= 3 else ("warning" if streak >= 1 else "good"),
+            }
+        )
+    summary.sort(key=lambda item: (-item["streak"], -item["sessions_flagged"]))
+    return summary
+
+
+def build_dashboard(engine: Engine, weeks: int = 12, today: Optional[date] = None) -> dict[str, Any]:
+    """Everything the progress page plots. No LLM anywhere in here."""
+    today = today or date.today()
+    this_week = week_start_for(today)
+    since = this_week - timedelta(weeks=weeks - 1)
+    until = this_week + timedelta(days=7)
+
+    records = load_set_records(engine, since, until)
+    bodyweight = load_bodyweight(engine, since, until)
+
+    week_starts = [since + timedelta(weeks=offset) for offset in range(weeks)]
+    current = [r for r in records if r.session_date >= this_week]
+    prior_4 = [r for r in records if this_week - timedelta(weeks=4) <= r.session_date < this_week]
+
+    volume_now = total_volume(current)
+    volume_prior_avg = round(total_volume(prior_4) / 4, 1) if prior_4 else None
+    volume_delta = (
+        round((volume_now - volume_prior_avg) / volume_prior_avg * 100, 1)
+        if volume_prior_avg
+        else None
+    )
+
+    bodyweight_delta = None
+    if len(bodyweight) >= 2:
+        bodyweight_delta = round(bodyweight[-1][1] - bodyweight[0][1], 1)
+
+    return {
+        "week_start": this_week.isoformat(),
+        "weeks": weeks,
+        "timezone": pipeline.LOCAL_TIMEZONE,
+        "kpis": {
+            "volume_this_week": volume_now,
+            "volume_delta_pct": volume_delta,
+            "sets_this_week": len(working_sets(current)),
+            "exercises_this_week": len(group_by_exercise_session(current)),
+            "bodyweight": bodyweight[-1][1] if bodyweight else None,
+            "bodyweight_delta": bodyweight_delta,
+        },
+        "weekly_volume": [[week.isoformat(), value] for week, value in
+                          weekly_volume_series(records, week_starts)],
+        "exercise_e1rm": [
+            {"exercise": name, "points": [[day.isoformat(), value] for day, value in points]}
+            for name, points in exercise_e1rm_series(records)
+        ],
+        "bodyweight": [[day.isoformat(), value] for day, value in bodyweight],
+        "muscle_volume": sorted(
+            volume_by_muscle_group(current).items(), key=lambda pair: -pair[1]
+        ),
+        "pain": pain_summary(records),
+        "has_data": bool(records),
+    }
