@@ -255,6 +255,7 @@ class PipelineResult:
     exercises_created: list[str] = field(default_factory=list)
     exercises_matched: list[tuple[str, str]] = field(default_factory=list)
     duplicate_of_recent: bool = False
+    replaced: Optional[dict[str, int]] = None
     error: Optional[str] = None
 
     @property
@@ -405,13 +406,20 @@ def _grounding_similarity(exercise_name: str, haystack: str) -> float:
     ) / 100.0
 
 
-def local_to_utc(local_dt: datetime, timezone_name: str = LOCAL_TIMEZONE) -> datetime:
-    """Attach the fixed local timezone to a naive datetime and convert to UTC."""
+def local_to_utc(local_dt: datetime, timezone_name: Optional[str] = None) -> datetime:
+    """Attach the fixed local timezone to a naive datetime and convert to UTC.
+
+    The zone is resolved at call time, not bound as a default argument. A
+    default would freeze whatever LOCAL_TIMEZONE held at import, so a later
+    change to it would silently not apply - which matters most for the delete
+    window in `_local_day_bounds`, where a stale zone would remove the wrong
+    day's rows.
+    """
     from datetime import timezone as _tz
 
     if ZoneInfo is None:  # pragma: no cover
         raise RuntimeError("zoneinfo unavailable; Python 3.9+ required")
-    tz = ZoneInfo(timezone_name)
+    tz = ZoneInfo(timezone_name or LOCAL_TIMEZONE)
     aware = local_dt.replace(tzinfo=tz) if local_dt.tzinfo is None else local_dt
     return aware.astimezone(_tz.utc)
 
@@ -419,8 +427,8 @@ def local_to_utc(local_dt: datetime, timezone_name: str = LOCAL_TIMEZONE) -> dat
 def resolve_logged_at(
     logged_at_local: Optional[str],
     session_date: date,
-    timezone_name: str = LOCAL_TIMEZONE,
-    default_hour: int = DEFAULT_SESSION_HOUR,
+    timezone_name: Optional[str] = None,
+    default_hour: Optional[int] = None,
 ) -> datetime:
     """Turn the model's local-time guess into a UTC timestamp.
 
@@ -428,6 +436,9 @@ def resolve_logged_at(
     date the user supplied. Anything else falls back to the session date at
     `default_hour` — the model does not get to move a workout to another day.
     """
+    timezone_name = timezone_name or LOCAL_TIMEZONE
+    default_hour = DEFAULT_SESSION_HOUR if default_hour is None else default_hour
+
     if logged_at_local:
         parsed: Optional[datetime] = None
         candidate = logged_at_local.strip().replace("Z", "+00:00")
@@ -701,6 +712,48 @@ _INSERT_BODYWEIGHT = text(
 )
 
 
+def _local_day_bounds(session_date: date) -> tuple[datetime, datetime]:
+    """The UTC window covering one local calendar day."""
+    start = local_to_utc(datetime.combine(session_date, time.min))
+    end = local_to_utc(datetime.combine(session_date + timedelta(days=1), time.min))
+    return start, end
+
+
+def count_entries_for_date(engine: Engine, session_date: date) -> dict[str, int]:
+    """How much is already logged against a local date."""
+    start, end = _local_day_bounds(session_date)
+    params = {"start": start, "end": end}
+    with engine.connect() as conn:
+        sets = conn.execute(
+            text("SELECT count(*) FROM workout_logs WHERE logged_at >= :start AND logged_at < :end"),
+            params,
+        ).scalar_one()
+        bodyweight = conn.execute(
+            text("SELECT count(*) FROM bodyweight_logs "
+                 "WHERE logged_at >= :start AND logged_at < :end"),
+            params,
+        ).scalar_one()
+    return {"sets": int(sets), "bodyweight": int(bodyweight)}
+
+
+def delete_entries_for_date(conn: Connection, session_date: date) -> dict[str, int]:
+    """Remove every log row on a local date. Caller owns the transaction.
+
+    Takes a Connection rather than an Engine so the delete and the insert that
+    replaces it commit together: a failure mid-way must never leave the day
+    emptied with nothing put back.
+    """
+    start, end = _local_day_bounds(session_date)
+    params = {"start": start, "end": end}
+    sets = conn.execute(
+        text("DELETE FROM workout_logs WHERE logged_at >= :start AND logged_at < :end"), params
+    ).rowcount
+    bodyweight = conn.execute(
+        text("DELETE FROM bodyweight_logs WHERE logged_at >= :start AND logged_at < :end"), params
+    ).rowcount
+    return {"sets": int(sets or 0), "bodyweight": int(bodyweight or 0)}
+
+
 def find_recent_submission(
     engine: Engine,
     raw_text: str,
@@ -751,6 +804,7 @@ def process_entry(
     client: Any = None,
     check_duplicates: bool = False,
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    replace_existing: bool = False,
 ) -> PipelineResult:
     """Run the full pipeline for one journal entry.
 
@@ -819,6 +873,11 @@ def process_entry(
         return result
 
     with engine.begin() as conn:
+        if replace_existing:
+            # Only reached when there is something to put back - the early
+            # return above means a failed extraction never empties the day.
+            result.replaced = delete_entries_for_date(conn, session_date)
+            logger.info("Replaced %s on %s", result.replaced, session_date)
         known = load_exercise_names(conn)
         for workout_set, confidence in accepted_sets:
             exercise_id, matched_name, created = get_or_create_exercise(

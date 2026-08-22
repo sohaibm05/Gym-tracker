@@ -165,7 +165,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 h1 { font-size: 1.35rem; margin: 0 0 1rem; }
 h2 { font-size: 1.1rem; margin: 1.4rem 0 .5rem; }
 label { display: block; font-weight: 600; margin: .9rem 0 .3rem; }
-input[type=date], textarea, button { width: 100%; font-size: 1rem; padding: .7rem;
+input[type=date], textarea, button, select { width: 100%; font-size: 1rem; padding: .7rem;
        border-radius: .5rem; border: 1px solid #8884; font-family: inherit; }
 textarea { min-height: 11rem; resize: vertical; }
 button { margin-top: 1rem; font-weight: 600; border: 0; background: #2563eb; color: #fff; }
@@ -258,6 +258,14 @@ def _render_result(result: pipeline.PipelineResult, session_date: date) -> str:
             f"{html.escape(session_date.isoformat())}.</div>"
         )
 
+    if result.replaced:
+        removed = result.replaced
+        parts.append(
+            '<div class="card warn"><strong>Replaced that day.</strong> Removed '
+            f"{removed['sets']} set(s) and {removed['bodyweight']} bodyweight "
+            "entry/entries logged earlier on this date before saving this one.</div>"
+        )
+
     if result.exercises_created:
         names = ", ".join(html.escape(name) for name in result.exercises_created)
         parts.append(f'<div class="card muted">New exercises created: {names}</div>')
@@ -316,11 +324,18 @@ async def index(_user: str = Depends(require_auth)) -> HTMLResponse:
   <label for="raw_text">Journal entry</label>
   <textarea id="raw_text" name="raw_text" required
     placeholder="Paste straight from Notes. Messy is fine."></textarea>
+  <label for="mode">If that day already has entries</label>
+  <select id="mode" name="mode">
+    <option value="add" selected>Add to them &mdash; a second session, or more sets</option>
+    <option value="replace">Replace them &mdash; discard that day and use this instead</option>
+  </select>
   <button type="submit">Parse &amp; save</button>
 </form>
 <p class="muted">Sets below the confidence threshold
 ({pipeline.CONFIDENCE_THRESHOLD:.0%}) are listed for review instead of being saved.
-Bodyweight mentions in the same entry are picked up automatically.</p>
+Bodyweight mentions in the same entry are picked up automatically.
+<strong>Replace</strong> deletes everything already logged on that date, so use it to
+correct a bad entry &mdash; not to add an evening session.</p>
 """,
     )
 
@@ -329,6 +344,7 @@ Bodyweight mentions in the same entry are picked up automatically.</p>
 async def log_entry(
     session_date: str = Form(...),
     raw_text: str = Form(...),
+    mode: str = Form("add"),
     _user: str = Depends(require_auth),
 ) -> HTMLResponse:
     try:
@@ -345,15 +361,18 @@ async def log_entry(
         parsed_date,
         engine=get_engine(),
         check_duplicates=True,
+        replace_existing=(mode == "replace"),
     )
     logger.info(
-        "event=log_processed date=%s inserted_sets=%d inserted_bodyweight=%d "
-        "review=%d duplicate=%s",
+        "event=log_processed date=%s mode=%s inserted_sets=%d inserted_bodyweight=%d "
+        "review=%d duplicate=%s replaced=%s",
         parsed_date,
+        mode,
         result.inserted_sets,
         result.inserted_bodyweight,
         len(result.review_items),
         result.duplicate_of_recent,
+        result.replaced,
     )
     return _page(
         "Result",

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -610,3 +610,54 @@ class TestEnvHelper:
                     monkeypatch.delenv(name, raising=False)
             importlib.reload(pipeline)
             importlib.reload(insights)
+
+
+# --------------------------------------------------------------------------
+# Same-day handling: add vs replace
+# --------------------------------------------------------------------------
+
+
+class TestLocalDayBounds:
+    """Replace deletes by a UTC window covering one LOCAL day. Getting the
+    window wrong would delete a neighbouring day's rows."""
+
+    def test_utc_day_is_midnight_to_midnight(self, monkeypatch):
+        monkeypatch.setattr(pipeline, "LOCAL_TIMEZONE", "UTC")
+        start, end = pipeline._local_day_bounds(date(2026, 8, 20))
+        assert start == datetime(2026, 8, 20, tzinfo=timezone.utc)
+        assert end == datetime(2026, 8, 21, tzinfo=timezone.utc)
+
+    def test_offset_zone_shifts_the_window(self, monkeypatch):
+        """Karachi is UTC+5, so its day runs 19:00 the previous day to 19:00."""
+        monkeypatch.setattr(pipeline, "LOCAL_TIMEZONE", "Asia/Karachi")
+        start, end = pipeline._local_day_bounds(date(2026, 8, 20))
+        assert start == datetime(2026, 8, 19, 19, 0, tzinfo=timezone.utc)
+        assert end == datetime(2026, 8, 20, 19, 0, tzinfo=timezone.utc)
+
+    def test_window_is_exactly_one_day(self, monkeypatch):
+        monkeypatch.setattr(pipeline, "LOCAL_TIMEZONE", "Asia/Karachi")
+        start, end = pipeline._local_day_bounds(date(2026, 8, 20))
+        assert end - start == timedelta(days=1)
+
+    def test_consecutive_days_abut_without_overlapping(self, monkeypatch):
+        """An overlap would let replace delete part of the neighbouring day."""
+        monkeypatch.setattr(pipeline, "LOCAL_TIMEZONE", "Asia/Karachi")
+        _, first_end = pipeline._local_day_bounds(date(2026, 8, 20))
+        second_start, _ = pipeline._local_day_bounds(date(2026, 8, 21))
+        assert first_end == second_start
+
+
+class TestReplaceIsOptIn:
+    def test_process_entry_defaults_to_adding(self):
+        import inspect
+
+        signature = inspect.signature(pipeline.process_entry)
+        assert signature.parameters["replace_existing"].default is False
+
+    def test_result_reports_nothing_replaced_by_default(self):
+        assert pipeline.PipelineResult().replaced is None
+
+    def test_empty_entry_never_reports_a_replace(self):
+        """Nothing to insert means nothing should have been deleted."""
+        result = pipeline.process_entry("   ", date(2026, 8, 20))
+        assert result.replaced is None and result.error
