@@ -456,8 +456,9 @@ so re-running it costs only another extraction.
 
 ## Charts
 
-`/progress` plots the logged data: weekly volume, estimated 1RM per exercise as
-small multiples, bodyweight, volume by muscle group, and a pain-flag view. Drawn
+`/progress` plots the logged data: weekly volume, estimated 1RM as small
+multiples sectioned by muscle group, bodyweight, volume by muscle group, and a
+pain-flag view. Drawn
 as inline SVG from a JSON blob, so there is no chart library, no external
 request, and nothing added to `requirements.txt`.
 
@@ -466,6 +467,16 @@ number on a chart and the same number in the report cannot drift apart.
 
 A few decisions that are easy to get wrong:
 
+- **e1RM is grouped by muscle, not averaged into it.** The exercises of one
+  muscle group sit together under a heading so "is my chest progressing" is one
+  glance rather than a hunt, but each keeps its own line. One averaged e1RM per
+  muscle group would read more easily and mean nothing: a 100kg bench press and
+  a 15kg cable fly have no useful mean, and the average would move when you
+  changed exercise selection rather than when you got stronger. Which exercises
+  appear is still decided by how much they are trained, so grouping never
+  reserves slots for a muscle you barely work. An exercise with no group on file
+  sections under **Unassigned**, last — which is also the nudge to go and set it
+  on the review screen.
 - **Each exercise carries a fitted trend line and its slope in kg/week.** The
   shape of a line does not give the rate: two lifts can both end higher while
   one is gaining three times as fast. The line drawn and the rate quoted beside
@@ -556,7 +567,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-643 tests, no network and no database required — they cover the Stage A
+655 tests, no network and no database required — they cover the Stage A
 rule branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold), `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
