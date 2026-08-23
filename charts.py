@@ -23,6 +23,10 @@ import json
 from datetime import date, timedelta
 from typing import Any
 
+# insights does not import this module, so this stays a one-way dependency. Only
+# the shared label for an exercise with no muscle group on file comes from it.
+import insights
+
 # Tokens are declared for both the OS setting and an explicit theme stamp, so a
 # viewer's choice wins either way.
 PROGRESS_CSS = """
@@ -91,6 +95,10 @@ PROGRESS_CSS = """
 .plot svg { display: block; overflow: visible; }
 
 .smalls { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: .9rem; }
+.smalls .section { grid-column: 1 / -1; font-size: .8rem; font-weight: 600;
+  letter-spacing: .04em; text-transform: uppercase; color: var(--ink-2);
+  margin: .3rem 0 0; padding-bottom: .25rem; border-bottom: 1px solid var(--hairline); }
+.smalls .section:first-child { margin-top: 0; }
 .small h3 { font-size: .85rem; margin: 0 0 .1rem; font-weight: 600; }
 .small .sub { font-size: .75rem; margin: 0 0 .4rem; }
 
@@ -429,14 +437,22 @@ def _tile(label: str, value: str, delta: str = "", up_is_good: bool = False) -> 
     )
 
 
-def _table(headers: list[str], rows: list[list[str]], caption: str) -> str:
-    """The table twin. Every plotted value is reachable here without hovering."""
+def _table(
+    headers: list[str], rows: list[list[str]], caption: str, numeric_from: int = 1
+) -> str:
+    """The table twin. Every plotted value is reachable here without hovering.
+
+    `numeric_from` is the first right-aligned column. One label column is the
+    common case; a table that leads with more than one needs to say so, or its
+    text columns get flushed right against the numbers.
+    """
     head = "".join(
-        f'<th class="{"num" if i else ""}">{html.escape(h)}</th>' for i, h in enumerate(headers)
+        f'<th class="{"num" if i >= numeric_from else ""}">{html.escape(h)}</th>'
+        for i, h in enumerate(headers)
     )
     body = "".join(
         "<tr>" + "".join(
-            f'<td class="{"num" if i else ""}">{html.escape(str(c))}</td>'
+            f'<td class="{"num" if i >= numeric_from else ""}">{html.escape(str(c))}</td>'
             for i, c in enumerate(row)
         ) + "</tr>"
         for row in rows
@@ -497,8 +513,15 @@ def render_progress_body(data: dict[str, Any]) -> str:
                "Table view"),
     )
 
-    smalls, e1rm_rows = [], []
+    # The series arrive already ordered so one muscle group's exercises are
+    # adjacent, so a heading goes in wherever the group changes. Ordering stays
+    # in insights.py; this only draws the seam.
+    smalls, e1rm_rows, current_group = [], [], None
     for index, series in enumerate(data["exercise_e1rm"]):
+        group = series.get("muscle_group") or insights.UNASSIGNED_GROUP
+        if group != current_group:
+            smalls.append(f'<h3 class="section">{html.escape(group)}</h3>')
+            current_group = group
         first, last = series["points"][0][1], series["points"][-1][1]
         change = last - first
         slope = series.get("slope_per_week")
@@ -510,15 +533,19 @@ def render_progress_body(data: dict[str, Any]) -> str:
             f'<div class="plot" data-chart="e1rm:{index}"></div></div>'
         )
         for day, value in series["points"]:
-            e1rm_rows.append([series["exercise"], day, _fmt(value, 1)])
+            e1rm_rows.append([group, series["exercise"], day, _fmt(value, 1)])
 
     e1rm_card = _card(
-        "Estimated 1RM by exercise",
-        "Epley, from clean reps only. The grey line is the fitted trend; the rate "
-        "beside each name is its slope.",
+        "Estimated 1RM by muscle group",
+        "Epley, from clean reps only, grouped by the muscle each exercise is filed "
+        "under. Still one line per exercise \u2014 a bench press and a fly average to "
+        "nothing useful. The grey line is the fitted trend; the rate beside each "
+        "name is its slope.",
         f'<div class="smalls">{"".join(smalls)}</div>' if smalls
         else '<p class="empty">Needs at least two sessions of an exercise to show a trend.</p>',
-        _table(["Exercise", "Session", "e1RM (kg)"], e1rm_rows, "Table view") if e1rm_rows else "",
+        _table(["Muscle group", "Exercise", "Session", "e1RM (kg)"], e1rm_rows,
+               "Table view", numeric_from=3)
+        if e1rm_rows else "",
     )
 
     bodyweight_card = _card(

@@ -19,9 +19,10 @@ import json
 import logging
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from rapidfuzz import fuzz
@@ -75,6 +76,18 @@ CONFIDENCE_THRESHOLD = float(env("CONFIDENCE_THRESHOLD", "0.7"))
 # rapidfuzz score (0-100) at or above which a proposed exercise name is treated
 # as the same exercise as an existing row.
 FUZZY_MATCH_THRESHOLD = float(env("FUZZY_MATCH_THRESHOLD", "85"))
+
+# Band immediately below FUZZY_MATCH_THRESHOLD. A new name scoring in here is
+# too far from an existing exercise to merge automatically, but close enough
+# that a typo is the likeliest explanation - which is exactly the case that
+# silently splits one lift's history across two rows.
+NEAR_MISS_FLOOR = float(env("NEAR_MISS_FLOOR", "70"))
+
+# Grounding similarity below which a name that WAS saved is still treated as
+# weakly supported by the text it was read from. Confidence already penalizes
+# this band by 0.15, which on its own does not drop a set with a weight and a
+# rep count under CONFIDENCE_THRESHOLD - so without a flag it passes unseen.
+WEAK_GROUNDING_SIMILARITY = float(env("WEAK_GROUNDING_SIMILARITY", "0.8"))
 
 # Groq's Llama chat models (llama-3.3-70b-versatile, llama-3.1-8b-instant) were
 # deprecated for free/developer tiers on 2026-06-17. openai/gpt-oss-120b is the
@@ -255,19 +268,180 @@ class ReviewItem:
 
 
 @dataclass
+class NameFlag:
+    """A saved exercise name that does not look right - niche, or just wrong.
+
+    Distinct from `ReviewItem` in the one way that matters: the row this refers
+    to WAS inserted. A flag is an amber "look at this", not a rejection, so it
+    never withholds data. Raised only when the name creates a NEW exercise,
+    because that is the moment a bad name becomes a permanent row; re-logging an
+    exercise that already exists is not suspicious and must not nag.
+    """
+
+    exercise_name: str
+    reason: str  # "near_miss" | "weak_grounding" | "unrecognized"
+    detail: str
+    nearest_name: Optional[str] = None
+    score: Optional[float] = None
+
+
+@dataclass
 class PipelineResult:
     inserted_sets: int = 0
     inserted_bodyweight: int = 0
     review_items: list[ReviewItem] = field(default_factory=list)
     exercises_created: list[str] = field(default_factory=list)
+    name_flags: list[NameFlag] = field(default_factory=list)
     exercises_matched: list[tuple[str, str]] = field(default_factory=list)
     duplicate_of_recent: bool = False
     replaced: Optional[dict[str, int]] = None
     error: Optional[str] = None
+    # Rows the user unticked on the review screen. Distinct from review_items,
+    # which are rows the pipeline itself held back.
+    skipped_sets: int = 0
+    skipped_bodyweight: int = 0
 
     @property
     def total_inserted(self) -> int:
         return self.inserted_sets + self.inserted_bodyweight
+
+
+# --------------------------------------------------------------------------
+# Editable draft — what the review screen shows before anything is written
+# --------------------------------------------------------------------------
+
+# The editable columns of each row, in the order the review screen lays them
+# out. `raw_span` is carried but never edited: it is the evidence the row was
+# read from, and rewriting it would rewrite the audit trail.
+SET_COLUMNS: tuple[str, ...] = (
+    "exercise_name",
+    "weight_kg",
+    "reps",
+    "cheat_reps",
+    "set_number",
+    "logged_at_local",
+    "muscle_group",
+    "is_warmup",
+    "is_dropset",
+    "pain_flag",
+    "notes",
+    "raw_span",
+)
+
+BODYWEIGHT_COLUMNS: tuple[str, ...] = (
+    "weight_kg",
+    "body_fat_pct",
+    "logged_at_local",
+    "notes",
+    "raw_span",
+)
+
+
+@dataclass
+class DraftIssue:
+    """Something wrong with a drafted row, addressed to the person reviewing it.
+
+    `blocking` separates the two kinds the review screen treats differently:
+    a blocking issue is one the database would reject, so the row cannot be
+    saved until it is fixed; a non-blocking one is missing or weakly grounded
+    information, which is flagged but savable — a set with no recorded weight
+    is still a set that happened.
+    """
+
+    message: str
+    field: Optional[str] = None  # column it belongs to; None = the whole row
+    blocking: bool = False
+
+
+@dataclass
+class DraftRow:
+    """One prospective database row, as extracted and possibly since edited."""
+
+    kind: str  # "workout_set" | "bodyweight"
+    values: dict[str, Any] = field(default_factory=dict)
+    confidence: Optional[float] = None
+    issues: list[DraftIssue] = field(default_factory=list)
+    include: bool = True
+    edited: bool = False  # a person changed a value on the review screen
+    # Which columns they changed. Muscle group needs this: a value the user
+    # chose may overwrite what is on record for an exercise, a suggestion the
+    # app filled in must not.
+    edited_fields: frozenset[str] = frozenset()
+    # Typed in on the review screen rather than read out of the entry. Such a row
+    # has no source text behind it, so the grounding checks do not apply to it.
+    added: bool = False
+    # An added row nobody has filled in yet: not a row at all, so it is neither
+    # saved nor complained about.
+    blank: bool = False
+    # The exact wording `process_entry` used before the review screen existed,
+    # kept so the CLI and the unattended path still report failures the same way.
+    validation_error: Optional[str] = None
+
+    @property
+    def blocking(self) -> bool:
+        return any(issue.blocking for issue in self.issues)
+
+    @property
+    def flagged(self) -> bool:
+        return bool(self.issues)
+
+    def issues_for(self, column: str) -> list[DraftIssue]:
+        return [issue for issue in self.issues if issue.field == column]
+
+    @property
+    def row_issues(self) -> list[DraftIssue]:
+        """Issues that belong to no single column."""
+        return [issue for issue in self.issues if issue.field is None]
+
+    def legacy_reason(self, confidence_threshold: float) -> str:
+        """Why an unattended run would have held this row back."""
+        if self.validation_error:
+            return self.validation_error
+        return (
+            f"confidence {self.confidence or 0.0:.2f} below "
+            f"threshold {confidence_threshold:.2f}"
+        )
+
+
+@dataclass
+class EntryDraft:
+    """Everything one journal entry would write, before any of it is written."""
+
+    raw_text: str
+    session_date: date
+    sets: list[DraftRow] = field(default_factory=list)
+    bodyweight: Optional[DraftRow] = None
+    # Fragments of the extraction that are not editable rows at all — a `sets`
+    # key that came back as a string, say. Nothing can be done with these on the
+    # review screen, so they pass straight through to the result.
+    review_items: list[ReviewItem] = field(default_factory=list)
+    error: Optional[str] = None
+    replace_existing: bool = False
+
+    @property
+    def rows(self) -> list[DraftRow]:
+        return self.sets + ([self.bodyweight] if self.bodyweight is not None else [])
+
+    @property
+    def included(self) -> list[DraftRow]:
+        return [row for row in self.rows if row.include and not row.blank]
+
+    @property
+    def flagged_count(self) -> int:
+        return sum(1 for row in self.rows if row.flagged)
+
+    @property
+    def blocked_count(self) -> int:
+        return sum(1 for row in self.included if row.blocking)
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.rows
+
+    @property
+    def ready(self) -> bool:
+        """True when saving would not be rejected by the database."""
+        return self.error is None and self.blocked_count == 0
 
 
 # --------------------------------------------------------------------------
@@ -351,19 +525,159 @@ def name_match_score(proposed: str, existing: str) -> float:
     return score
 
 
-def find_matching_exercise(
-    proposed: str,
-    existing_names: Iterable[str],
-    threshold: float = FUZZY_MATCH_THRESHOLD,
-) -> Optional[str]:
-    """Return the best existing name at/above `threshold`, else None."""
+def nearest_existing_exercise(
+    proposed: str, existing_names: Iterable[str]
+) -> tuple[Optional[str], float]:
+    """The closest existing name and its score, whatever that score is.
+
+    Split out from `find_matching_exercise` because the near-miss flag needs the
+    score precisely when it is too low to merge on.
+    """
     best_name: Optional[str] = None
     best_score = 0.0
     for candidate in existing_names:
         score = name_match_score(proposed, candidate)
         if score > best_score:
             best_name, best_score = candidate, score
+    return best_name, best_score
+
+
+def find_matching_exercise(
+    proposed: str,
+    existing_names: Iterable[str],
+    threshold: float = FUZZY_MATCH_THRESHOLD,
+) -> Optional[str]:
+    """Return the best existing name at/above `threshold`, else None."""
+    best_name, best_score = nearest_existing_exercise(proposed, existing_names)
     return best_name if best_score >= threshold else None
+
+
+def _content_tokens(name: str) -> list[str]:
+    """Sorted name tokens with equipment/muscle qualifiers removed.
+
+    Qualifiers are exactly what `name_match_score` already forgives, so they
+    must not be what makes a name look suspicious.
+    """
+    return sorted(
+        token for token in normalize_tokens(name)
+        if token not in _QUALIFIER_TOKENS_SINGULAR
+    )
+
+
+def _is_probable_typo(proposed: str, existing: str, per_token_ratio: float = 80.0) -> bool:
+    """True when two names differ by misspelling rather than by movement.
+
+    The distinction the near-miss flag lives or dies on. "Bech Press" against
+    "Chest Bench Press" is a typo splitting one lift in two. "Incline Bench
+    Press" against "Chest Bench Press" is two different lifts that SHOULD be
+    separate rows - `QUALIFIER_TOKENS` already documents `incline` as marking a
+    genuinely different movement, so flagging it would contradict the matcher.
+
+    Tokens shared exactly are paired off, then what is left is matched up by
+    character similarity - that pairing is the misspelling. Only tokens that
+    find no partner at all are allowed to be qualifiers, which is what lets
+    "Bech Press" pair against "Chest Bench Press" (the spare "chest" is an
+    equipment/muscle word) while "Incline Bench Press" does not (the spare
+    "incline" is not). Qualifiers are deliberately NOT stripped up front: doing
+    so deletes the partner a typo inside one ("Shoulderr Press") needs to be
+    compared against.
+    """
+    shared = Counter(normalize_tokens(proposed)) & Counter(normalize_tokens(existing))
+    leftover_left = sorted((Counter(normalize_tokens(proposed)) - shared).elements())
+    unpaired_right = sorted((Counter(normalize_tokens(existing)) - shared).elements())
+
+    unpaired_left: list[str] = []
+    paired = 0
+    for token in leftover_left:
+        best_index, best_score = None, per_token_ratio
+        for index, candidate in enumerate(unpaired_right):
+            score = fuzz.ratio(token, candidate)
+            if score >= best_score:
+                best_index, best_score = index, score
+        if best_index is None:
+            unpaired_left.append(token)
+        else:
+            unpaired_right.pop(best_index)
+            paired += 1
+
+    if paired == 0:
+        return False
+    # A leftover with no partner is only forgivable as an equipment/muscle word;
+    # anything else is a genuine variation and must not read as a misspelling.
+    return all(token in _QUALIFIER_TOKENS_SINGULAR
+               for token in unpaired_left + unpaired_right)
+
+
+def flag_exercise_name(
+    proposed: str,
+    existing_names: Iterable[str],
+    raw_span: Optional[str] = None,
+    raw_text: str = "",
+    near_miss_floor: float = NEAR_MISS_FLOOR,
+    merge_threshold: float = FUZZY_MATCH_THRESHOLD,
+    weak_grounding: float = WEAK_GROUNDING_SIMILARITY,
+) -> Optional["NameFlag"]:
+    """Amber-flag a newly created exercise name that does not look right.
+
+    Three checks, in descending order of how much damage the case does, and at
+    most one flag is returned so the report stays readable:
+
+      1. `near_miss`      - close to an existing exercise but under the merge
+                            threshold. A typo here splits one lift's history in
+                            two, and every later chart inherits the split.
+      2. `weak_grounding` - the name is poorly supported by the text it was
+                            read from, i.e. the model may have tidied it into
+                            something that was never written.
+      3. `unrecognized`   - no muscle-group table, muscle word or movement verb
+                            knows this name. Either genuinely niche, or wrong.
+
+    Returns None when the name looks ordinary. Pure: no database, no network.
+    """
+    nearest, score = nearest_existing_exercise(proposed, existing_names)
+    if (nearest is not None
+            and near_miss_floor <= score < merge_threshold
+            and _is_probable_typo(proposed, nearest)):
+        return NameFlag(
+            exercise_name=proposed,
+            reason="near_miss",
+            detail=(f"close to existing {nearest!r} (score {score:.0f}, merge needs "
+                    f"{merge_threshold:.0f}) - if these are the same lift, the history "
+                    f"is now split across two exercises"),
+            nearest_name=nearest,
+            score=score,
+        )
+
+    # Same haystack rule `compute_confidence` uses: the span if the model gave
+    # one, otherwise the whole entry.
+    haystack = (raw_span or "").strip() or (raw_text or "")
+    if haystack:
+        # Take the better of the full name and the name stripped of qualifiers:
+        # the model routinely adds "Barbell"/"Dumbbell" to a name the text wrote
+        # bare, and that is normalization, not invention.
+        similarity = max(
+            _grounding_similarity(proposed, haystack),
+            _grounding_similarity(" ".join(_content_tokens(proposed)), haystack),
+        )
+        if similarity < weak_grounding:
+            return NameFlag(
+                exercise_name=proposed,
+                reason="weak_grounding",
+                detail=(f"only {similarity:.0%} similar to the text it was read from "
+                        f"({haystack.strip()[:60]!r}) - check the name was actually "
+                        f"written, not inferred"),
+                score=similarity,
+            )
+
+    if resolve_muscle_group(proposed) is None:
+        return NameFlag(
+            exercise_name=proposed,
+            reason="unrecognized",
+            detail=("no muscle group, muscle word or movement verb recognized - either "
+                    "a niche movement worth adding to muscle_groups.py, or not an "
+                    "exercise name at all"),
+        )
+
+    return None
 
 
 def compute_confidence(
@@ -853,6 +1167,44 @@ def get_groq_client() -> Any:
     return Groq(api_key=api_key)
 
 
+def score_set(
+    item: dict[str, Any],
+    raw_text: str,
+) -> tuple[Optional[WorkoutSet], float, Optional[ValidationError]]:
+    """Validate and score one raw set object.
+
+    The single place a set is turned into a model and given a confidence, so the
+    review screen, the CLI dry run and the insert path can never disagree about
+    what is wrong with a row. Returns (model, confidence, error); exactly one of
+    model and error is None.
+    """
+    try:
+        workout_set = WorkoutSet.model_validate(item)
+    except ValidationError as exc:
+        return None, compute_confidence(None, None, None, None, raw_text, validation_ok=False), exc
+
+    confidence = compute_confidence(
+        workout_set.exercise_name,
+        workout_set.weight_kg,
+        workout_set.reps,
+        workout_set.raw_span,
+        raw_text,
+    )
+    return workout_set, confidence, None
+
+
+def score_bodyweight(
+    item: dict[str, Any],
+    raw_text: str,
+) -> tuple[Optional[BodyweightEntry], float, Optional[ValidationError]]:
+    """`score_set`, for the bodyweight reading."""
+    try:
+        entry = BodyweightEntry.model_validate(item)
+    except ValidationError as exc:
+        return None, 0.0, exc
+    return entry, compute_bodyweight_confidence(entry, raw_text), None
+
+
 def validate_extraction(
     payload: dict[str, Any],
     raw_text: str,
@@ -873,39 +1225,29 @@ def validate_extraction(
             review.append(ReviewItem("workout_set", f"set {index} was not an object", 0.0,
                                      {"raw": str(item)[:500]}))
             continue
-        try:
-            workout_set = WorkoutSet.model_validate(item)
-        except ValidationError as exc:
+        workout_set, confidence, exc = score_set(item, raw_text)
+        if exc is not None:
             review.append(
                 ReviewItem(
                     "workout_set",
                     f"failed validation: {_short_errors(exc)}",
-                    compute_confidence(None, None, None, None, raw_text, validation_ok=False),
+                    confidence,
                     item,
                 )
             )
             continue
-
-        confidence = compute_confidence(
-            workout_set.exercise_name,
-            workout_set.weight_kg,
-            workout_set.reps,
-            workout_set.raw_span,
-            raw_text,
-        )
         scored_sets.append((workout_set, confidence))
 
     scored_bodyweight: Optional[tuple[BodyweightEntry, float]] = None
     raw_bodyweight = payload.get("bodyweight")
     if isinstance(raw_bodyweight, dict):
-        try:
-            entry = BodyweightEntry.model_validate(raw_bodyweight)
-        except ValidationError as exc:
+        entry, bodyweight_confidence, exc = score_bodyweight(raw_bodyweight, raw_text)
+        if exc is not None:
             review.append(
                 ReviewItem("bodyweight", f"failed validation: {_short_errors(exc)}", 0.0, raw_bodyweight)
             )
         else:
-            scored_bodyweight = (entry, compute_bodyweight_confidence(entry, raw_text))
+            scored_bodyweight = (entry, bodyweight_confidence)
     elif raw_bodyweight not in (None, ""):
         review.append(
             ReviewItem("bodyweight", "'bodyweight' was neither null nor an object", 0.0,
@@ -955,6 +1297,365 @@ def _short_errors(exc: ValidationError) -> str:
 
 
 # --------------------------------------------------------------------------
+# Draft building (extraction -> editable rows, still nothing written)
+# --------------------------------------------------------------------------
+
+
+def _clean_message(message: str) -> str:
+    """Pydantic prefixes custom validator failures; the prefix means nothing here."""
+    return re.sub(r"^(Value|Assertion) error, ", "", message).strip()
+
+
+def _named_column(message: str, columns: Sequence[str]) -> Optional[str]:
+    """The column a whole-model validation message is about, if it names one.
+
+    Pydantic reports a `model_validator` failure against no field at all, which
+    would leave the form saying a row is unsaveable without marking anything on
+    it. These messages are ours, so the column they name is reliable.
+    """
+    lowered = message.lower()
+    # Longest first, so "cheat_reps exceeds reps" points at cheat_reps, the
+    # column that is actually out of range, rather than the one it is compared to.
+    matches = sorted((c for c in columns if c in lowered), key=len, reverse=True)
+    return matches[0] if matches else None
+
+
+def _field_issues(exc: ValidationError, columns: Sequence[str]) -> list[DraftIssue]:
+    """Turn a validation failure into per-column issues the form can highlight."""
+    issues: list[DraftIssue] = []
+    for error in exc.errors():
+        message = _clean_message(error["msg"])
+        location = str(error["loc"][0]) if error["loc"] else None
+        column = location if location in columns else _named_column(message, columns)
+        issues.append(DraftIssue(message, column, blocking=True))
+    return issues
+
+
+def _column_defaults(model: type[BaseModel], columns: Sequence[str]) -> dict[str, Any]:
+    """What each column falls back to when the extraction leaves it out.
+
+    Read off the models rather than restated, so the review screen shows the
+    value the database would actually store — `cheat_reps` absent means 0, not
+    null, and null is what the column rejects.
+    """
+    defaults: dict[str, Any] = {}
+    for column in columns:
+        info = model.model_fields.get(column)
+        defaults[column] = (
+            None if info is None or info.is_required()
+            else info.get_default(call_default_factory=True)
+        )
+    return defaults
+
+
+SET_DEFAULTS = _column_defaults(WorkoutSet, SET_COLUMNS)
+BODYWEIGHT_DEFAULTS = _column_defaults(BodyweightEntry, BODYWEIGHT_COLUMNS)
+
+
+def _pick(
+    values: dict[str, Any], columns: Sequence[str], defaults: dict[str, Any]
+) -> dict[str, Any]:
+    """Keep only the editable columns, filling omissions with the column default.
+
+    A missing key and an explicit null are treated alike: models routinely emit
+    one or the other for a flag they had nothing to say about, and neither means
+    "store null in a NOT NULL column".
+    """
+    picked: dict[str, Any] = {}
+    for column in columns:
+        value = values.get(column)
+        picked[column] = defaults[column] if value is None else value
+    return picked
+
+
+def _is_blank(values: dict[str, Any], defaults: dict[str, Any]) -> bool:
+    """True when nothing has been entered — every column still holds its default.
+
+    Compared as text as well as by value, because anything that has been through
+    a form arrives as a string: an untouched cheat-rep box submits "0", not 0,
+    and an empty slot that failed this check would fail validation on its blank
+    exercise name instead of being ignored.
+    """
+    return all(
+        value == defaults[column] or str(value).strip() == str(defaults[column])
+        for column, value in values.items()
+    )
+
+
+def suggest_muscle_group(
+    exercise_name: str,
+    known_groups: Optional[Mapping[str, Optional[str]]] = None,
+) -> Optional[str]:
+    """The muscle group to offer for an exercise name, or None if nothing fits.
+
+    What is already on record wins over the table. `get_or_create_exercise`
+    never revises a stored group on its own, so offering a table answer that
+    disagrees with one would show the user a value that saving quietly ignores.
+    The name is fuzzy-matched the same way the insert path matches it, so a
+    reworded name still finds its own row.
+    """
+    if known_groups:
+        matched = find_matching_exercise(exercise_name, known_groups.keys())
+        if matched is not None and known_groups[matched]:
+            return known_groups[matched]
+    return resolve_muscle_group(exercise_name)
+
+
+def draft_set_row(
+    values: dict[str, Any],
+    raw_text: str,
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    edited: bool = False,
+    added: bool = False,
+    edited_fields: frozenset[str] = frozenset(),
+    known_groups: Optional[Mapping[str, Optional[str]]] = None,
+    resuggest_muscle_group: bool = False,
+) -> DraftRow:
+    """Score one set and describe everything a person should look at before saving.
+
+    `added` marks a row typed in on the review screen rather than read out of the
+    entry. There is no source text behind such a row, so the grounding checks —
+    which ask how well a reading is supported by what was written — would be
+    measuring nothing. Missing weights and reps are still worth pointing out.
+    """
+    row = DraftRow(
+        "workout_set",
+        _pick(values, SET_COLUMNS, SET_DEFAULTS),
+        edited=edited,
+        added=added,
+        edited_fields=edited_fields,
+    )
+    if _is_blank(row.values, SET_DEFAULTS):
+        # An empty slot the user has not filled in. Not a row, so it is neither
+        # saved nor complained about.
+        row.blank = True
+        return row
+
+    workout_set, confidence, exc = score_set(row.values, raw_text)
+    row.confidence = 1.0 if added else confidence
+
+    if exc is not None:
+        row.validation_error = f"failed validation: {_short_errors(exc)}"
+        row.issues = _field_issues(exc, SET_COLUMNS)
+        return row
+
+    # Show the coerced values, so what the screen displays is what gets stored.
+    row.values = _pick(workout_set.model_dump(), SET_COLUMNS, SET_DEFAULTS)
+
+    if workout_set.weight_kg is None:
+        row.issues.append(
+            DraftIssue("no weight recorded — saved blank unless you fill it in", "weight_kg")
+        )
+    if workout_set.reps is None:
+        row.issues.append(
+            DraftIssue("no rep count recorded — saved blank unless you fill it in", "reps")
+        )
+
+    # Suggested rather than read: the extraction is never asked for a muscle
+    # group. A value already there is kept on the way in, so the rare one a model
+    # does volunteer still counts; on the way back from the review screen it is
+    # recomputed unless the user took the field over, because by then the value
+    # sitting in the box is this function's own last answer — and renaming the
+    # exercise has to re-answer it rather than leave the old name's group behind.
+    if "muscle_group" not in row.edited_fields:
+        current = None if resuggest_muscle_group else row.values.get("muscle_group")
+        row.values["muscle_group"] = current or suggest_muscle_group(
+            workout_set.exercise_name, known_groups
+        )
+    _flag_muscle_group(row)
+
+    if added:
+        return row
+
+    if _grounding_similarity(workout_set.exercise_name, workout_set.raw_span or raw_text) < 0.5:
+        row.issues.append(
+            DraftIssue("this name does not closely match the text it was read from",
+                       "exercise_name")
+        )
+
+    # Only worth saying when nothing more specific already explains the score.
+    if confidence < confidence_threshold and not row.issues and not edited:
+        row.issues.append(
+            DraftIssue(
+                f"confidence {confidence:.2f}, below the {confidence_threshold:.2f} "
+                "threshold — check it against your entry"
+            )
+        )
+    return row
+
+
+def _flag_muscle_group(row: DraftRow) -> None:
+    """Mark a muscle group that nothing can be done with downstream.
+
+    `insights.volume_by_muscle_group` buckets on this column exactly as stored,
+    so a blank one silently becomes "Unassigned" and a typo becomes its own
+    bucket. Neither is an error the database would catch, which is why both are
+    flagged here rather than left to be discovered in a chart.
+    """
+    group = (row.values.get("muscle_group") or "").strip()
+    if not group:
+        row.issues.append(
+            DraftIssue(
+                "no muscle group matched this name — volume by muscle group will "
+                "count it as Unassigned",
+                "muscle_group",
+            )
+        )
+    elif group not in muscle_groups.CANONICAL_GROUPS:
+        row.issues.append(
+            DraftIssue(
+                f"“{group}” is not one of the standard groups "
+                f"({', '.join(muscle_groups.CANONICAL_GROUPS)}) — it will be "
+                "counted as its own bucket",
+                "muscle_group",
+            )
+        )
+
+
+def draft_bodyweight_row(
+    values: dict[str, Any],
+    raw_text: str,
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    edited: bool = False,
+    added: bool = False,
+) -> DraftRow:
+    """`draft_set_row`, for the bodyweight reading."""
+    row = DraftRow(
+        "bodyweight",
+        _pick(values, BODYWEIGHT_COLUMNS, BODYWEIGHT_DEFAULTS),
+        edited=edited,
+        added=added,
+    )
+    if _is_blank(row.values, BODYWEIGHT_DEFAULTS):
+        row.blank = True
+        return row
+
+    entry, confidence, exc = score_bodyweight(row.values, raw_text)
+    row.confidence = 1.0 if added else confidence
+
+    if exc is not None:
+        row.validation_error = f"failed validation: {_short_errors(exc)}"
+        row.issues = _field_issues(exc, BODYWEIGHT_COLUMNS)
+        return row
+
+    row.values = _pick(entry.model_dump(), BODYWEIGHT_COLUMNS, BODYWEIGHT_DEFAULTS)
+    if added:
+        return row
+
+    haystack = _normalize_numeric_text(entry.raw_span or raw_text)
+    if not _number_appears_in(float(entry.weight_kg), haystack):
+        row.issues.append(
+            DraftIssue("this number does not appear in your entry", "weight_kg")
+        )
+    if confidence < confidence_threshold and not row.issues and not edited:
+        row.issues.append(
+            DraftIssue(
+                f"confidence {confidence:.2f}, below the {confidence_threshold:.2f} "
+                "threshold — check it against your entry"
+            )
+        )
+    return row
+
+
+def load_exercise_groups(conn: Connection) -> dict[str, Optional[str]]:
+    """Every known exercise name and the muscle group it is filed under."""
+    rows = conn.execute(text("SELECT name, muscle_group FROM exercises")).fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
+def blank_set_row() -> DraftRow:
+    """An empty slot for a set the extraction missed entirely."""
+    return DraftRow("workout_set", dict(SET_DEFAULTS), added=True, blank=True)
+
+
+def blank_bodyweight_row() -> DraftRow:
+    """An empty slot for a bodyweight reading the entry never mentioned."""
+    return DraftRow("bodyweight", dict(BODYWEIGHT_DEFAULTS), added=True, blank=True)
+
+
+def draft_from_payload(
+    payload: dict[str, Any],
+    raw_text: str,
+    session_date: date,
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    known_groups: Optional[Mapping[str, Optional[str]]] = None,
+) -> EntryDraft:
+    """Turn a raw extraction into editable rows, keeping the ones that failed.
+
+    `validate_extraction` drops invalid sets into a review list; here they are
+    kept as rows, because a set the model got half right is exactly the one a
+    person wants to correct rather than retype.
+    """
+    draft = EntryDraft(raw_text=raw_text, session_date=session_date)
+
+    raw_sets = payload.get("sets") or []
+    if not isinstance(raw_sets, list):
+        draft.review_items.append(
+            ReviewItem("extraction", "'sets' was not a list", None, {"sets": str(raw_sets)[:500]})
+        )
+        raw_sets = []
+
+    for index, item in enumerate(raw_sets):
+        if not isinstance(item, dict):
+            draft.review_items.append(
+                ReviewItem("workout_set", f"set {index} was not an object", 0.0,
+                           {"raw": str(item)[:500]})
+            )
+            continue
+        draft.sets.append(
+            draft_set_row(item, raw_text, confidence_threshold, known_groups=known_groups)
+        )
+
+    raw_bodyweight = payload.get("bodyweight")
+    if isinstance(raw_bodyweight, dict):
+        draft.bodyweight = draft_bodyweight_row(raw_bodyweight, raw_text, confidence_threshold)
+    elif raw_bodyweight not in (None, ""):
+        draft.review_items.append(
+            ReviewItem("bodyweight", "'bodyweight' was neither null nor an object", 0.0,
+                       {"raw": str(raw_bodyweight)[:500]})
+        )
+
+    return draft
+
+
+def build_draft(
+    raw_text: str,
+    session_date: date,
+    client: Any = None,
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    known_groups: Optional[Mapping[str, Optional[str]]] = None,
+) -> EntryDraft:
+    """Extract one journal entry into a draft. Touches the model, not the database.
+
+    `known_groups` is what the `exercises` table already records, so the muscle
+    group offered for an exercise you have logged before is the one it is
+    actually filed under.
+    """
+    raw_text = (raw_text or "").strip()
+    if not raw_text:
+        return EntryDraft(
+            raw_text=raw_text,
+            session_date=session_date,
+            error="Empty entry — nothing to parse.",
+        )
+
+    try:
+        payload = extract_entities(raw_text, session_date, client=client)
+    except ExtractionError as exc:
+        logger.error("Extraction failed: %s", exc)
+        return EntryDraft(
+            raw_text=raw_text,
+            session_date=session_date,
+            error="Extraction failed after one retry — entry not inserted.",
+            review_items=[ReviewItem("extraction", str(exc), None, {"raw_text": raw_text})],
+        )
+
+    return draft_from_payload(
+        payload, raw_text, session_date, confidence_threshold, known_groups
+    )
+
+
+# --------------------------------------------------------------------------
 # Database
 # --------------------------------------------------------------------------
 
@@ -985,14 +1686,29 @@ def get_or_create_exercise(
     proposed_name: str,
     muscle_group: Optional[str],
     known: dict[str, int],
+    chosen_group: bool = False,
 ) -> tuple[int, Optional[str], bool]:
     """Resolve an exercise name to an id, fuzzy-matching before inserting.
 
     Returns (exercise_id, matched_existing_name_or_None, created).
+
+    `chosen_group` says the muscle group came from a person on the review
+    screen rather than from the table. Only then is an existing exercise's group
+    revised: a suggestion must never quietly overwrite a filing decision that
+    has already been made, but a correction the user typed has to stick, or the
+    review screen would be offering an edit that does nothing.
     """
     matched = find_matching_exercise(proposed_name, known.keys())
     if matched is not None:
-        return known[matched], matched, False
+        exercise_id = known[matched]
+        if chosen_group:
+            conn.execute(
+                text("UPDATE exercises SET muscle_group = :muscle_group "
+                     "WHERE exercise_id = :exercise_id "
+                     "AND muscle_group IS DISTINCT FROM :muscle_group"),
+                {"muscle_group": muscle_group, "exercise_id": exercise_id},
+            )
+        return exercise_id, matched, False
 
     # An explicit group from the caller wins; otherwise look the name up in the
     # static table. Either may be None, which stores NULL and reports as
@@ -1126,6 +1842,184 @@ def find_recent_submission(
 # --------------------------------------------------------------------------
 
 
+def commit_draft(
+    draft: EntryDraft,
+    engine: Optional[Engine] = None,
+    check_duplicates: bool = False,
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    review_excluded: bool = False,
+) -> PipelineResult:
+    """Write the ticked rows of a draft. The only function that inserts.
+
+    A row that reaches here has either been looked at on the review screen or
+    cleared the threshold unattended, so the threshold is not applied again —
+    `include` is the decision. `review_excluded` makes the rows left out come
+    back as review items, which is what the unattended path reports.
+
+    Confidence is recomputed from the values as they stand. A row a person
+    edited or typed in themselves is stored at 1.0: the score measures how well
+    an extraction is grounded in the source text, and a human correction is
+    better evidence than any grounding heuristic — for a hand-entered row there
+    is no extraction to score at all.
+
+    Blank slots are skipped in silence. They are offers to add a row that nobody
+    took up, so they are neither saved nor reported as left out.
+    """
+    if engine is None:
+        engine = get_engine()
+
+    result = PipelineResult(review_items=list(draft.review_items))
+    if draft.error:
+        result.error = draft.error
+        return result
+
+    if check_duplicates:
+        prior = find_recent_submission(engine, draft.raw_text)
+        if prior is not None:
+            logger.info("Duplicate submission suppressed (%s)", prior)
+            return PipelineResult(
+                inserted_sets=prior["inserted_sets"],
+                inserted_bodyweight=prior["inserted_bodyweight"],
+                duplicate_of_recent=True,
+            )
+
+    # (model, confidence, the muscle group was chosen by the user not suggested,
+    #  the exercise name was typed by the user rather than extracted)
+    accepted_sets: list[tuple[WorkoutSet, float, bool, bool]] = []
+    for row in draft.sets:
+        if row.blank:
+            continue
+        if not row.include:
+            result.skipped_sets += 1
+            if review_excluded:
+                result.review_items.append(
+                    ReviewItem(
+                        "workout_set",
+                        row.legacy_reason(confidence_threshold),
+                        row.confidence,
+                        dict(row.values),
+                    )
+                )
+            continue
+        workout_set, confidence, exc = score_set(row.values, draft.raw_text)
+        if exc is not None:
+            # Callers check `draft.ready` first, so this is a guard rather than a
+            # path: a row the database would reject is never silently dropped.
+            result.review_items.append(
+                ReviewItem("workout_set", f"failed validation: {_short_errors(exc)}",
+                           row.confidence, dict(row.values))
+            )
+            continue
+        accepted_sets.append((
+            workout_set,
+            1.0 if row.edited or row.added else confidence,
+            "muscle_group" in row.edited_fields,
+            row.added or "exercise_name" in row.edited_fields,
+        ))
+
+    accepted_bodyweight: Optional[tuple[BodyweightEntry, float]] = None
+    if draft.bodyweight is not None and not draft.bodyweight.blank:
+        row = draft.bodyweight
+        if not row.include:
+            result.skipped_bodyweight += 1
+            if review_excluded:
+                result.review_items.append(
+                    ReviewItem("bodyweight", row.legacy_reason(confidence_threshold),
+                               row.confidence, dict(row.values))
+                )
+        else:
+            entry, confidence, exc = score_bodyweight(row.values, draft.raw_text)
+            if exc is not None:
+                result.review_items.append(
+                    ReviewItem("bodyweight", f"failed validation: {_short_errors(exc)}",
+                               row.confidence, dict(row.values))
+                )
+            else:
+                accepted_bodyweight = (entry, 1.0 if row.edited or row.added else confidence)
+
+    if not accepted_sets and accepted_bodyweight is None:
+        return result
+
+    with engine.begin() as conn:
+        if draft.replace_existing:
+            # Only reached when there is something to put back - the early
+            # return above means a failed extraction never empties the day.
+            result.replaced = delete_entries_for_date(conn, draft.session_date)
+            logger.info("Replaced %s on %s", result.replaced, draft.session_date)
+        known = load_exercise_names(conn)
+        for workout_set, confidence, chosen_group, name_typed in accepted_sets:
+            exercise_id, matched_name, created = get_or_create_exercise(
+                conn, workout_set.exercise_name, workout_set.muscle_group, known,
+                chosen_group=chosen_group,
+            )
+            if created:
+                result.exercises_created.append(workout_set.exercise_name)
+                # Flag against everything known EXCEPT the row just inserted -
+                # `get_or_create_exercise` has already added it to `known`, and a
+                # name always scores 100 against itself. Names created earlier in
+                # this same entry stay in scope, so a typo of a lift first logged
+                # two sets ago is still caught.
+                #
+                # A name the user typed on the review screen is flagged with no
+                # source text, which skips the grounding check while leaving the
+                # near-miss and unrecognized ones in force. Grounding asks
+                # whether the model read the name or invented it; for a name a
+                # person wrote there is no extraction to score, the same reason
+                # `confidence` above is pinned to 1.0 for an edited row. Asking
+                # it anyway would flag every hand-typed name, and a flag that
+                # fires on ordinary lifts hides the real ones.
+                flag = flag_exercise_name(
+                    workout_set.exercise_name,
+                    [name for name in known if name != workout_set.exercise_name],
+                    None if name_typed else workout_set.raw_span,
+                    "" if name_typed else draft.raw_text,
+                )
+                if flag is not None:
+                    result.name_flags.append(flag)
+                    logger.info(
+                        "event=name_flagged exercise=%r reason=%s",
+                        workout_set.exercise_name, flag.reason,
+                    )
+            elif matched_name and matched_name != workout_set.exercise_name:
+                result.exercises_matched.append((workout_set.exercise_name, matched_name))
+
+            conn.execute(
+                _INSERT_WORKOUT_SET,
+                {
+                    "exercise_id": exercise_id,
+                    "logged_at": resolve_logged_at(workout_set.logged_at_local, draft.session_date),
+                    "weight_kg": workout_set.weight_kg,
+                    "reps": workout_set.reps,
+                    "cheat_reps": workout_set.cheat_reps,
+                    "set_number": workout_set.set_number,
+                    "is_warmup": workout_set.is_warmup,
+                    "is_dropset": workout_set.is_dropset,
+                    "pain_flag": workout_set.pain_flag,
+                    "notes": workout_set.notes,
+                    "raw_source": draft.raw_text,
+                    "extraction_confidence": confidence,
+                },
+            )
+            result.inserted_sets += 1
+
+        if accepted_bodyweight is not None:
+            entry, confidence = accepted_bodyweight
+            conn.execute(
+                _INSERT_BODYWEIGHT,
+                {
+                    "logged_at": resolve_logged_at(entry.logged_at_local, draft.session_date),
+                    "weight_kg": entry.weight_kg,
+                    "body_fat_pct": entry.body_fat_pct,
+                    "notes": entry.notes,
+                    "raw_source": draft.raw_text,
+                    "extraction_confidence": confidence,
+                },
+            )
+            result.inserted_bodyweight += 1
+
+    return result
+
+
 def process_entry(
     raw_text: str,
     session_date: date,
@@ -1135,10 +2029,12 @@ def process_entry(
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
     replace_existing: bool = False,
 ) -> PipelineResult:
-    """Run the full pipeline for one journal entry.
+    """Extract and insert one journal entry with nobody watching.
 
-    Called by both the CLI and the web app. `check_duplicates` is enabled by the
-    web app, where a double-tapped submit is a real risk.
+    The CLI path: no review screen, so the confidence threshold does the
+    deciding and anything under it is reported rather than saved. The web app
+    goes through `build_draft` and `commit_draft` instead, and lets the person
+    who wrote the entry make that call.
     """
     raw_text = (raw_text or "").strip()
     if not raw_text:
@@ -1157,98 +2053,18 @@ def process_entry(
                 duplicate_of_recent=True,
             )
 
-    try:
-        payload = extract_entities(raw_text, session_date, client=client)
-    except ExtractionError as exc:
-        logger.error("Extraction failed: %s", exc)
-        return PipelineResult(
-            error="Extraction failed after one retry — entry not inserted.",
-            review_items=[ReviewItem("extraction", str(exc), None, {"raw_text": raw_text})],
-        )
+    draft = build_draft(raw_text, session_date, client=client,
+                        confidence_threshold=confidence_threshold)
+    if draft.error:
+        return PipelineResult(error=draft.error, review_items=list(draft.review_items))
 
-    scored_sets, scored_bodyweight, review = validate_extraction(payload, raw_text)
-    result = PipelineResult(review_items=list(review))
+    draft.replace_existing = replace_existing
+    for row in draft.rows:
+        row.include = not row.blocking and (row.confidence or 0.0) >= confidence_threshold
 
-    accepted_sets = []
-    for workout_set, confidence in scored_sets:
-        if confidence < confidence_threshold:
-            result.review_items.append(
-                ReviewItem(
-                    "workout_set",
-                    f"confidence {confidence:.2f} below threshold {confidence_threshold:.2f}",
-                    confidence,
-                    workout_set.model_dump(),
-                )
-            )
-        else:
-            accepted_sets.append((workout_set, confidence))
-
-    accepted_bodyweight = None
-    if scored_bodyweight is not None:
-        entry, confidence = scored_bodyweight
-        if confidence < confidence_threshold:
-            result.review_items.append(
-                ReviewItem(
-                    "bodyweight",
-                    f"confidence {confidence:.2f} below threshold {confidence_threshold:.2f}",
-                    confidence,
-                    entry.model_dump(),
-                )
-            )
-        else:
-            accepted_bodyweight = (entry, confidence)
-
-    if not accepted_sets and accepted_bodyweight is None:
-        return result
-
-    with engine.begin() as conn:
-        if replace_existing:
-            # Only reached when there is something to put back - the early
-            # return above means a failed extraction never empties the day.
-            result.replaced = delete_entries_for_date(conn, session_date)
-            logger.info("Replaced %s on %s", result.replaced, session_date)
-        known = load_exercise_names(conn)
-        for workout_set, confidence in accepted_sets:
-            exercise_id, matched_name, created = get_or_create_exercise(
-                conn, workout_set.exercise_name, workout_set.muscle_group, known
-            )
-            if created:
-                result.exercises_created.append(workout_set.exercise_name)
-            elif matched_name and matched_name != workout_set.exercise_name:
-                result.exercises_matched.append((workout_set.exercise_name, matched_name))
-
-            conn.execute(
-                _INSERT_WORKOUT_SET,
-                {
-                    "exercise_id": exercise_id,
-                    "logged_at": resolve_logged_at(workout_set.logged_at_local, session_date),
-                    "weight_kg": workout_set.weight_kg,
-                    "reps": workout_set.reps,
-                    "cheat_reps": workout_set.cheat_reps,
-                    "set_number": workout_set.set_number,
-                    "is_warmup": workout_set.is_warmup,
-                    "is_dropset": workout_set.is_dropset,
-                    "pain_flag": workout_set.pain_flag,
-                    "notes": workout_set.notes,
-                    "raw_source": raw_text,
-                    "extraction_confidence": confidence,
-                },
-            )
-            result.inserted_sets += 1
-
-        if accepted_bodyweight is not None:
-            entry, confidence = accepted_bodyweight
-            conn.execute(
-                _INSERT_BODYWEIGHT,
-                {
-                    "logged_at": resolve_logged_at(entry.logged_at_local, session_date),
-                    "weight_kg": entry.weight_kg,
-                    "body_fat_pct": entry.body_fat_pct,
-                    "notes": entry.notes,
-                    "raw_source": raw_text,
-                    "extraction_confidence": confidence,
-                },
-            )
-            result.inserted_bodyweight += 1
-
-    return result
+    return commit_draft(
+        draft,
+        engine=engine,
+        confidence_threshold=confidence_threshold,
+        review_excluded=True,
+    )

@@ -224,10 +224,15 @@ def volume_by_exercise(records: Iterable[SetRecord]) -> dict[str, float]:
     return {name: round(value, 1) for name, value in sorted(totals.items())}
 
 
+# What an exercise with no muscle group on file is bucketed under. One constant
+# so the volume chart and the e1RM sections cannot label the same gap differently.
+UNASSIGNED_GROUP = "Unassigned"
+
+
 def volume_by_muscle_group(records: Iterable[SetRecord]) -> dict[str, float]:
     totals: dict[str, float] = defaultdict(float)
     for record in records:
-        totals[record.muscle_group or "Unassigned"] += set_volume(record)
+        totals[record.muscle_group or UNASSIGNED_GROUP] += set_volume(record)
     return {name: round(value, 1) for name, value in sorted(totals.items())}
 
 
@@ -949,6 +954,49 @@ def exercise_e1rm_series(
     return series[:limit]
 
 
+def exercise_e1rm_by_muscle_group(
+    records: Iterable[SetRecord], limit: int = 6, min_sessions: int = 2
+) -> list[tuple[str, str, list[tuple[date, float]]]]:
+    """`exercise_e1rm_series`, ordered so one muscle group's exercises sit together.
+
+    Returns (muscle_group, exercise, points).
+
+    Grouping here is presentation, not aggregation: the series stay per
+    exercise. One averaged e1RM line per muscle group would be easier to read
+    and would not mean anything — a 100kg bench press and a 15kg cable fly have
+    no useful mean, and the average would move when exercise selection changed
+    rather than when strength did. Sectioning the real series answers "is my
+    chest progressing" without inventing a number to answer it with.
+
+    Which exercises appear is decided before grouping, so the chart still shows
+    the most-trained lifts rather than reserving slots per group. Groups follow
+    the most-trained exercise in each, with Unassigned last so a gap in the
+    muscle-group table sinks instead of splitting the groups that do read.
+    """
+    records = list(records)
+    series = exercise_e1rm_series(records, limit=limit, min_sessions=min_sessions)
+    # Every row for an exercise carries the group from the same `exercises` row,
+    # so this is a lookup rather than a reconciliation.
+    group_for = {record.exercise_name: record.muscle_group for record in records}
+
+    def group_of(name: str) -> str:
+        return group_for.get(name) or UNASSIGNED_GROUP
+
+    first_seen: dict[str, int] = {}
+    for index, (name, _) in enumerate(series):
+        first_seen.setdefault(group_of(name), index)
+
+    ordered = sorted(
+        enumerate(series),
+        key=lambda pair: (
+            group_of(pair[1][0]) == UNASSIGNED_GROUP,
+            first_seen[group_of(pair[1][0])],
+            pair[0],
+        ),
+    )
+    return [(group_of(name), name, points) for _, (name, points) in ordered]
+
+
 def pain_summary(records: Iterable[SetRecord]) -> list[dict[str, Any]]:
     """Exercises carrying pain flags, worst streak first.
 
@@ -1017,6 +1065,7 @@ def build_dashboard(engine: Engine, weeks: int = 12, today: Optional[date] = Non
         "exercise_e1rm": [
             {
                 "exercise": name,
+                "muscle_group": group,
                 "points": [[day.isoformat(), value] for day, value in points],
                 "slope_per_week": trend_slope_per_week(points),
                 "trend": (
@@ -1024,7 +1073,7 @@ def build_dashboard(engine: Engine, weeks: int = 12, today: Optional[date] = Non
                     if trend_endpoints(points) else None
                 ),
             }
-            for name, points in exercise_e1rm_series(records)
+            for group, name, points in exercise_e1rm_by_muscle_group(records)
         ],
         "bodyweight": [[day.isoformat(), value] for day, value in bodyweight],
         "muscle_volume": sorted(
