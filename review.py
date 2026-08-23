@@ -99,6 +99,12 @@ body { max-width: 60rem; }
 .actions button { margin-top: 0; width: auto; padding: .7rem 1.4rem; }
 .actions button.secondary { background: transparent; color: inherit; border: 1px solid #8886; }
 .actions button.secondary:active { background: #8882; }
+/* Replace deletes a day before it writes. The button that does it should not
+   look like the one that only adds. */
+.actions button.danger { background: #b3261e; color: #fff; border: 1px solid #b3261e; }
+.actions button.danger:active { background: #8c1d16; }
+.dup-evidence { margin: .5rem 0 0; padding-left: 1.1rem; }
+.dup-evidence li { margin: .15rem 0; }
 details.entry summary { cursor: pointer; font-weight: 600; }
 details.entry pre { margin: .6rem 0 0; font-size: .9rem; opacity: .85; }
 """
@@ -270,6 +276,40 @@ def _add_buttons(draft: EntryDraft, standalone: bool = True) -> str:
     return f'<div class="actions">{joined}</div>' if standalone else joined
 
 
+def _duplicate_banner(draft: EntryDraft, duplicate: Mapping[str, Any]) -> str:
+    """Why the save stopped, and what the earlier one actually put in the database.
+
+    Re-pasting an entry to correct a bad parse looks exactly like a
+    double-tapped submit, so this cannot refuse on its own judgement — it states
+    the case, shows the evidence, and lets the user decide.
+    """
+    sets = int(duplicate.get("inserted_sets", 0) or 0)
+    bodyweight = int(duplicate.get("inserted_bodyweight", 0) or 0)
+    evidence = duplicate.get("evidence") or []
+
+    if evidence:
+        items = "".join(
+            f"<li>{html.escape(str(row['exercise']))} &mdash; {int(row['sets'])} set(s)</li>"
+            for row in evidence
+        )
+        detail = f'<ul class="dup-evidence">{items}</ul>'
+    else:
+        # Bodyweight-only entries produce no exercise rows, so there is nothing
+        # to list. Say so rather than showing an empty box.
+        detail = ('<p class="evidence">That save recorded no exercise sets '
+                  "&mdash; a bodyweight reading only.</p>")
+
+    return (
+        '<div class="card warn"><strong>This looks like it was already saved.</strong> '
+        f"The same text was written to {html.escape(draft.session_date.isoformat())} "
+        f"within the last {pipeline.DUPLICATE_WINDOW_MINUTES} minutes, saving {sets} "
+        f"set(s) and {bodyweight} bodyweight entry/entries. Nothing has been written "
+        f"this time yet.{detail}"
+        "<p>If that was a double-tap, go back. If you are re-logging this to fix a "
+        "bad parse, choose how it should land.</p></div>"
+    )
+
+
 def _banner(draft: EntryDraft, existing: Optional[Mapping[str, int]]) -> str:
     parts: list[str] = []
 
@@ -320,17 +360,35 @@ def render_review_body(
     draft: EntryDraft,
     existing: Optional[Mapping[str, int]] = None,
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    duplicate: Optional[Mapping[str, Any]] = None,
 ) -> str:
-    """The review form: every prospective row, editable, before anything is written."""
+    """The review form: every prospective row, editable, before anything is written.
+
+    `duplicate` turns the same form into the answer to the duplicate guard: the
+    rows are unchanged and still editable, but the save buttons become the two
+    ways forward. It is rendered from the draft the user just submitted, so
+    nothing they corrected is lost while they decide.
+    """
+    # With a decision pending the mode is carried by whichever button is pressed,
+    # so the hidden copy is left out rather than submitted alongside it.
+    mode_hidden = (
+        ""
+        if duplicate
+        else (f'<input type="hidden" name="mode" '
+              f'value="{"replace" if draft.replace_existing else "add"}">')
+    )
+    override_hidden = (
+        '<input type="hidden" name="override_duplicate" value="1">' if duplicate else ""
+    )
     hidden = (
         f'<input type="hidden" name="raw_text" value="{html.escape(draft.raw_text)}">'
         f'<input type="hidden" name="session_date" '
         f'value="{html.escape(draft.session_date.isoformat())}">'
-        f'<input type="hidden" name="mode" '
-        f'value="{"replace" if draft.replace_existing else "add"}">'
+        f'{mode_hidden}'
         f'<input type="hidden" name="set_count" value="{len(draft.sets)}">'
         f'<input type="hidden" name="has_bodyweight" '
         f'value="{"1" if draft.bodyweight is not None else ""}">'
+        f'{override_hidden}'
     )
 
     entry = (
@@ -378,14 +436,51 @@ def render_review_body(
     # baked in at render time would go stale the moment a box is unticked.
     total = len(draft.included)
 
+    if duplicate:
+        heading = "Already saved once"
+        intro = (
+            '<p class="muted">These rows are still exactly what would be written, '
+            "and still editable. Choose how this should land, or go back.</p>"
+        )
+        banner = _duplicate_banner(draft, duplicate)
+        # Each button carries its own mode, which is why the hidden copy is
+        # omitted above. Replace deletes the day first, so it is styled as the
+        # destructive action it is.
+        actions = (
+            '<button type="submit" name="mode" value="replace" class="danger">'
+            f"Replace {html.escape(draft.session_date.isoformat())} with this</button>"
+            '<button type="submit" name="mode" value="add" class="secondary">'
+            "Add as a second copy</button>"
+            '<a href="/">Go back &mdash; it was a double-tap</a>'
+        )
+    else:
+        heading = "Check before saving"
+        intro = (
+            '<p class="muted">This is exactly what will be written to the database for '
+            f"{html.escape(draft.session_date.isoformat())}. Correct anything that is "
+            "wrong, untick anything that should not be saved, then save. Nothing has "
+            "been stored yet. Muscle group is suggested from the exercise name, not "
+            "read from your entry &mdash; correcting one re-files that exercise for "
+            "good.</p>"
+        )
+        banner = _banner(draft, existing)
+        save_class = ' class="danger"' if draft.replace_existing else ""
+        save_label = (
+            f"Replace {html.escape(draft.session_date.isoformat())} and save"
+            if draft.replace_existing
+            else "Save to database"
+        )
+        actions = (
+            f'<button type="submit" name="action" value="save"{save_class}>'
+            f"{save_label}</button>"
+            f"{_add_buttons(draft, standalone=False)}"
+            '<a href="/">Discard and start over</a>'
+        )
+
     return f"""
-<h1>Check before saving</h1>
-<p class="muted">This is exactly what will be written to the database for
-{html.escape(draft.session_date.isoformat())}. Correct anything that is wrong,
-untick anything that should not be saved, then save. Nothing has been stored yet.
-Muscle group is suggested from the exercise name, not read from your entry &mdash;
-correcting one re-files that exercise for good.</p>
-{_banner(draft, existing)}
+<h1>{heading}</h1>
+{intro}
+{banner}
 {entry}
 <form method="post" action="/save">
 {hidden}{MUSCLE_GROUP_OPTIONS}
@@ -393,9 +488,7 @@ correcting one re-files that exercise for good.</p>
 {cards}
 {bodyweight}
 <div class="actions">
-  <button type="submit" name="action" value="save">Save to database</button>
-  {_add_buttons(draft, standalone=False)}
-  <a href="/">Discard and start over</a>
+  {actions}
 </div>
 <p class="muted">{total} row(s) drafted. Only the ticked ones are saved; an empty
 slot is ignored.</p>

@@ -294,6 +294,10 @@ class PipelineResult:
     name_flags: list[NameFlag] = field(default_factory=list)
     exercises_matched: list[tuple[str, str]] = field(default_factory=list)
     duplicate_of_recent: bool = False
+    # What the matched earlier save actually produced, per exercise. Empty
+    # unless `duplicate_of_recent`; it is the evidence for that claim, so the
+    # user can check a match that looks wrong rather than having to believe it.
+    duplicate_evidence: list[dict[str, Any]] = field(default_factory=list)
     replaced: Optional[dict[str, int]] = None
     error: Optional[str] = None
     # Rows the user unticked on the review screen. Distinct from review_items,
@@ -1799,42 +1803,98 @@ def delete_entries_for_date(conn: Connection, session_date: date) -> dict[str, i
     return {"sets": int(sets or 0), "bodyweight": int(bodyweight or 0)}
 
 
+def _submission_clauses(
+    raw_text: str,
+    window_minutes: int,
+    session_date: Optional[date],
+) -> tuple[str, dict[str, Any]]:
+    """The WHERE fragment identifying rows written from one journal entry.
+
+    Matching is exact text equality — `raw_source` is TEXT, so nothing is
+    truncated and two different entries cannot collide here.
+    """
+    params: dict[str, Any] = {
+        "raw_source": raw_text,
+        "window": f"{int(window_minutes)} minutes",
+    }
+    clauses = [
+        "raw_source = :raw_source",
+        "created_at >= now() - CAST(:window AS interval)",
+    ]
+
+    if session_date is not None:
+        # Scoped to the day being logged. Without this, pasting the same short
+        # entry ("rest day, weighed 82.4") against two dates in one sitting
+        # reads as a double-tap and the second date is silently dropped.
+        start, end = _local_day_bounds(session_date)
+        clauses.append("logged_at >= :day_start AND logged_at < :day_end")
+        params["day_start"] = start
+        params["day_end"] = end
+
+    return " AND ".join(clauses), params
+
+
 def find_recent_submission(
     engine: Engine,
     raw_text: str,
     window_minutes: int = DUPLICATE_WINDOW_MINUTES,
+    session_date: Optional[date] = None,
 ) -> Optional[dict[str, int]]:
     """Return counts for an identical entry inserted within the window, else None.
 
     Backs the /log duplicate-submission guard: Render's free tier cold-starts for
     30-50s, which is exactly when a user double-taps submit.
+
+    `session_date` scopes the match to the day being logged. It is optional only
+    so the older two-argument call still works; every caller that knows the date
+    should pass it, or logging one short entry against two dates in one sitting
+    reads as a double-tap and the second date is dropped.
     """
+    where, params = _submission_clauses(raw_text, window_minutes, session_date)
     with engine.connect() as conn:
-        params = {"raw_source": raw_text, "window": f"{int(window_minutes)} minutes"}
         sets = conn.execute(
-            text(
-                """
-                SELECT count(*) FROM workout_logs
-                WHERE raw_source = :raw_source
-                  AND created_at >= now() - CAST(:window AS interval)
-                """
-            ),
-            params,
+            text(f"SELECT count(*) FROM workout_logs WHERE {where}"), params
         ).scalar_one()
         bodyweight = conn.execute(
-            text(
-                """
-                SELECT count(*) FROM bodyweight_logs
-                WHERE raw_source = :raw_source
-                  AND created_at >= now() - CAST(:window AS interval)
-                """
-            ),
-            params,
+            text(f"SELECT count(*) FROM bodyweight_logs WHERE {where}"), params
         ).scalar_one()
 
     if not sets and not bodyweight:
         return None
     return {"inserted_sets": int(sets), "inserted_bodyweight": int(bodyweight)}
+
+
+def describe_recent_submission(
+    engine: Engine,
+    raw_text: str,
+    window_minutes: int = DUPLICATE_WINDOW_MINUTES,
+    session_date: Optional[date] = None,
+) -> list[dict[str, Any]]:
+    """What the matched entry actually saved, per exercise.
+
+    A guard that says "duplicate" and shows nothing is impossible to argue with,
+    and impossible to trust when the sets it claims to have saved are not the
+    ones you meant to log. This is the evidence for the claim.
+    """
+    where, params = _submission_clauses(raw_text, window_minutes, session_date)
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                f"""
+                SELECT e.name AS exercise, count(*) AS sets, min(w.logged_at) AS first_logged
+                FROM workout_logs w
+                JOIN exercises e ON e.exercise_id = w.exercise_id
+                WHERE {where}
+                GROUP BY e.name
+                ORDER BY min(w.logged_at), e.name
+                """
+            ),
+            params,
+        ).all()
+    return [
+        {"exercise": row[0], "sets": int(row[1]), "first_logged": row[2]}
+        for row in rows
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -1848,6 +1908,7 @@ def commit_draft(
     check_duplicates: bool = False,
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
     review_excluded: bool = False,
+    override_duplicate: bool = False,
 ) -> PipelineResult:
     """Write the ticked rows of a draft. The only function that inserts.
 
@@ -1864,6 +1925,13 @@ def commit_draft(
 
     Blank slots are skipped in silence. They are offers to add a row that nobody
     took up, so they are neither saved nor reported as left out.
+
+    `override_duplicate` is the answer to the duplicate guard rather than a way
+    around it. Re-pasting an entry to correct a bad parse is indistinguishable
+    from a double-tapped submit, so the guard asks instead of refusing, and this
+    carries the decision back. It is also what makes Replace work on a matched
+    entry: without it the delete-and-reinsert is stopped by the same guard and
+    the save appears to succeed while changing nothing.
     """
     if engine is None:
         engine = get_engine()
@@ -1873,14 +1941,19 @@ def commit_draft(
         result.error = draft.error
         return result
 
-    if check_duplicates:
-        prior = find_recent_submission(engine, draft.raw_text)
+    if check_duplicates and not override_duplicate:
+        prior = find_recent_submission(
+            engine, draft.raw_text, session_date=draft.session_date
+        )
         if prior is not None:
-            logger.info("Duplicate submission suppressed (%s)", prior)
+            logger.info("Duplicate submission held for a decision (%s)", prior)
             return PipelineResult(
                 inserted_sets=prior["inserted_sets"],
                 inserted_bodyweight=prior["inserted_bodyweight"],
                 duplicate_of_recent=True,
+                duplicate_evidence=describe_recent_submission(
+                    engine, draft.raw_text, session_date=draft.session_date
+                ),
             )
 
     # (model, confidence, the muscle group was chosen by the user not suggested,
@@ -2044,7 +2117,8 @@ def process_entry(
         engine = get_engine()
 
     if check_duplicates:
-        prior = find_recent_submission(engine, raw_text)
+        # The unattended path has nobody to ask, so it still refuses outright.
+        prior = find_recent_submission(engine, raw_text, session_date=session_date)
         if prior is not None:
             logger.info("Duplicate submission suppressed (%s)", prior)
             return PipelineResult(

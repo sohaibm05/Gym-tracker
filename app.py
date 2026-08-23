@@ -29,7 +29,7 @@ import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -251,20 +251,13 @@ def _render_result(result: pipeline.PipelineResult, session_date: date) -> str:
     if result.error:
         parts.append(f'<div class="card err"><strong>Error.</strong> {html.escape(result.error)}</div>')
 
-    if result.duplicate_of_recent:
-        parts.append(
-            '<div class="card warn"><strong>Duplicate submission.</strong> '
-            "This exact text was already processed within the last "
-            f"{pipeline.DUPLICATE_WINDOW_MINUTES} minutes, so nothing was re-inserted. "
-            f"The earlier run saved {result.inserted_sets} set(s) and "
-            f"{result.inserted_bodyweight} bodyweight entry/entries.</div>"
-        )
-    else:
-        parts.append(
-            f'<div class="card ok"><strong>Inserted {result.inserted_sets} set(s)</strong> and '
-            f"{result.inserted_bodyweight} bodyweight entry/entries for "
-            f"{html.escape(session_date.isoformat())}.</div>"
-        )
+    # A duplicate never reaches here: /save intercepts it and asks instead,
+    # so by this point something really was written.
+    parts.append(
+        f'<div class="card ok"><strong>Inserted {result.inserted_sets} set(s)</strong> and '
+        f"{result.inserted_bodyweight} bodyweight entry/entries for "
+        f"{html.escape(session_date.isoformat())}.</div>"
+    )
 
     if result.replaced:
         removed = result.replaced
@@ -411,11 +404,17 @@ def _existing_counts(session_date: date) -> Optional[dict[str, int]]:
         return None
 
 
-def _review_page(draft: pipeline.EntryDraft) -> HTMLResponse:
+def _review_page(
+    draft: pipeline.EntryDraft,
+    duplicate: Optional[dict[str, Any]] = None,
+) -> HTMLResponse:
     return _page(
-        "Check before saving",
+        "Already saved once" if duplicate else "Check before saving",
         review.render_review_body(
-            draft, _existing_counts(draft.session_date), pipeline.CONFIDENCE_THRESHOLD
+            draft,
+            _existing_counts(draft.session_date),
+            pipeline.CONFIDENCE_THRESHOLD,
+            duplicate=duplicate,
         ),
         extra_css=review.REVIEW_CSS,
     )
@@ -487,7 +486,34 @@ async def save_reviewed(request: Request, _user: str = Depends(require_auth)) ->
         logger.info("event=save_blocked date=%s blocked=%d", draft.session_date, draft.blocked_count)
         return _review_page(draft)
 
-    result = pipeline.commit_draft(draft, engine=get_engine(), check_duplicates=True)
+    # Set only by the duplicate decision page below, so a first save always
+    # passes through the guard.
+    override = bool(str(form.get("override_duplicate", "")).strip())
+    result = pipeline.commit_draft(
+        draft,
+        engine=get_engine(),
+        check_duplicates=True,
+        override_duplicate=override,
+    )
+
+    if result.duplicate_of_recent:
+        # Nothing was written. Hand the draft straight back with the two ways
+        # forward rather than dead-ending on a refusal the user cannot answer.
+        logger.info(
+            "event=duplicate_decision_offered date=%s prior_sets=%d prior_bodyweight=%d",
+            draft.session_date,
+            result.inserted_sets,
+            result.inserted_bodyweight,
+        )
+        return _review_page(
+            draft,
+            duplicate={
+                "inserted_sets": result.inserted_sets,
+                "inserted_bodyweight": result.inserted_bodyweight,
+                "evidence": result.duplicate_evidence,
+            },
+        )
+
     logger.info(
         "event=entry_saved date=%s replace=%s inserted_sets=%d inserted_bodyweight=%d "
         "skipped=%d review=%d duplicate=%s replaced=%s",
