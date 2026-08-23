@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import date, timedelta
+from itertools import groupby
 
 import pytest
 
@@ -109,17 +110,66 @@ class TestPainSummary:
         assert pain_summary(records)[0]["exercise"] == "Lat Pulldown"
 
 
+class TestE1rmMuscleGrouping:
+    """The chart answers "is my chest progressing", so the exercises of one
+    muscle group have to sit together — but as their own series. See
+    `exercise_e1rm_by_muscle_group` for why they are not averaged into one."""
+
+    def _mixed(self):
+        days = [MONDAY, MONDAY + timedelta(days=2), MONDAY + timedelta(days=4)]
+        records = []
+        for day in days:
+            records += sets_for("Bench", day, 60, [10, 10], muscle="Chest")
+            records += sets_for("Row", day, 50, [10], muscle="Back")
+            records += sets_for("Fly", day, 15, [12], muscle="Chest")
+            records += sets_for("High to Low", day, 16, [12], muscle=None)
+        return records
+
+    def test_each_series_is_labelled_with_its_group(self):
+        grouped = insights.exercise_e1rm_by_muscle_group(self._mixed())
+        assert {name: group for group, name, _ in grouped} == {
+            "Bench": "Chest", "Fly": "Chest", "Row": "Back", "High to Low": "Unassigned"}
+
+    def test_a_group_appears_as_one_run_not_several(self):
+        groups = [group for group, _, _ in insights.exercise_e1rm_by_muscle_group(self._mixed())]
+        runs = [group for group, _ in groupby(groups)]
+        assert len(runs) == len(set(runs))
+
+    def test_an_exercise_with_no_group_falls_under_the_shared_label(self):
+        grouped = insights.exercise_e1rm_by_muscle_group(self._mixed())
+        assert ("Unassigned", "High to Low") in [(g, n) for g, n, _ in grouped]
+
+    def test_unassigned_sorts_last_so_it_does_not_split_the_rest(self):
+        groups = [group for group, _, _ in insights.exercise_e1rm_by_muscle_group(self._mixed())]
+        assert groups[-1] == insights.UNASSIGNED_GROUP
+
+    def test_the_series_themselves_are_unchanged_by_grouping(self):
+        records = self._mixed()
+        flat = dict(insights.exercise_e1rm_series(records))
+        grouped = {name: points for _, name, points in
+                   insights.exercise_e1rm_by_muscle_group(records)}
+        assert grouped == flat
+
+    def test_which_exercises_appear_is_still_decided_by_training_volume(self):
+        """Grouping must not start reserving slots per muscle group."""
+        records = self._mixed()
+        assert ([name for name, _ in insights.exercise_e1rm_series(records, limit=2)]
+                == sorted(name for _, name, _ in
+                          insights.exercise_e1rm_by_muscle_group(records, limit=2)))
+
+
 class TestRendering:
-    def _data(self, exercise="Bench Press"):
+    def _data(self, exercise="Bench Press", series=None):
         return {
             "week_start": MONDAY.isoformat(), "weeks": 12, "timezone": "Asia/Karachi",
             "kpis": {"volume_this_week": 7139.0, "volume_delta_pct": 1.0,
                      "sets_this_week": 15, "exercises_this_week": 5,
                      "bodyweight": 82.4, "bodyweight_delta": -0.7},
             "weekly_volume": [[MONDAY.isoformat(), 7139.0]],
-            "exercise_e1rm": [{"exercise": exercise,
-                               "points": [[MONDAY.isoformat(), 80.0],
-                                          [(MONDAY + timedelta(7)).isoformat(), 82.0]]}],
+            "exercise_e1rm": series or [
+                {"exercise": exercise, "muscle_group": "Chest",
+                 "points": [[MONDAY.isoformat(), 80.0],
+                            [(MONDAY + timedelta(7)).isoformat(), 82.0]]}],
             "bodyweight": [[MONDAY.isoformat(), 82.4]],
             "muscle_volume": [["Chest", 1269.0]],
             "pain": [{"exercise": exercise, "sessions_flagged": 1,
@@ -127,9 +177,108 @@ class TestRendering:
             "has_data": True,
         }
 
+    def _series(self, *pairs):
+        return [{"exercise": name, "muscle_group": group,
+                 "points": [[MONDAY.isoformat(), 80.0],
+                            [(MONDAY + timedelta(7)).isoformat(), 82.0]]}
+                for name, group in pairs]
+
+    def test_a_heading_is_drawn_for_each_muscle_group(self):
+        body = charts.render_progress_body(
+            self._data(series=self._series(("Bench", "Chest"), ("Row", "Back"))))
+        assert '<h3 class="section">Chest</h3>' in body
+        assert '<h3 class="section">Back</h3>' in body
+
+    def test_one_heading_covers_a_whole_group(self):
+        body = charts.render_progress_body(
+            self._data(series=self._series(("Bench", "Chest"), ("Fly", "Chest"))))
+        assert body.count('<h3 class="section">Chest</h3>') == 1
+
+    def test_a_missing_group_is_labelled_rather_than_left_blank(self):
+        body = charts.render_progress_body(self._data(series=self._series(("Bench", None))))
+        assert f'<h3 class="section">{insights.UNASSIGNED_GROUP}</h3>' in body
+
+    def test_a_group_name_is_escaped(self):
+        """It reaches the page from the review form, so it is user text."""
+        body = charts.render_progress_body(
+            self._data(series=self._series(("Bench", "</h3><script>alert(1)</script>"))))
+        assert "<script>alert(1)</script>" not in body.split("</script>", 1)[1]
+
+    def test_the_table_view_names_the_group(self):
+        body = charts.render_progress_body(
+            self._data(series=self._series(("Bench", "Chest"))))
+        assert ">Muscle group</th>" in body
+
+    def test_only_the_e1rm_number_is_right_aligned(self):
+        """Three label columns lead this table, not one."""
+        body = charts.render_progress_body(
+            self._data(series=self._series(("Bench", "Chest"))))
+        header = body.split(">Muscle group</th>")[0].rsplit("<th", 1)[1]
+        assert "num" not in header
+        assert '<th class="num">e1RM (kg)</th>' in body
+
+    @pytest.mark.parametrize("sheet", ["PROGRESS_CSS", "PROGRESS_JS"])
+    def test_no_stray_control_characters_reach_the_page(self, sheet):
+        """These blocks are plain Python strings, so a backslash-escaped CSS code
+        point is eaten as a Python octal escape and a control character lands in
+        the stylesheet in place of the glyph."""
+        text = getattr(charts, sheet)
+        assert [c for c in text if ord(c) < 32 and c not in "\n\t"] == []
+
+    def test_a_fold_marker_is_drawn(self):
+        assert 'summary::before' in charts.PROGRESS_CSS
+        assert '"▾"' in charts.PROGRESS_CSS
+
+    def test_cards_are_foldable(self):
+        body = charts.render_progress_body(self._data())
+        assert body.count('<details class="fold"') == 5
+
+    def test_a_card_with_something_to_show_starts_open(self):
+        body = charts.render_progress_body(self._data())
+        assert '<details class="fold" open><summary><h2>Weekly volume' in body
+
+    def test_an_all_clear_card_folds_and_says_so_on_its_summary(self):
+        """Folding it away must not cost the answer it was showing."""
+        data = self._data()
+        data["pain"] = []
+        body = charts.render_progress_body(data)
+        card = body.split("Pain flags")[1]
+        assert card.startswith("</h2><span class=\"note\">none in this window")
+        assert '<details class="fold"><summary><h2>Pain flags' in body
+
+    def test_a_card_with_flags_stays_open_and_counts_them(self):
+        body = charts.render_progress_body(self._data())
+        assert '<details class="fold" open><summary><h2>Pain flags' in body
+        assert "1 exercise(s)" in body
+
+    def test_a_serious_flag_is_called_out_on_the_summary(self):
+        data = self._data()
+        data["pain"][0]["status"] = "serious"
+        data["pain"][0]["streak"] = 3
+        assert "1 needing attention" in charts.render_progress_body(data)
+
+    def test_muscle_group_sections_are_foldable_and_start_open(self):
+        body = charts.render_progress_body(
+            self._data(series=self._series(("Bench", "Chest"), ("Row", "Back"))))
+        assert body.count('<details class="fold group" open>') == 2
+
+    def test_every_group_section_is_closed_off(self):
+        """An unclosed <details> would swallow the rest of the card."""
+        body = charts.render_progress_body(
+            self._data(series=self._series(("Bench", "Chest"), ("Row", "Back"))))
+        assert body.count("<details") == body.count("</details>")
+        assert (body.count('<div class="smalls">')
+                == body.count('<details class="fold group"'))
+
+    def test_a_chart_redraws_when_its_section_opens(self):
+        """A host inside a closed <details> measures zero, and clientWidth falls
+        back to a guess that would never correct itself."""
+        assert "addEventListener('toggle'" in charts.PROGRESS_JS
+        assert "if (evt.target.open) draw(evt.target)" in charts.PROGRESS_JS
+
     def test_renders_the_expected_cards(self):
         body = charts.render_progress_body(self._data())
-        for heading in ("Weekly volume", "Estimated 1RM by exercise", "Bodyweight",
+        for heading in ("Weekly volume", "Estimated 1RM by muscle group", "Bodyweight",
                         "Volume by muscle group", "Pain flags"):
             assert heading in body
 

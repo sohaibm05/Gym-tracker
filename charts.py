@@ -23,6 +23,10 @@ import json
 from datetime import date, timedelta
 from typing import Any
 
+# insights does not import this module, so this stays a one-way dependency. Only
+# the shared label for an exercise with no muscle group on file comes from it.
+import insights
+
 # Tokens are declared for both the OS setting and an explicit theme stamp, so a
 # viewer's choice wins either way.
 PROGRESS_CSS = """
@@ -90,7 +94,29 @@ PROGRESS_CSS = """
 .plot { width: 100%; }
 .plot svg { display: block; overflow: visible; }
 
-.smalls { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: .9rem; }
+/* auto-fill, not auto-fit: each muscle group now has its own grid, and auto-fit
+   would collapse the empty tracks so a group with one exercise drew a chart
+   three times the size of one in a group of three. */
+.smalls { display: grid; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); gap: .9rem; }
+.fold > summary { cursor: pointer; list-style: none; display: flex; align-items: baseline;
+  gap: .5rem; }
+.fold > summary::-webkit-details-marker { display: none; }
+/* The literal glyph, not a CSS hex escape. This block is a plain Python string,
+   so a backslash-escaped code point is read as a Python octal escape first and a
+   control character reaches the stylesheet instead of the arrow. */
+.fold > summary::before { content: "▾"; color: var(--ink-muted); font-size: .8rem;
+  line-height: 1; transition: transform .12s ease; }
+.fold:not([open]) > summary::before { transform: rotate(-90deg); }
+.fold > summary:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px;
+  border-radius: .3rem; }
+.fold > summary h2, .fold > summary h3 { margin: 0; }
+.fold > summary .note { font-size: .8rem; color: var(--ink-muted); }
+.fold:not([open]) > summary .note { color: var(--ink-2); }
+.group { margin-top: .3rem; }
+.group > summary { border-bottom: 1px solid var(--hairline); padding-bottom: .25rem;
+  margin-bottom: .6rem; }
+.section { font-size: .8rem; font-weight: 600; letter-spacing: .04em;
+  text-transform: uppercase; color: var(--ink-2); }
 .small h3 { font-size: .85rem; margin: 0 0 .1rem; font-weight: 600; }
 .small .sub { font-size: .75rem; margin: 0 0 .4rem; }
 
@@ -367,8 +393,8 @@ PROGRESS_JS = """
     host.appendChild(svg);
   }
 
-  function draw() {
-    document.querySelectorAll('[data-chart]').forEach(function (host) {
+  function draw(root) {
+    (root || document).querySelectorAll('[data-chart]').forEach(function (host) {
       var kind = host.getAttribute('data-chart');
       if (kind === 'volume' && DATA.weekly_volume.length) {
         columns(host, DATA.weekly_volume, 'kg', weekRange);
@@ -385,10 +411,19 @@ PROGRESS_JS = """
   }
 
   draw();
+
+  // A host inside a closed <details> has no width, and clientWidth falls back to
+  // a guess that would never correct itself. Redraw what just opened, at the
+  // size it actually got. `toggle` does not bubble, hence the capture phase.
+  document.addEventListener('toggle', function (evt) {
+    if (evt.target.open) draw(evt.target);
+  }, true);
+
   var timer;
   window.addEventListener('resize', function () {
     clearTimeout(timer);
-    timer = setTimeout(draw, 150);   // re-render at true size, never scale text
+    // Only what is on screen: a closed section redraws when it opens.
+    timer = setTimeout(function () { draw(); }, 150);
   });
 })();
 """
@@ -429,14 +464,22 @@ def _tile(label: str, value: str, delta: str = "", up_is_good: bool = False) -> 
     )
 
 
-def _table(headers: list[str], rows: list[list[str]], caption: str) -> str:
-    """The table twin. Every plotted value is reachable here without hovering."""
+def _table(
+    headers: list[str], rows: list[list[str]], caption: str, numeric_from: int = 1
+) -> str:
+    """The table twin. Every plotted value is reachable here without hovering.
+
+    `numeric_from` is the first right-aligned column. One label column is the
+    common case; a table that leads with more than one needs to say so, or its
+    text columns get flushed right against the numbers.
+    """
     head = "".join(
-        f'<th class="{"num" if i else ""}">{html.escape(h)}</th>' for i, h in enumerate(headers)
+        f'<th class="{"num" if i >= numeric_from else ""}">{html.escape(h)}</th>'
+        for i, h in enumerate(headers)
     )
     body = "".join(
         "<tr>" + "".join(
-            f'<td class="{"num" if i else ""}">{html.escape(str(c))}</td>'
+            f'<td class="{"num" if i >= numeric_from else ""}">{html.escape(str(c))}</td>'
             for i, c in enumerate(row)
         ) + "</tr>"
         for row in rows
@@ -447,10 +490,27 @@ def _table(headers: list[str], rows: list[list[str]], caption: str) -> str:
     )
 
 
-def _card(title: str, subtitle: str, plot: str, table: str = "") -> str:
+def _card(
+    title: str,
+    subtitle: str,
+    plot: str,
+    table: str = "",
+    note: str = "",
+    open_by_default: bool = True,
+) -> str:
+    """One collapsible card.
+
+    A card with nothing to report starts folded, and says so in `note` on its
+    own summary line — so folding it away never costs you the answer, which is
+    the whole reason "no pain flags" is worth showing at all.
+    """
+    mark = " open" if open_by_default else ""
+    hint = f'<span class="note">{html.escape(note)}</span>' if note else ""
     return (
-        f'<section class="card"><h2>{html.escape(title)}</h2>'
-        f'<p class="sub">{html.escape(subtitle)}</p>{plot}{table}</section>'
+        f'<section class="card"><details class="fold"{mark}>'
+        f"<summary><h2>{html.escape(title)}</h2>{hint}</summary>"
+        f'<p class="sub">{html.escape(subtitle)}</p>{plot}{table}'
+        f"</details></section>"
     )
 
 
@@ -497,8 +557,21 @@ def render_progress_body(data: dict[str, Any]) -> str:
                "Table view"),
     )
 
-    smalls, e1rm_rows = [], []
+    # The series arrive already ordered so one muscle group's exercises are
+    # adjacent, so a heading goes in wherever the group changes. Ordering stays
+    # in insights.py; this only draws the seam.
+    smalls, e1rm_rows, current_group = [], [], None
     for index, series in enumerate(data["exercise_e1rm"]):
+        group = series.get("muscle_group") or insights.UNASSIGNED_GROUP
+        if group != current_group:
+            if current_group is not None:
+                smalls.append("</div></details>")
+            smalls.append(
+                f'<details class="fold group" open>'
+                f'<summary><h3 class="section">{html.escape(group)}</h3></summary>'
+                f'<div class="smalls">'
+            )
+            current_group = group
         first, last = series["points"][0][1], series["points"][-1][1]
         change = last - first
         slope = series.get("slope_per_week")
@@ -510,15 +583,21 @@ def render_progress_body(data: dict[str, Any]) -> str:
             f'<div class="plot" data-chart="e1rm:{index}"></div></div>'
         )
         for day, value in series["points"]:
-            e1rm_rows.append([series["exercise"], day, _fmt(value, 1)])
+            e1rm_rows.append([group, series["exercise"], day, _fmt(value, 1)])
+    if current_group is not None:
+        smalls.append("</div></details>")
 
     e1rm_card = _card(
-        "Estimated 1RM by exercise",
-        "Epley, from clean reps only. The grey line is the fitted trend; the rate "
-        "beside each name is its slope.",
-        f'<div class="smalls">{"".join(smalls)}</div>' if smalls
+        "Estimated 1RM by muscle group",
+        "Epley, from clean reps only, grouped by the muscle each exercise is filed "
+        "under. Still one line per exercise \u2014 a bench press and a fly average to "
+        "nothing useful. The grey line is the fitted trend; the rate beside each "
+        "name is its slope.",
+        "".join(smalls) if smalls
         else '<p class="empty">Needs at least two sessions of an exercise to show a trend.</p>',
-        _table(["Exercise", "Session", "e1RM (kg)"], e1rm_rows, "Table view") if e1rm_rows else "",
+        _table(["Muscle group", "Exercise", "Session", "e1RM (kg)"], e1rm_rows,
+               "Table view", numeric_from=3)
+        if e1rm_rows else "",
     )
 
     bodyweight_card = _card(
@@ -529,6 +608,8 @@ def render_progress_body(data: dict[str, Any]) -> str:
              '("was 82.4kg this morning") and it lands here.</p>',
         _table(["Date", "Weight (kg)"], [[d, _fmt(v, 1)] for d, v in data["bodyweight"]],
                "Table view") if data["bodyweight"] else "",
+        note="" if data["bodyweight"] else "none logged",
+        open_by_default=bool(data["bodyweight"]),
     )
 
     muscle_card = _card(
@@ -539,6 +620,8 @@ def render_progress_body(data: dict[str, Any]) -> str:
         _table(["Muscle group", "Volume (kg)"],
                [[name, _fmt(value)] for name, value in data["muscle_volume"]],
                "Table view") if data["muscle_volume"] else "",
+        note="" if data["muscle_volume"] else "nothing logged this week",
+        open_by_default=bool(data["muscle_volume"]),
     )
 
     if data["pain"]:
@@ -562,10 +645,19 @@ def render_progress_body(data: dict[str, Any]) -> str:
     else:
         pain_body = '<p class="empty">No pain flags in this window.</p>'
 
+    # The all-clear is the one card worth folding on a good week: the answer is
+    # the summary line, and there is nothing underneath it to read.
+    serious = sum(1 for item in data["pain"] if item["status"] == "serious")
     pain_card = _card(
         "Pain flags",
         "Colour is never the only signal here - each row carries an icon and a word.",
         pain_body,
+        note=(
+            "none in this window" if not data["pain"]
+            else f"{len(data['pain'])} exercise(s)"
+                 + (f", {serious} needing attention" if serious else "")
+        ),
+        open_by_default=bool(data["pain"]),
     )
 
     return (
