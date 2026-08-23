@@ -492,9 +492,20 @@ into a neighbouring date - tested at an offset zone, not just UTC.
 
 Render's free tier cold-starts in 30–50s after idle, which is exactly when you
 double-tap submit. The check sits on `/save`, the step that writes: it looks for
-the same raw text inserted in the last `DUPLICATE_WINDOW_MINUTES` (5) and returns
-the earlier result rather than inserting the entry twice. `/log` writes nothing,
-so re-running it costs only another extraction.
+the same raw text inserted in the last `DUPLICATE_WINDOW_MINUTES` (5) **against
+the day being logged**. `/log` writes nothing, so re-running it costs only
+another extraction.
+
+It asks rather than refuses. Re-pasting an entry to correct a bad parse is the
+same bytes arriving twice as a double-tapped submit, so the guard cannot tell
+them apart and does not try. On a match nothing is written and the review screen
+comes straight back — rows intact and still editable — with the earlier save
+listed exercise by exercise as the evidence for the claim, and two ways forward:
+replace that day, or add a second copy. Going back is the third.
+
+The day scoping matters for short entries: without it, "rest day, weighed 82.4"
+logged against Saturday and then against Sunday reads as a double-tap, and the
+second date is silently dropped.
 
 ## Charts
 
@@ -625,7 +636,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-713 tests, no network and no database required — they cover the Stage A
+741 tests, no network and no database required — they cover the Stage A
 rule branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold), `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
@@ -633,10 +644,11 @@ resolution and JSON-mode retry behaviour, the muscle-group tables and how their
 answer is suggested and overridden — both their resolution cases and mechanical
 guards that every key is in the normalized form lookup actually produces — the
 name flag, most of whose tests assert that ordinary lifts and real variations
-stay silent, and the review screen's draft/edit/save round trip. These are pure
-functions, so they are cheap to cover, and they are exactly the code where a
-silent bug produces a wrong training recommendation, or a saved row that does
-not match what was on screen, and nobody notices.
+stay silent, the duplicate guard's day scoping and its two ways forward, and the
+review screen's draft/edit/save round trip. These are pure functions, so they are
+cheap to cover, and they are exactly the code where a silent bug produces a wrong
+training recommendation, or a saved row that does not match what was on screen,
+and nobody notices.
 
 ## Not built (by design)
 
