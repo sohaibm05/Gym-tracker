@@ -2,10 +2,16 @@
 
 Routes:
     GET  /               mobile-friendly entry form
-    POST /log            run the pipeline on a pasted journal entry
+    POST /log            parse a pasted entry and show it back — writes nothing
+    POST /log/confirm    write the previewed entry to the database
+    POST /log/edit       reopen the form with the same text, to fix and re-parse
     GET  /weekly-report  report page with a "Generate weekly report" button
     POST /weekly-report  run Stage A + Stage B and upsert the report
     GET  /healthz        unauthenticated liveness probe
+
+Nothing reaches the database on POST /log. Extraction and scoring happen there,
+the result is shown for checking, and only POST /log/confirm inserts — carrying
+the parse forward in a signed hidden field so the model is not called twice.
 
 All extraction/validation/insert logic is imported from pipeline.py; all report
 logic from insights.py. Nothing is reimplemented here.
@@ -13,13 +19,19 @@ logic from insights.py. Nothing is reimplemented here.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import hmac
 import html
+import json
 import logging
 import os
 import re
 import secrets
 import sys
 import time
+import zlib
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
@@ -178,6 +190,21 @@ button:active { background: #1d4ed8; }
 ul { padding-left: 1.2rem; }
 nav a { display: inline-block; margin-right: 1rem; }
 pre { white-space: pre-wrap; word-wrap: break-word; }
+button.secondary { background: transparent; color: inherit; border: 1px solid #8886; }
+button.danger { background: #b91c1c; }
+button.danger:active { background: #991b1b; }
+.preview-table { width: 100%; border-collapse: collapse; margin-top: .4rem; font-size: .95rem; }
+.preview-table th, .preview-table td { text-align: left; padding: .35rem .5rem;
+       border-bottom: 1px solid #8883; vertical-align: top; }
+.preview-table th { font-size: .8rem; text-transform: uppercase; letter-spacing: .03em;
+       opacity: .7; font-weight: 600; }
+.preview-table td.num { text-align: right; white-space: nowrap; }
+.scroll-x { overflow-x: auto; }
+.flag { font-size: .78rem; padding: .05rem .35rem; border-radius: .3rem;
+        border: 1px solid #8886; margin-right: .25rem; white-space: nowrap; }
+.flag-pain { border-color: #dc2626; color: #dc2626; }
+.actions { display: flex; gap: .6rem; flex-wrap: wrap; }
+.actions form { flex: 1 1 12rem; margin: 0; }
 """
 
 
@@ -237,19 +264,372 @@ def _render_markdown(markdown_text: str) -> str:
     return "\n".join(lines_out)
 
 
+# --------------------------------------------------------------------------
+# Preview token
+#
+# The parse has to survive the round trip from the preview page to the confirm
+# post without being re-extracted (a second model call per save) and without a
+# server-side store (each serverless request is a fresh process). So it travels
+# in a hidden field, signed: the browser holds it, but only this server can
+# produce one it will accept. Everything inside is still re-validated through
+# the Pydantic models on the way back in - the signature proves origin, not
+# correctness.
+# --------------------------------------------------------------------------
+
+# Anything longer than this was not produced here; refuse before decompressing.
+_MAX_TOKEN_CHARS = 512_000
+
+
+def _token_key() -> bytes:
+    """Signing key. APP_PASSWORD is already required for the app to serve at all.
+
+    A per-process random key would be simpler but cannot work: the preview and
+    the confirm are two requests, and serverless gives each its own process, so
+    the second one would never recognise the first one's signature.
+    """
+    secret = os.getenv("APP_PREVIEW_SECRET") or os.getenv("APP_PASSWORD") or ""
+    if not secret:
+        raise RuntimeError("APP_PASSWORD is not set, so preview tokens cannot be signed")
+    return hashlib.sha256(secret.encode("utf-8")).digest()
+
+
+def _sign_preview(prepared: pipeline.PreparedEntry, mode: str) -> str:
+    body = json.dumps(
+        {"prepared": prepared.to_dict(), "mode": mode},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    packed = base64.urlsafe_b64encode(zlib.compress(body, 6)).decode("ascii")
+    signature = hmac.new(_token_key(), packed.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{packed}.{signature}"
+
+
+def _unsign_preview(token: str) -> tuple[pipeline.PreparedEntry, str]:
+    """Recover a signed preview, or raise ValueError.
+
+    Callers turn the ValueError into "parse it again" rather than guessing at
+    what the user meant - a token that fails here is either tampered with or
+    from an older deploy, and neither is worth writing rows for.
+    """
+    token = (token or "").strip()
+    if not token or len(token) > _MAX_TOKEN_CHARS:
+        raise ValueError("missing or oversized preview token")
+    packed, separator, signature = token.partition(".")
+    if not separator:
+        raise ValueError("malformed preview token")
+    expected = hmac.new(_token_key(), packed.encode("ascii", "ignore"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise ValueError("preview token signature does not match")
+    try:
+        data = json.loads(zlib.decompress(base64.urlsafe_b64decode(packed)))
+    except (binascii.Error, zlib.error, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unreadable preview token: {exc}") from exc
+    prepared = pipeline.PreparedEntry.from_dict(data.get("prepared") or {})
+    return prepared, _clean_mode(data.get("mode"))
+
+
+def _clean_mode(value: Optional[str]) -> str:
+    """Replace only ever comes from an exact match, so a stray value cannot delete a day."""
+    return "replace" if value == "replace" else "add"
+
+
+# --------------------------------------------------------------------------
+# Forms and previews
+# --------------------------------------------------------------------------
+
+
+def _hidden_text(name: str, value: str) -> str:
+    """Carry multi-line text between forms.
+
+    A journal entry has newlines in it, and an attribute value is not a
+    dependable place to keep them - a hidden <input> is subject to value
+    sanitization and attribute-value normalization, either of which can flatten
+    the entry into one line. A hidden <textarea> submits its content verbatim.
+    No newline after the opening tag: the parser eats a leading one.
+    """
+    return f'<textarea name="{html.escape(name)}" hidden>{html.escape(value)}</textarea>'
+
+
+def _log_form(session_date: str, raw_text: str = "", mode: str = "add") -> str:
+    """The entry form, also used to reopen an entry for editing after a parse."""
+    add_selected = " selected" if mode != "replace" else ""
+    replace_selected = " selected" if mode == "replace" else ""
+    return f"""
+<form method="post" action="/log">
+  <label for="session_date">Session date</label>
+  <input type="date" id="session_date" name="session_date"
+    value="{html.escape(session_date)}" required>
+  <label for="raw_text">Journal entry</label>
+  <textarea id="raw_text" name="raw_text" required
+    placeholder="Paste straight from Notes. Messy is fine."
+    >{html.escape(raw_text)}</textarea>
+  <label for="mode">If that day already has entries</label>
+  <select id="mode" name="mode">
+    <option value="add"{add_selected}>Add to them &mdash; a second session, or more sets</option>
+    <option value="replace"{replace_selected}>Replace them &mdash; discard that day and use this instead</option>
+  </select>
+  <button type="submit">Parse &amp; preview</button>
+</form>
+<p class="muted">Parsing shows you what was read out of the text.
+Nothing is saved until you confirm it on the next screen. Sets below the
+confidence threshold ({pipeline.CONFIDENCE_THRESHOLD:.0%}) are listed for review
+instead of being saved. Bodyweight mentions in the same entry are picked up
+automatically. <strong>Replace</strong> deletes everything already logged on
+that date, so use it to correct a bad entry &mdash; not to add an evening
+session.</p>
+"""
+
+
+def _flag_labels(workout_set) -> str:
+    flags = []
+    if workout_set.is_warmup:
+        flags.append('<span class="flag">warm-up</span>')
+    if workout_set.is_dropset:
+        flags.append('<span class="flag">drop set</span>')
+    if workout_set.pain_flag:
+        flags.append('<span class="flag flag-pain">pain</span>')
+    return "".join(flags)
+
+
+def _load_label(workout_set) -> str:
+    """Weight x reps, with the clean count spelled out when reps were cheated."""
+    weight = f"{workout_set.weight_kg:g}kg" if workout_set.weight_kg is not None else "?kg"
+    reps = str(workout_set.reps) if workout_set.reps is not None else "?"
+    detail = f"{html.escape(weight)} &times; {html.escape(reps)}"
+    if workout_set.cheat_reps and workout_set.reps is not None:
+        clean = max(0, workout_set.reps - workout_set.cheat_reps)
+        detail += (
+            f' <span class="muted">({workout_set.cheat_reps} cheat &rarr; {clean} clean)</span>'
+        )
+    return detail
+
+
+def _render_set_rows(prepared: pipeline.PreparedEntry) -> str:
+    rows = []
+    for workout_set, confidence in prepared.accepted_sets:
+        time_label = pipeline.local_time_label(
+            workout_set.logged_at_local, prepared.session_date
+        )
+        rows.append(
+            "<tr>"
+            f'<td class="num muted">{html.escape(time_label)}</td>'
+            f"<td>{html.escape(workout_set.exercise_name)}"
+            + (
+                f'<br><span class="muted">{html.escape(workout_set.muscle_group)}</span>'
+                if workout_set.muscle_group
+                else ""
+            )
+            + "</td>"
+            f'<td class="num">{_load_label(workout_set)}</td>'
+            f"<td>{_flag_labels(workout_set)}</td>"
+            f'<td class="num muted">{confidence:.2f}</td>'
+            "</tr>"
+        )
+    return "".join(rows)
+
+
+def _render_review_card(review_items) -> str:
+    if not review_items:
+        return ""
+    rows = []
+    for item in review_items:
+        confidence = f"{item.confidence:.2f}" if item.confidence is not None else "n/a"
+        label = html.escape(str(item.payload.get("exercise_name") or item.kind))
+        weight = item.payload.get("weight_kg")
+        reps = item.payload.get("reps")
+        detail = ""
+        if weight is not None or reps is not None:
+            detail = f" ({html.escape(str(weight))}kg &times; {html.escape(str(reps))})"
+        rows.append(
+            f"<li><strong>{label}</strong>{detail} &mdash; confidence {confidence}. "
+            f"{html.escape(item.reason)}</li>"
+        )
+    return (
+        '<div class="card warn"><strong>Not being saved '
+        f"({len(review_items)})</strong><ul>{''.join(rows)}</ul>"
+        "<p class=\"muted\">Fix the wording in the entry and parse again if any of "
+        "these should have been read.</p></div>"
+    )
+
+
+def _render_preview(prepared: pipeline.PreparedEntry, mode: str, token: str) -> str:
+    """The screen between parsing and writing. Nothing here has been saved yet."""
+    session_date = html.escape(prepared.session_date.isoformat())
+    existing = prepared.existing_on_date or {}
+    existing = {"sets": int(existing.get("sets") or 0),
+                "bodyweight": int(existing.get("bodyweight") or 0)}
+    set_count = len(prepared.accepted_sets)
+    bodyweight_count = 1 if prepared.accepted_bodyweight is not None else 0
+
+    parts = [
+        (
+            f'<div class="card ok"><strong>Nothing saved yet.</strong> This is what was '
+            f"read out of your entry for {session_date} &mdash; {set_count} set(s) and "
+            f"{bodyweight_count} bodyweight entry/entries ready to save.</div>"
+        )
+    ]
+
+    if mode == "replace" and (existing["sets"] or existing["bodyweight"]):
+        parts.append(
+            '<div class="card err"><strong>Replace will delete first.</strong> '
+            f"{session_date} currently holds {existing['sets']} set(s) and "
+            f"{existing['bodyweight']} bodyweight entry/entries. Saving discards all "
+            "of them and stores the rows below instead. This cannot be undone.</div>"
+        )
+    elif mode == "replace":
+        parts.append(
+            '<div class="card muted">Replace is selected, but nothing is logged on '
+            f"{session_date} yet, so there is nothing to discard.</div>"
+        )
+    elif existing["sets"] or existing["bodyweight"]:
+        parts.append(
+            f'<div class="card muted">{session_date} already holds {existing["sets"]} '
+            f"set(s) and {existing['bodyweight']} bodyweight entry/entries. These will "
+            "be added alongside them &mdash; go back and choose Replace if you meant to "
+            "overwrite the day.</div>"
+        )
+
+    if prepared.accepted_sets:
+        parts.append(
+            '<h2>Sets to save</h2><div class="scroll-x"><table class="preview-table">'
+            "<thead><tr><th>Time</th><th>Exercise</th><th>Load</th><th>Flags</th>"
+            "<th>Conf.</th></tr></thead>"
+            f"<tbody>{_render_set_rows(prepared)}</tbody></table></div>"
+            f'<p class="muted">Times are {html.escape(pipeline.LOCAL_TIMEZONE)}; '
+            "&ldquo;~&rdquo; means the text carried no time marker, so the default hour "
+            f"({pipeline.DEFAULT_SESSION_HOUR}:00) was used.</p>"
+        )
+
+    if prepared.accepted_bodyweight is not None:
+        entry, confidence = prepared.accepted_bodyweight
+        body_fat = (
+            f", {entry.body_fat_pct:g}% body fat" if entry.body_fat_pct is not None else ""
+        )
+        parts.append(
+            f'<div class="card"><strong>Bodyweight</strong> {entry.weight_kg:g}kg'
+            f'{html.escape(body_fat)} <span class="muted">(confidence '
+            f"{confidence:.2f})</span></div>"
+        )
+
+    parts.append(_render_review_card(prepared.review_items))
+
+    save_label = (
+        f"Replace {session_date} with these {set_count} set(s)"
+        if mode == "replace"
+        else f"Save {set_count} set(s)"
+    )
+    button_class = "danger" if mode == "replace" else ""
+    parts.append(
+        f"""
+<div class="actions">
+  <form method="post" action="/log/confirm" onsubmit="this.querySelector('button').disabled=true">
+    <input type="hidden" name="token" value="{html.escape(token)}">
+    <button type="submit" class="{button_class}">{save_label}</button>
+  </form>
+  <form method="post" action="/log/edit">
+    {_hidden_text("raw_text", prepared.raw_text)}
+    <input type="hidden" name="session_date" value="{session_date}">
+    <input type="hidden" name="mode" value="{html.escape(mode)}">
+    <button type="submit" class="secondary">Back &mdash; edit the text</button>
+  </form>
+</div>
+<p class="muted">Leaving this page without saving discards the parse; the entry
+is not stored anywhere until you press save.</p>
+<details><summary class="muted">The text this was read from</summary>
+<pre>{html.escape(prepared.raw_text)}</pre></details>
+"""
+    )
+    return "".join(parts)
+
+
+def _render_prior_detail(detail: list) -> str:
+    """What the matched submission actually saved, exercise by exercise.
+
+    Without this the guard just asserts "duplicate" and gives you no way to tell
+    whether it is right - which is exactly the moment you need to know, because
+    the sets it saved may not be the ones you meant to log.
+    """
+    if not detail:
+        return (
+            '<p class="muted">Those rows are on this date with the same text, but the '
+            "exercises behind them could not be listed.</p>"
+        )
+    rows = "".join(
+        f"<tr><td>{html.escape(str(row['exercise']))}</td>"
+        f'<td class="num">{int(row["sets"])} set(s)</td></tr>'
+        for row in detail
+    )
+    return (
+        '<p class="muted">That earlier save produced these rows. If this is not what '
+        "your entry says, it was parsed wrong &mdash; replace the day.</p>"
+        '<div class="scroll-x"><table class="preview-table">'
+        "<thead><tr><th>Exercise</th><th>Saved</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table></div>"
+    )
+
+
+def _render_duplicate_choice(
+    raw_text: str, session_date: date, prior: dict, detail: list = ()
+) -> str:
+    """Shown instead of parsing when this exact text was saved moments ago.
+
+    The guard exists for a double-tapped submit, but re-pasting the same text on
+    purpose - to replace a bad parse - looks identical to one. So it offers both
+    ways out rather than refusing, which is what made a deliberate replace
+    silently do nothing.
+    """
+    escaped_date = html.escape(session_date.isoformat())
+    return f"""
+<div class="card warn"><strong>You already saved this text.</strong>
+Character for character the same entry went in against {escaped_date} within the
+last {pipeline.DUPLICATE_WINDOW_MINUTES} minutes &mdash;
+{prior.get('inserted_sets', 0)} set(s) and
+{prior.get('inserted_bodyweight', 0)} bodyweight entry/entries. Nothing has been
+parsed or saved this time.</div>
+{_render_prior_detail(list(detail))}
+<p>If you double-tapped save, you are done &mdash; the sets are in. Otherwise pick one:</p>
+<div class="actions">
+  <form method="post" action="/log">
+    {_hidden_text("raw_text", raw_text)}
+    <input type="hidden" name="session_date" value="{escaped_date}">
+    <input type="hidden" name="mode" value="replace">
+    <input type="hidden" name="force" value="1">
+    <button type="submit" class="danger">Replace that day with this entry</button>
+  </form>
+  <form method="post" action="/log">
+    {_hidden_text("raw_text", raw_text)}
+    <input type="hidden" name="session_date" value="{escaped_date}">
+    <input type="hidden" name="mode" value="add">
+    <input type="hidden" name="force" value="1">
+    <button type="submit" class="secondary">Parse it again and add a second copy</button>
+  </form>
+</div>
+<p class="muted">Both parse the text again and show it before anything is written.</p>
+<p><a href="/">Back to the form</a></p>
+"""
+
+
 def _render_result(result: pipeline.PipelineResult, session_date: date) -> str:
     parts: list[str] = []
 
     if result.error:
         parts.append(f'<div class="card err"><strong>Error.</strong> {html.escape(result.error)}</div>')
 
-    if result.duplicate_of_recent:
+    if result.duplicate_of_recent and result.duplicate_reason == "already_committed":
+        parts.append(
+            '<div class="card warn"><strong>Already saved.</strong> This preview had '
+            f"already been saved, so nothing went in twice. It stored "
+            f"{result.inserted_sets} set(s) and {result.inserted_bodyweight} "
+            "bodyweight entry/entries.</div>"
+        )
+    elif result.duplicate_of_recent:
         parts.append(
             '<div class="card warn"><strong>Duplicate submission.</strong> '
-            "This exact text was already processed within the last "
+            "This exact text was already saved within the last "
             f"{pipeline.DUPLICATE_WINDOW_MINUTES} minutes, so nothing was re-inserted. "
             f"The earlier run saved {result.inserted_sets} set(s) and "
-            f"{result.inserted_bodyweight} bodyweight entry/entries.</div>"
+            f"{result.inserted_bodyweight} bodyweight entry/entries. To overwrite that "
+            'day instead, <a href="/">paste the entry again</a> and choose Replace.</div>'
         )
     else:
         parts.append(
@@ -278,23 +658,7 @@ def _render_result(result: pipeline.PipelineResult, session_date: date) -> str:
         parts.append(f'<div class="card muted"><strong>Fuzzy-matched names</strong><ul>{rows}</ul></div>')
 
     if result.review_items:
-        rows = []
-        for item in result.review_items:
-            confidence = f"{item.confidence:.2f}" if item.confidence is not None else "n/a"
-            label = html.escape(str(item.payload.get("exercise_name") or item.kind))
-            weight = item.payload.get("weight_kg")
-            reps = item.payload.get("reps")
-            detail = ""
-            if weight is not None or reps is not None:
-                detail = f" ({html.escape(str(weight))}kg &times; {html.escape(str(reps))})"
-            rows.append(
-                f"<li><strong>{label}</strong>{detail} &mdash; confidence {confidence}. "
-                f"{html.escape(item.reason)}</li>"
-            )
-        parts.append(
-            '<div class="card warn"><strong>Needs manual review '
-            f"({len(result.review_items)}) &mdash; not inserted</strong><ul>{''.join(rows)}</ul></div>"
-        )
+        parts.append(_render_review_card(result.review_items))
     elif not result.error and not result.duplicate_of_recent:
         parts.append('<div class="card muted">Nothing needed review.</div>')
 
@@ -313,30 +677,40 @@ async def healthz() -> JSONResponse:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(_user: str = Depends(require_auth)) -> HTMLResponse:
-    today = pipeline.local_today().isoformat()
     return _page(
         "Log a workout",
-        f"""
-<h1>Log a workout</h1>
-<form method="post" action="/log">
-  <label for="session_date">Session date</label>
-  <input type="date" id="session_date" name="session_date" value="{today}" required>
-  <label for="raw_text">Journal entry</label>
-  <textarea id="raw_text" name="raw_text" required
-    placeholder="Paste straight from Notes. Messy is fine."></textarea>
-  <label for="mode">If that day already has entries</label>
-  <select id="mode" name="mode">
-    <option value="add" selected>Add to them &mdash; a second session, or more sets</option>
-    <option value="replace">Replace them &mdash; discard that day and use this instead</option>
-  </select>
-  <button type="submit">Parse &amp; save</button>
-</form>
-<p class="muted">Sets below the confidence threshold
-({pipeline.CONFIDENCE_THRESHOLD:.0%}) are listed for review instead of being saved.
-Bodyweight mentions in the same entry are picked up automatically.
-<strong>Replace</strong> deletes everything already logged on that date, so use it to
-correct a bad entry &mdash; not to add an evening session.</p>
-""",
+        "<h1>Log a workout</h1>" + _log_form(pipeline.local_today().isoformat()),
+    )
+
+
+@app.post("/log/edit", response_class=HTMLResponse)
+async def log_edit(
+    raw_text: str = Form(""),
+    session_date: str = Form(""),
+    mode: str = Form("add"),
+    _user: str = Depends(require_auth),
+) -> HTMLResponse:
+    """Reopen the form on the entry just previewed, so a bad parse can be reworded."""
+    parsed_date = _parse_session_date(session_date) or pipeline.local_today()
+    return _page(
+        "Log a workout",
+        "<h1>Edit and parse again</h1>"
+        + _log_form(parsed_date.isoformat(), raw_text, _clean_mode(mode)),
+    )
+
+
+def _parse_session_date(value: str) -> Optional[date]:
+    try:
+        return datetime.strptime((value or "").strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _bad_date_page(back: str) -> HTMLResponse:
+    return _page(
+        "Invalid date",
+        '<h1>Result</h1><div class="card err">Session date must be YYYY-MM-DD.</div>'
+        f'<p><a href="{back}">Back</a></p>',
     )
 
 
@@ -345,38 +719,107 @@ async def log_entry(
     session_date: str = Form(...),
     raw_text: str = Form(...),
     mode: str = Form("add"),
+    force: str = Form(""),
     _user: str = Depends(require_auth),
 ) -> HTMLResponse:
-    try:
-        parsed_date = datetime.strptime(session_date.strip(), "%Y-%m-%d").date()
-    except ValueError:
-        return _page(
-            "Invalid date",
-            '<h1>Result</h1><div class="card err">Session date must be YYYY-MM-DD.</div>'
-            '<p><a href="/">Back</a></p>',
-        )
+    """Parse and show. This route writes nothing - /log/confirm does that."""
+    parsed_date = _parse_session_date(session_date)
+    if parsed_date is None:
+        return _bad_date_page("/")
 
-    result = pipeline.process_entry(
+    mode = _clean_mode(mode)
+    allow_duplicate = force == "1"
+    prepared = pipeline.prepare_entry(
         raw_text,
         parsed_date,
         engine=get_engine(),
         check_duplicates=True,
-        replace_existing=(mode == "replace"),
+        allow_duplicate=allow_duplicate,
     )
     logger.info(
-        "event=log_processed date=%s mode=%s inserted_sets=%d inserted_bodyweight=%d "
-        "review=%d duplicate=%s replaced=%s",
+        "event=log_previewed date=%s mode=%s forced=%s sets=%d bodyweight=%d review=%d "
+        "duplicate=%s error=%s",
         parsed_date,
+        mode,
+        allow_duplicate,
+        len(prepared.accepted_sets),
+        1 if prepared.accepted_bodyweight is not None else 0,
+        len(prepared.review_items),
+        prepared.duplicate_of_recent,
+        bool(prepared.error),
+    )
+
+    if prepared.duplicate_of_recent:
+        return _page(
+            "Already logged",
+            "<h1>Already logged</h1>"
+            + _render_duplicate_choice(
+                prepared.raw_text,
+                parsed_date,
+                prepared.prior_submission or {},
+                prepared.prior_detail,
+            ),
+        )
+
+    if prepared.error:
+        return _page(
+            "Could not parse",
+            f'<h1>Could not parse</h1><div class="card err">{html.escape(prepared.error)}</div>'
+            + _render_review_card(prepared.review_items)
+            + '<p><a href="/">Back to the form</a></p>',
+        )
+
+    if not prepared.has_insertable:
+        return _page(
+            "Nothing to save",
+            '<h1>Nothing to save</h1><div class="card warn">Nothing in that entry '
+            "cleared the confidence threshold, so there is nothing to write.</div>"
+            + _render_review_card(prepared.review_items)
+            + '<p><a href="/">Back to the form</a></p>',
+        )
+
+    return _page(
+        "Check before saving",
+        "<h1>Check before saving</h1>"
+        + _render_preview(prepared, mode, _sign_preview(prepared, mode)),
+    )
+
+
+@app.post("/log/confirm", response_class=HTMLResponse)
+async def log_confirm(
+    token: str = Form(...),
+    _user: str = Depends(require_auth),
+) -> HTMLResponse:
+    """Write the entry the preview showed. The only route on this page that inserts."""
+    try:
+        prepared, mode = _unsign_preview(token)
+    except (ValueError, KeyError) as exc:
+        logger.warning("event=preview_token_rejected reason=%s", exc)
+        return _page(
+            "Preview expired",
+            '<h1>Nothing saved</h1><div class="card err">That preview could not be '
+            "read back, so nothing was written. Paste the entry again and re-parse "
+            "it.</div><p><a href=\"/\">Back to the form</a></p>",
+        )
+
+    result = pipeline.commit_entry(
+        prepared, engine=get_engine(), replace_existing=(mode == "replace")
+    )
+    logger.info(
+        "event=log_committed date=%s mode=%s inserted_sets=%d inserted_bodyweight=%d "
+        "review=%d duplicate=%s replaced=%s",
+        prepared.session_date,
         mode,
         result.inserted_sets,
         result.inserted_bodyweight,
         len(result.review_items),
-        result.duplicate_of_recent,
+        result.duplicate_reason or result.duplicate_of_recent,
         result.replaced,
     )
     return _page(
         "Result",
-        f'<h1>Result</h1>{_render_result(result, parsed_date)}<p><a href="/">Log another</a></p>',
+        f"<h1>Result</h1>{_render_result(result, prepared.session_date)}"
+        '<p><a href="/">Log another</a></p>',
     )
 
 

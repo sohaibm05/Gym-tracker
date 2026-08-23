@@ -13,6 +13,7 @@ import os
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
+from pydantic import ValidationError
 
 import pipeline
 from pipeline import (
@@ -1101,3 +1102,329 @@ class TestExtractionWaitsOutRateLimits:
         with pytest.raises(pipeline.ExtractionError) as caught:
             pipeline.extract_entities(RAW_ENTRY, date(2026, 8, 14), client=client)
         assert "Wait a minute and resubmit" in str(caught.value)
+
+
+# --------------------------------------------------------------------------
+# The preview split: parse first, write only on confirm
+# --------------------------------------------------------------------------
+
+
+class _FakeResult:
+    """Serves either a scalar or a row list, depending on what the query wants."""
+
+    def __init__(self, value):
+        self._value = value
+
+    def scalar_one(self):
+        return self._value
+
+    def all(self):
+        return list(self._value)
+
+
+class _FakeConnection:
+    """Serves canned scalars and records that it was only ever read from."""
+
+    def __init__(self, scalars):
+        self._scalars = list(scalars)
+        self.executed = 0
+
+    def execute(self, statement, params=None):
+        self.executed += 1
+        if not self._scalars:
+            raise AssertionError("the preview asked for more rows than the test staged")
+        return _FakeResult(self._scalars.pop(0))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _ReadOnlyEngine:
+    """An engine that fails loudly if anything opens a write transaction."""
+
+    def __init__(self, scalars=()):
+        self.connection = _FakeConnection(scalars)
+        self.begin_calls = 0
+
+    def connect(self):
+        return self.connection
+
+    def begin(self):
+        self.begin_calls += 1
+        raise AssertionError("prepare_entry opened a write transaction")
+
+
+PAYLOAD = {
+    "sets": [
+        {
+            "exercise_name": "Chest Bench Press",
+            "weight_kg": 60,
+            "reps": 8,
+            "set_number": 1,
+            "raw_span": "bench 60kg x 8",
+        }
+    ],
+    "bodyweight": None,
+}
+ENTRY_TEXT = "bench 60kg x 8"
+ENTRY_DATE = date(2026, 8, 20)
+
+
+def _stub_extraction(monkeypatch, payload=None):
+    monkeypatch.setattr(
+        pipeline,
+        "extract_entities",
+        lambda raw_text, session_date, client=None: payload if payload is not None else PAYLOAD,
+    )
+
+
+class TestPrepareEntryWritesNothing:
+    """The whole point of the preview is that this half cannot reach the data."""
+
+    def test_no_write_transaction_is_opened(self, monkeypatch):
+        _stub_extraction(monkeypatch)
+        engine = _ReadOnlyEngine(
+            [datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc), 0, 0, 0, 0]
+        )
+        prepared = pipeline.prepare_entry(
+            ENTRY_TEXT, ENTRY_DATE, engine=engine, check_duplicates=True
+        )
+        assert engine.begin_calls == 0
+        assert len(prepared.accepted_sets) == 1
+
+    def test_runs_without_a_database_at_all(self, monkeypatch):
+        _stub_extraction(monkeypatch)
+        prepared = pipeline.prepare_entry(ENTRY_TEXT, ENTRY_DATE)
+        assert prepared.has_insertable
+        assert prepared.prepared_at is None and prepared.existing_on_date is None
+
+    def test_reports_what_the_date_already_holds(self, monkeypatch):
+        _stub_extraction(monkeypatch)
+        engine = _ReadOnlyEngine(
+            [datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc), 14, 1, 0, 0]
+        )
+        prepared = pipeline.prepare_entry(
+            ENTRY_TEXT, ENTRY_DATE, engine=engine, check_duplicates=True
+        )
+        assert prepared.existing_on_date == {"sets": 14, "bodyweight": 1}
+
+    def test_a_recent_duplicate_skips_the_model_call(self, monkeypatch):
+        called = []
+        monkeypatch.setattr(
+            pipeline,
+            "extract_entities",
+            lambda *a, **k: called.append(1) or PAYLOAD,
+        )
+        engine = _ReadOnlyEngine(
+            [datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc), 0, 0, 14, 0, []]
+        )
+        prepared = pipeline.prepare_entry(
+            ENTRY_TEXT, ENTRY_DATE, engine=engine, check_duplicates=True
+        )
+        assert prepared.duplicate_of_recent
+        assert prepared.prior_submission == {"inserted_sets": 14, "inserted_bodyweight": 0}
+        assert called == []
+
+    def test_the_duplicate_claim_carries_what_the_earlier_run_saved(self, monkeypatch):
+        """A guard that shows no evidence cannot be checked when it looks wrong."""
+        rows = [
+            type("Row", (), {"exercise": "Chest Bench Press", "sets": 3,
+                             "first_logged": datetime(2026, 8, 20, 16, 35, tzinfo=timezone.utc)})(),
+            type("Row", (), {"exercise": "Lateral Raise", "sets": 11,
+                             "first_logged": datetime(2026, 8, 20, 17, 0, tzinfo=timezone.utc)})(),
+        ]
+        engine = _ReadOnlyEngine(
+            [datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc), 0, 0, 14, 0, rows]
+        )
+        prepared = pipeline.prepare_entry(
+            ENTRY_TEXT, ENTRY_DATE, engine=engine, check_duplicates=True
+        )
+        assert [d["exercise"] for d in prepared.prior_detail] == [
+            "Chest Bench Press", "Lateral Raise"]
+        assert [d["sets"] for d in prepared.prior_detail] == [3, 11]
+
+
+class TestDuplicateGuardScope:
+    """It has to match one entry on one day - not the same words on another date."""
+
+    def test_the_lookup_is_pinned_to_the_session_date(self):
+        where, params = pipeline._submission_clauses(
+            "bench 60x8", 5, None, date(2026, 8, 20)
+        )
+        assert "logged_at >= :day_start AND logged_at < :day_end" in where
+        assert params["day_start"] == pipeline._local_day_bounds(date(2026, 8, 20))[0]
+        assert params["day_end"] == pipeline._local_day_bounds(date(2026, 8, 20))[1]
+
+    def test_the_day_window_follows_the_configured_zone(self, monkeypatch):
+        monkeypatch.setattr(pipeline, "LOCAL_TIMEZONE", "Asia/Karachi")
+        _, karachi = pipeline._submission_clauses("x", 5, None, date(2026, 8, 20))
+        monkeypatch.setattr(pipeline, "LOCAL_TIMEZONE", "UTC")
+        _, utc = pipeline._submission_clauses("x", 5, None, date(2026, 8, 20))
+        assert karachi["day_start"] != utc["day_start"]
+
+    def test_matching_is_exact_text_equality(self):
+        where, params = pipeline._submission_clauses("bench 60x8", 5, None, None)
+        assert "raw_source = :raw_source" in where
+        assert "LIKE" not in where.upper()
+        assert params["raw_source"] == "bench 60x8"
+
+    def test_an_unscoped_lookup_still_works_for_the_replay_check(self):
+        where, params = pipeline._submission_clauses(
+            "x", 5, datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc), None
+        )
+        assert "created_at >= :since" in where
+        assert "day_start" not in params
+
+    def test_forcing_past_the_guard_parses_anyway(self, monkeypatch):
+        """Re-pasting on purpose to replace a bad parse must not be swallowed."""
+        _stub_extraction(monkeypatch)
+        engine = _ReadOnlyEngine(
+            [datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc), 14, 0]
+        )
+        prepared = pipeline.prepare_entry(
+            ENTRY_TEXT,
+            ENTRY_DATE,
+            engine=engine,
+            check_duplicates=True,
+            allow_duplicate=True,
+        )
+        assert not prepared.duplicate_of_recent
+        assert len(prepared.accepted_sets) == 1
+
+    def test_a_low_confidence_set_is_held_back_from_the_preview(self, monkeypatch):
+        _stub_extraction(
+            monkeypatch,
+            {"sets": [{"exercise_name": "Invented Machine", "weight_kg": 999, "reps": 3}]},
+        )
+        prepared = pipeline.prepare_entry(ENTRY_TEXT, ENTRY_DATE)
+        assert prepared.accepted_sets == []
+        assert prepared.review_items and not prepared.has_insertable
+
+    def test_a_failed_extraction_reports_an_error_and_nothing_to_save(self, monkeypatch):
+        def _boom(*args, **kwargs):
+            raise pipeline.ExtractionError("model said no")
+
+        monkeypatch.setattr(pipeline, "extract_entities", _boom)
+        prepared = pipeline.prepare_entry(ENTRY_TEXT, ENTRY_DATE)
+        assert prepared.error and not prepared.has_insertable
+
+    def test_an_empty_entry_is_rejected_before_anything_else(self):
+        prepared = pipeline.prepare_entry("   ", ENTRY_DATE)
+        assert prepared.error and not prepared.has_insertable
+
+
+class TestCommitEntry:
+    def test_nothing_insertable_never_opens_a_transaction(self):
+        prepared = pipeline.PreparedEntry(raw_text="x", session_date=ENTRY_DATE)
+        engine = _ReadOnlyEngine()
+        result = pipeline.commit_entry(prepared, engine=engine)
+        assert engine.begin_calls == 0
+        assert result.inserted_sets == 0 and result.replaced is None
+
+    def test_a_duplicate_reports_the_earlier_run_without_writing(self):
+        prepared = pipeline.PreparedEntry(
+            raw_text="x",
+            session_date=ENTRY_DATE,
+            duplicate_of_recent=True,
+            prior_submission={"inserted_sets": 14, "inserted_bodyweight": 0},
+        )
+        engine = _ReadOnlyEngine()
+        result = pipeline.commit_entry(prepared, engine=engine)
+        assert engine.begin_calls == 0
+        assert result.duplicate_of_recent and result.duplicate_reason == "recent_submission"
+        assert result.inserted_sets == 14
+
+    def test_an_errored_prepare_is_never_committed(self):
+        prepared = pipeline.PreparedEntry(
+            raw_text="x", session_date=ENTRY_DATE, error="Extraction failed"
+        )
+        engine = _ReadOnlyEngine()
+        result = pipeline.commit_entry(prepared, engine=engine)
+        assert engine.begin_calls == 0 and result.error
+
+    def test_review_items_survive_into_the_result(self):
+        prepared = pipeline.PreparedEntry(
+            raw_text="x",
+            session_date=ENTRY_DATE,
+            review_items=[pipeline.ReviewItem("workout_set", "too low", 0.4, {})],
+        )
+        result = pipeline.commit_entry(prepared, engine=_ReadOnlyEngine())
+        assert len(result.review_items) == 1
+
+
+class TestPreparedEntryRoundTrip:
+    """The parse travels through the browser between the two requests."""
+
+    def _prepared(self):
+        return pipeline.PreparedEntry(
+            raw_text=ENTRY_TEXT,
+            session_date=ENTRY_DATE,
+            accepted_sets=[
+                (
+                    pipeline.WorkoutSet(
+                        exercise_name="Chest Bench Press",
+                        weight_kg=60,
+                        reps=8,
+                        cheat_reps=2,
+                        pain_flag=True,
+                        logged_at_local="2026-08-20T16:35:00",
+                    ),
+                    0.92,
+                )
+            ],
+            accepted_bodyweight=(pipeline.BodyweightEntry(weight_kg=82.4), 0.8),
+            review_items=[pipeline.ReviewItem("workout_set", "too low", 0.4, {"reps": 3})],
+            prepared_at=datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc),
+            existing_on_date={"sets": 14, "bodyweight": 0},
+        )
+
+    def test_every_field_survives(self):
+        restored = pipeline.PreparedEntry.from_dict(self._prepared().to_dict())
+        workout_set, confidence = restored.accepted_sets[0]
+        assert workout_set.exercise_name == "Chest Bench Press"
+        assert (workout_set.weight_kg, workout_set.reps, workout_set.cheat_reps) == (60, 8, 2)
+        assert workout_set.pain_flag and workout_set.logged_at_local == "2026-08-20T16:35:00"
+        assert confidence == 0.92
+        assert restored.accepted_bodyweight[0].weight_kg == 82.4
+        assert restored.session_date == ENTRY_DATE
+        assert restored.prepared_at == datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+        assert restored.existing_on_date == {"sets": 14, "bodyweight": 0}
+        assert restored.review_items[0].reason == "too low"
+
+    def test_a_tampered_set_is_rejected_rather_than_inserted(self):
+        payload = self._prepared().to_dict()
+        payload["sets"][0]["set"]["reps"] = 0  # gt=0 on the model
+        with pytest.raises(ValidationError):
+            pipeline.PreparedEntry.from_dict(payload)
+
+    def test_cheat_reps_above_reps_is_still_rejected_on_the_way_back(self):
+        payload = self._prepared().to_dict()
+        payload["sets"][0]["set"]["cheat_reps"] = 99
+        with pytest.raises(ValidationError):
+            pipeline.PreparedEntry.from_dict(payload)
+
+    def test_a_confidence_outside_the_range_is_clamped(self):
+        payload = self._prepared().to_dict()
+        payload["sets"][0]["confidence"] = 42.0
+        restored = pipeline.PreparedEntry.from_dict(payload)
+        assert restored.accepted_sets[0][1] == 1.0
+
+    def test_an_unversioned_payload_is_refused(self):
+        with pytest.raises(ValueError):
+            pipeline.PreparedEntry.from_dict({"sets": []})
+
+
+class TestLocalTimeLabel:
+    """Shared by the CLI dry run and the web preview, so they cannot disagree."""
+
+    def test_a_time_marker_is_shown_as_written(self, monkeypatch):
+        monkeypatch.setattr(pipeline, "LOCAL_TIMEZONE", "UTC")
+        assert pipeline.local_time_label("2026-08-20T16:35:00", ENTRY_DATE) == "16:35"
+
+    def test_a_missing_marker_is_flagged_with_a_tilde(self, monkeypatch):
+        monkeypatch.setattr(pipeline, "LOCAL_TIMEZONE", "UTC")
+        monkeypatch.setattr(pipeline, "DEFAULT_SESSION_HOUR", 18)
+        assert pipeline.local_time_label(None, ENTRY_DATE) == "~18:00"

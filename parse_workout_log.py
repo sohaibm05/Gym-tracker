@@ -47,22 +47,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _local_time_label(workout_set, session_date: date) -> str:
-    """Resolved wall-clock time for a set, in LOCAL_TIMEZONE.
-
-    Prefixed with "~" when the text carried no usable time marker and the
-    default session hour was applied, so a missed "4:35" is visible.
-    """
-    from zoneinfo import ZoneInfo
-
-    # Read the zone once and use it for both the resolve and the display, so the
-    # two can never disagree.
-    zone_name = pipeline.LOCAL_TIMEZONE
-    resolved = pipeline.resolve_logged_at(
-        workout_set.logged_at_local, session_date, zone_name
-    )
-    local = resolved.astimezone(ZoneInfo(zone_name))
-    prefix = "" if (workout_set.logged_at_local or "").strip() else "~"
-    return f"{prefix}{local:%H:%M}"
+    """Resolved wall-clock time for a set. The web preview shares this."""
+    return pipeline.local_time_label(workout_set.logged_at_local, session_date)
 
 
 def format_set_line(workout_set, confidence: float, session_date: date) -> str:

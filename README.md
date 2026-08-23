@@ -22,9 +22,13 @@ Notes app (unchanged)
   -> computed confidence heuristic             pipeline.compute_confidence
   -> fuzzy match against existing exercises    pipeline.find_matching_exercise
   -> below threshold? -> review list, not inserted
-  -> above threshold? -> parameterized INSERT into Postgres
+  -> above threshold? -> shown on a preview page          pipeline.prepare_entry
+  -> you press save   -> parameterized INSERT into Postgres  pipeline.commit_entry
   -> Power BI reads Postgres directly (later, not part of this build)
 ```
+
+Nothing is written until you have seen it. `POST /log` parses and shows; only
+`POST /log/confirm` inserts.
 
 ## Files
 
@@ -329,6 +333,36 @@ worth getting looked at. That is the whole of it — the Stage B prompt forbids 
 model from going further, and a unit test asserts the note never mentions a
 diagnosis or a corrective exercise.
 
+### Nothing is saved before you have seen it
+
+Extraction is a language model reading handwriting-grade text, so it is
+sometimes wrong — and a wrong parse used to be discovered only after it was in
+the database. The write is therefore split in two:
+
+- `pipeline.prepare_entry` extracts, validates and scores. It opens exactly one
+  read connection and **never** writes. `POST /log` stops here and renders what
+  it found: every set with its resolved time, load, cheat/clean split, warm-up,
+  drop-set and pain flags, and its confidence; the bodyweight reading; and
+  everything held back for review.
+- `pipeline.commit_entry` writes. Only `POST /log/confirm` calls it.
+
+Two tests pin the split: a fake engine that raises if anything opens a write
+transaction during a parse, and a source check that `commit_entry` does not
+appear in the `/log` handler.
+
+The parse travels between those two requests in a signed hidden field rather
+than a server-side cache — each serverless request is a fresh process, so there
+is nowhere to keep it, and re-extracting on confirm would mean paying for two
+model calls per save. The token is HMAC-signed with `APP_PASSWORD` (or
+`APP_PREVIEW_SECRET`), and every row in it is re-validated through the Pydantic
+models on the way back in: the signature proves where it came from, the models
+prove it is still sane.
+
+The entry text is carried between forms in a hidden `<textarea>`, not a hidden
+`<input>`. A journal entry has newlines in it, and an `<input>` value is subject
+to sanitization and attribute-value normalization that can flatten it to one
+line.
+
 ### Two entries on the same day
 
 Logging a second time against a date that already has rows asks which you meant:
@@ -338,11 +372,12 @@ Logging a second time against a date that already has rows asks which you meant:
 - **Replace** - discard everything already logged on that date and use this
   entry instead. For correcting a bad parse, not for adding.
 
-Replace is deliberately never the default, and never implicit. Two safeguards
-back it: the delete and the insert that follows commit in one transaction, so a
-failure mid-way cannot leave the day emptied with nothing put back; and it only
-runs when there is something to insert, so a failed extraction or an
-all-review entry leaves the existing day untouched.
+Replace is deliberately never the default, and never implicit. Three safeguards
+back it: the preview names the exact counts it is about to delete before you can
+press the button; the delete and the insert that follows commit in one
+transaction, so a failure mid-way cannot leave the day emptied with nothing put
+back; and it only runs when there is something to insert, so a failed extraction
+or an all-review entry leaves the existing day untouched.
 
 The delete window is a UTC range covering one *local* day, so it cannot reach
 into a neighbouring date - tested at an offset zone, not just UTC.
@@ -353,8 +388,32 @@ into a neighbouring date - tested at an offset zone, not just UTC.
 
 Render's free tier cold-starts in 30–50s after idle, which is exactly when you
 double-tap submit. Before extracting anything, `/log` checks whether the same raw
-text was inserted in the last `DUPLICATE_WINDOW_MINUTES` (5) and returns the
-earlier result instead of re-running the model and re-inserting.
+text was already saved **against the same date** in the last
+`DUPLICATE_WINDOW_MINUTES` (5), and if so skips the model call entirely.
+
+Three things about how it decides, because a guard that blocks a save you meant
+to make is worse than no guard:
+
+- **It matches exact text, on one date.** `raw_source` is `TEXT`, compared with
+  `=`, so nothing is truncated and two different entries cannot collide. The
+  date scope matters: without it, pasting the same short entry ("rest day,
+  weighed 82.4") against two dates in one sitting reads as a double-tap and the
+  second date is silently dropped.
+- **It shows its evidence.** The page lists which exercises that earlier save
+  actually produced, so a match that looks wrong can be checked instead of
+  believed. If those rows are not what your entry says, the earlier parse was
+  wrong — which is the case the replace path exists for.
+- **It offers a way through.** A deliberate re-paste — to correct a bad parse —
+  is indistinguishable from a double-tap, so the guard asks rather than refuses:
+  replace the day with this entry, or parse it again and add a second copy. It
+  used to just stop, which meant re-submitting with **Replace** selected did
+  nothing at all.
+
+A second guard sits on the confirm step, and catches the case the first cannot:
+the preview records the database clock when it was built, and confirming looks
+for rows from this text written *since* that instant. Only confirming the same
+preview twice can produce those, so a double-tapped save is caught even when you
+have deliberately overridden the first guard.
 
 ## Charts
 
@@ -462,7 +521,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-545 tests, no network and no database required — they cover the Stage A rule
+623 tests, no network and no database required — they cover the Stage A rule
 branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold), `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
@@ -472,10 +531,18 @@ form lookup actually produces. These are pure functions, so they are cheap to
 cover, and they are exactly the code where a silent bug produces a wrong
 training recommendation that nobody notices.
 
+The log flow is covered end to end through the real routes against a fake
+engine: parsing must not open a write transaction, the signed preview must
+survive the round trip with its mode intact, a tampered or re-signed token must
+be refused, and a duplicate must offer the replace path rather than stopping.
+
 ## Not built (by design)
 
 - **iOS Shortcut** posting from the Notes Share Sheet straight to `/log`. Listed
-  as a stretch goal in the spec; ask for it when you want it.
+  as a stretch goal in the spec; ask for it when you want it. Note that `/log`
+  now returns a preview rather than saving, so a shortcut would need either a
+  confirm step of its own or a small unattended endpoint that calls
+  `prepare_entry` and `commit_entry` back to back.
 - **Scheduled report generation.** The weekly report runs from a button, which
   keeps the stack free of scheduling infrastructure. A cron version is a fine
   later upgrade.

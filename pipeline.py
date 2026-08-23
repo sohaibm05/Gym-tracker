@@ -262,12 +262,134 @@ class PipelineResult:
     exercises_created: list[str] = field(default_factory=list)
     exercises_matched: list[tuple[str, str]] = field(default_factory=list)
     duplicate_of_recent: bool = False
+    # Which guard suppressed the write: "recent_submission" when the same text
+    # was already saved inside the window, "already_committed" when this exact
+    # preview was confirmed twice. They need different wording, because only the
+    # first one is something the user might want to override.
+    duplicate_reason: str = ""
     replaced: Optional[dict[str, int]] = None
     error: Optional[str] = None
 
     @property
     def total_inserted(self) -> int:
         return self.inserted_sets + self.inserted_bodyweight
+
+
+@dataclass
+class PreparedEntry:
+    """A parsed, scored entry with nothing yet written.
+
+    The web app shows this to the user and only writes once they confirm, so
+    `prepare_entry` must stay free of inserts. It round-trips through the
+    browser between those two requests via `to_dict`/`from_dict`, which is what
+    keeps the confirm step from paying for a second extraction.
+    """
+
+    raw_text: str
+    session_date: date
+    accepted_sets: list[tuple[WorkoutSet, float]] = field(default_factory=list)
+    accepted_bodyweight: Optional[tuple[BodyweightEntry, float]] = None
+    review_items: list[ReviewItem] = field(default_factory=list)
+    error: Optional[str] = None
+    # Set when an identical entry was saved inside the duplicate window. The
+    # extraction is skipped in that case, so the accepted lists stay empty.
+    duplicate_of_recent: bool = False
+    prior_submission: Optional[dict[str, int]] = None
+    # Per-exercise breakdown of what that earlier submission saved, so the
+    # duplicate claim can be checked rather than taken on trust.
+    prior_detail: list[dict[str, Any]] = field(default_factory=list)
+    # What the date already holds, for the preview to show before a replace.
+    existing_on_date: Optional[dict[str, int]] = None
+    # Database clock at prepare time. The confirm step looks for rows from this
+    # text inserted *after* it, which is how a double-tapped confirm is caught
+    # even when the user has deliberately overridden the duplicate guard.
+    prepared_at: Optional[datetime] = None
+    allow_duplicate: bool = False
+
+    @property
+    def has_insertable(self) -> bool:
+        """True when confirming would actually write something."""
+        return bool(self.accepted_sets) or self.accepted_bodyweight is not None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "v": 1,
+            "raw_text": self.raw_text,
+            "session_date": self.session_date.isoformat(),
+            "sets": [
+                {"set": workout_set.model_dump(), "confidence": confidence}
+                for workout_set, confidence in self.accepted_sets
+            ],
+            "bodyweight": (
+                {
+                    "entry": self.accepted_bodyweight[0].model_dump(),
+                    "confidence": self.accepted_bodyweight[1],
+                }
+                if self.accepted_bodyweight is not None
+                else None
+            ),
+            "review": [
+                {
+                    "kind": item.kind,
+                    "reason": item.reason,
+                    "confidence": item.confidence,
+                    "payload": item.payload,
+                }
+                for item in self.review_items
+            ],
+            "prepared_at": self.prepared_at.isoformat() if self.prepared_at else None,
+            "allow_duplicate": self.allow_duplicate,
+            "existing_on_date": self.existing_on_date,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PreparedEntry":
+        """Rebuild from `to_dict`, re-validating every row through the models.
+
+        The dict has been through the browser, so nothing in it is trusted:
+        each set is re-validated rather than assigned, and each confidence is
+        clamped. A payload that no longer validates raises, which the caller
+        turns into "start again" rather than an insert of junk.
+        """
+        if not isinstance(data, dict) or data.get("v") != 1:
+            raise ValueError("unrecognised prepared-entry payload")
+
+        def _confidence(value: Any) -> float:
+            return round(max(0.0, min(1.0, float(value))), 3)
+
+        accepted_sets = [
+            (WorkoutSet.model_validate(row["set"]), _confidence(row["confidence"]))
+            for row in data.get("sets") or []
+        ]
+        raw_bodyweight = data.get("bodyweight")
+        accepted_bodyweight = (
+            (
+                BodyweightEntry.model_validate(raw_bodyweight["entry"]),
+                _confidence(raw_bodyweight["confidence"]),
+            )
+            if raw_bodyweight
+            else None
+        )
+        review_items = [
+            ReviewItem(
+                kind=str(item.get("kind", "")),
+                reason=str(item.get("reason", "")),
+                confidence=None if item.get("confidence") is None else _confidence(item["confidence"]),
+                payload=item.get("payload") or {},
+            )
+            for item in data.get("review") or []
+        ]
+        prepared_at = data.get("prepared_at")
+        return cls(
+            raw_text=str(data.get("raw_text") or ""),
+            session_date=date.fromisoformat(str(data["session_date"])),
+            accepted_sets=accepted_sets,
+            accepted_bodyweight=accepted_bodyweight,
+            review_items=review_items,
+            prepared_at=datetime.fromisoformat(prepared_at) if prepared_at else None,
+            allow_duplicate=bool(data.get("allow_duplicate")),
+            existing_on_date=data.get("existing_on_date"),
+        )
 
 
 # --------------------------------------------------------------------------
@@ -502,6 +624,28 @@ def resolve_logged_at(
             )
 
     return local_to_utc(datetime.combine(session_date, time(hour=default_hour)), timezone_name)
+
+
+def local_time_label(
+    logged_at_local: Optional[str],
+    session_date: date,
+    timezone_name: Optional[str] = None,
+) -> str:
+    """Resolved wall-clock time for a set, in LOCAL_TIMEZONE.
+
+    Prefixed with "~" when the text carried no usable time marker and the
+    default session hour was applied, so a missed "4:35" is visible. Shared by
+    the CLI dry run and the web preview so the two can never disagree about
+    what time a set will be stored at.
+    """
+    if ZoneInfo is None:  # pragma: no cover
+        raise RuntimeError("zoneinfo unavailable; Python 3.9+ required")
+    zone_name = timezone_name or LOCAL_TIMEZONE
+    local = resolve_logged_at(logged_at_local, session_date, zone_name).astimezone(
+        ZoneInfo(zone_name)
+    )
+    prefix = "" if (logged_at_local or "").strip() else "~"
+    return f"{prefix}{local:%H:%M}"
 
 
 # --------------------------------------------------------------------------
@@ -1048,21 +1192,26 @@ def _local_day_bounds(session_date: date) -> tuple[datetime, datetime]:
     return start, end
 
 
-def count_entries_for_date(engine: Engine, session_date: date) -> dict[str, int]:
-    """How much is already logged against a local date."""
+def _count_entries_on(conn: Connection, session_date: date) -> dict[str, int]:
+    """How much is already logged against a local date, on a caller's connection."""
     start, end = _local_day_bounds(session_date)
     params = {"start": start, "end": end}
-    with engine.connect() as conn:
-        sets = conn.execute(
-            text("SELECT count(*) FROM workout_logs WHERE logged_at >= :start AND logged_at < :end"),
-            params,
-        ).scalar_one()
-        bodyweight = conn.execute(
-            text("SELECT count(*) FROM bodyweight_logs "
-                 "WHERE logged_at >= :start AND logged_at < :end"),
-            params,
-        ).scalar_one()
+    sets = conn.execute(
+        text("SELECT count(*) FROM workout_logs WHERE logged_at >= :start AND logged_at < :end"),
+        params,
+    ).scalar_one()
+    bodyweight = conn.execute(
+        text("SELECT count(*) FROM bodyweight_logs "
+             "WHERE logged_at >= :start AND logged_at < :end"),
+        params,
+    ).scalar_one()
     return {"sets": int(sets), "bodyweight": int(bodyweight)}
+
+
+def count_entries_for_date(engine: Engine, session_date: date) -> dict[str, int]:
+    """How much is already logged against a local date."""
+    with engine.connect() as conn:
+        return _count_entries_on(conn, session_date)
 
 
 def delete_entries_for_date(conn: Connection, session_date: date) -> dict[str, int]:
@@ -1083,42 +1232,113 @@ def delete_entries_for_date(conn: Connection, session_date: date) -> dict[str, i
     return {"sets": int(sets or 0), "bodyweight": int(bodyweight or 0)}
 
 
-def find_recent_submission(
-    engine: Engine,
+def _submission_clauses(
+    raw_text: str,
+    window_minutes: int,
+    since: Optional[datetime],
+    session_date: Optional[date],
+) -> tuple[str, dict[str, Any]]:
+    """The WHERE fragment identifying rows written from one journal entry.
+
+    Matching is exact text equality - `raw_source` is TEXT, so nothing is
+    truncated and two different entries cannot collide here.
+    """
+    params: dict[str, Any] = {"raw_source": raw_text}
+    clauses = ["raw_source = :raw_source"]
+
+    if since is not None:
+        clauses.append("created_at >= :since")
+        params["since"] = since
+    else:
+        clauses.append("created_at >= now() - CAST(:window AS interval)")
+        params["window"] = f"{int(window_minutes)} minutes"
+
+    if session_date is not None:
+        # Scoped to the day being logged. Without this, pasting the same short
+        # entry ("rest day, weighed 82.4") against two dates in one sitting
+        # reads as a double-tap and the second date is silently dropped.
+        start, end = _local_day_bounds(session_date)
+        clauses.append("logged_at >= :day_start AND logged_at < :day_end")
+        params["day_start"] = start
+        params["day_end"] = end
+
+    return " AND ".join(clauses), params
+
+
+def _find_submission_on(
+    conn: Connection,
     raw_text: str,
     window_minutes: int = DUPLICATE_WINDOW_MINUTES,
+    since: Optional[datetime] = None,
+    session_date: Optional[date] = None,
 ) -> Optional[dict[str, int]]:
-    """Return counts for an identical entry inserted within the window, else None.
+    """Counts for an identical entry already inserted, else None.
 
-    Backs the /log duplicate-submission guard: Render's free tier cold-starts for
-    30-50s, which is exactly when a user double-taps submit.
+    `since` narrows the search to rows created after a specific instant instead
+    of the rolling window. The confirm step passes the database clock read at
+    preview time, which identifies rows written *by this preview* and nothing
+    older - so a double-tapped confirm is caught even when the user has
+    deliberately overridden the rolling-window guard.
     """
-    with engine.connect() as conn:
-        params = {"raw_source": raw_text, "window": f"{int(window_minutes)} minutes"}
-        sets = conn.execute(
-            text(
-                """
-                SELECT count(*) FROM workout_logs
-                WHERE raw_source = :raw_source
-                  AND created_at >= now() - CAST(:window AS interval)
-                """
-            ),
-            params,
-        ).scalar_one()
-        bodyweight = conn.execute(
-            text(
-                """
-                SELECT count(*) FROM bodyweight_logs
-                WHERE raw_source = :raw_source
-                  AND created_at >= now() - CAST(:window AS interval)
-                """
-            ),
-            params,
-        ).scalar_one()
+    where, params = _submission_clauses(raw_text, window_minutes, since, session_date)
+    sets = conn.execute(
+        text(f"SELECT count(*) FROM workout_logs WHERE {where}"), params
+    ).scalar_one()
+    bodyweight = conn.execute(
+        text(f"SELECT count(*) FROM bodyweight_logs WHERE {where}"), params
+    ).scalar_one()
 
     if not sets and not bodyweight:
         return None
     return {"inserted_sets": int(sets), "inserted_bodyweight": int(bodyweight)}
+
+
+def _describe_submission_on(
+    conn: Connection,
+    raw_text: str,
+    session_date: Optional[date] = None,
+    window_minutes: int = DUPLICATE_WINDOW_MINUTES,
+) -> list[dict[str, Any]]:
+    """What the matched entry actually saved, per exercise.
+
+    A guard that says "duplicate" and shows nothing is impossible to argue
+    with - and impossible to trust when the sets it claims to have saved are
+    not the ones you meant to log. This is the evidence for the claim.
+    """
+    where, params = _submission_clauses(raw_text, window_minutes, None, session_date)
+    rows = conn.execute(
+        text(
+            f"""
+            SELECT e.name AS exercise, count(*) AS sets, min(w.logged_at) AS first_logged
+            FROM workout_logs w
+            JOIN exercises e ON e.exercise_id = w.exercise_id
+            WHERE {where}
+            GROUP BY e.name
+            ORDER BY min(w.logged_at), e.name
+            """
+        ),
+        params,
+    ).all()
+    return [
+        {"exercise": row.exercise, "sets": int(row.sets), "first_logged": row.first_logged}
+        for row in rows
+    ]
+
+
+def find_recent_submission(
+    engine: Engine,
+    raw_text: str,
+    window_minutes: int = DUPLICATE_WINDOW_MINUTES,
+    since: Optional[datetime] = None,
+    session_date: Optional[date] = None,
+) -> Optional[dict[str, int]]:
+    """Return counts for an identical entry already inserted, else None.
+
+    Backs the /log duplicate guard: Render's free tier cold-starts for 30-50s,
+    which is exactly when a user double-taps submit.
+    """
+    with engine.connect() as conn:
+        return _find_submission_on(conn, raw_text, window_minutes, since, session_date)
 
 
 # --------------------------------------------------------------------------
@@ -1126,53 +1346,72 @@ def find_recent_submission(
 # --------------------------------------------------------------------------
 
 
-def process_entry(
+def prepare_entry(
     raw_text: str,
     session_date: date,
     engine: Optional[Engine] = None,
     client: Any = None,
     check_duplicates: bool = False,
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
-    replace_existing: bool = False,
-) -> PipelineResult:
-    """Run the full pipeline for one journal entry.
+    allow_duplicate: bool = False,
+) -> PreparedEntry:
+    """Extract, validate and score one entry. Writes nothing.
 
-    Called by both the CLI and the web app. `check_duplicates` is enabled by the
-    web app, where a double-tapped submit is a real risk.
+    This is the half of the pipeline the web app runs first, so the user can
+    see what was read out of their text before any of it reaches the database.
+    `commit_entry` does the writing. Keep the two apart: an insert added here
+    would silently defeat the preview.
+
+    Passing `engine` (with `check_duplicates`) also collects what the database
+    already holds - a recent identical submission, and the row counts on the
+    session date - so the preview can say what a replace would discard.
     """
     raw_text = (raw_text or "").strip()
     if not raw_text:
-        return PipelineResult(error="Empty entry — nothing to parse.")
+        return PreparedEntry(
+            raw_text="", session_date=session_date, error="Empty entry — nothing to parse."
+        )
 
-    if engine is None:
-        engine = get_engine()
+    prepared = PreparedEntry(
+        raw_text=raw_text, session_date=session_date, allow_duplicate=allow_duplicate
+    )
 
-    if check_duplicates:
-        prior = find_recent_submission(engine, raw_text)
-        if prior is not None:
-            logger.info("Duplicate submission suppressed (%s)", prior)
-            return PipelineResult(
-                inserted_sets=prior["inserted_sets"],
-                inserted_bodyweight=prior["inserted_bodyweight"],
-                duplicate_of_recent=True,
-            )
+    if engine is not None:
+        # One connection for every read the preview needs. Serverless runs with
+        # NullPool, so each of these would otherwise be a fresh Postgres
+        # connection.
+        with engine.connect() as conn:
+            prepared.prepared_at = conn.execute(text("SELECT now()")).scalar_one()
+            prepared.existing_on_date = _count_entries_on(conn, session_date)
+            if check_duplicates and not allow_duplicate:
+                prior = _find_submission_on(conn, raw_text, session_date=session_date)
+                if prior is not None:
+                    logger.info("Duplicate submission held for confirmation (%s)", prior)
+                    prepared.duplicate_of_recent = True
+                    prepared.prior_submission = prior
+                    prepared.prior_detail = _describe_submission_on(
+                        conn, raw_text, session_date=session_date
+                    )
+                    # Deliberately before the extraction: the whole point of the
+                    # guard is to not pay for a second model call.
+                    return prepared
 
     try:
         payload = extract_entities(raw_text, session_date, client=client)
     except ExtractionError as exc:
         logger.error("Extraction failed: %s", exc)
-        return PipelineResult(
-            error="Extraction failed after one retry — entry not inserted.",
-            review_items=[ReviewItem("extraction", str(exc), None, {"raw_text": raw_text})],
+        prepared.error = "Extraction failed after one retry — nothing was parsed."
+        prepared.review_items.append(
+            ReviewItem("extraction", str(exc), None, {"raw_text": raw_text})
         )
+        return prepared
 
     scored_sets, scored_bodyweight, review = validate_extraction(payload, raw_text)
-    result = PipelineResult(review_items=list(review))
+    prepared.review_items.extend(review)
 
-    accepted_sets = []
     for workout_set, confidence in scored_sets:
         if confidence < confidence_threshold:
-            result.review_items.append(
+            prepared.review_items.append(
                 ReviewItem(
                     "workout_set",
                     f"confidence {confidence:.2f} below threshold {confidence_threshold:.2f}",
@@ -1181,13 +1420,12 @@ def process_entry(
                 )
             )
         else:
-            accepted_sets.append((workout_set, confidence))
+            prepared.accepted_sets.append((workout_set, confidence))
 
-    accepted_bodyweight = None
     if scored_bodyweight is not None:
         entry, confidence = scored_bodyweight
         if confidence < confidence_threshold:
-            result.review_items.append(
+            prepared.review_items.append(
                 ReviewItem(
                     "bodyweight",
                     f"confidence {confidence:.2f} below threshold {confidence_threshold:.2f}",
@@ -1196,19 +1434,67 @@ def process_entry(
                 )
             )
         else:
-            accepted_bodyweight = (entry, confidence)
+            prepared.accepted_bodyweight = (entry, confidence)
 
-    if not accepted_sets and accepted_bodyweight is None:
+    return prepared
+
+
+def commit_entry(
+    prepared: PreparedEntry,
+    engine: Optional[Engine] = None,
+    replace_existing: bool = False,
+) -> PipelineResult:
+    """Write an already-prepared entry. The only half that touches the data.
+
+    Everything the preview showed the user is carried in `prepared`, so this
+    never re-runs the extraction and can never write something the preview did
+    not display.
+    """
+    result = PipelineResult(review_items=list(prepared.review_items))
+    if prepared.error:
+        result.error = prepared.error
+        return result
+    if prepared.duplicate_of_recent:
+        prior = prepared.prior_submission or {}
+        result.duplicate_of_recent = True
+        result.duplicate_reason = "recent_submission"
+        result.inserted_sets = int(prior.get("inserted_sets", 0))
+        result.inserted_bodyweight = int(prior.get("inserted_bodyweight", 0))
+        return result
+    if not prepared.has_insertable:
         return result
 
+    if engine is None:
+        engine = get_engine()
+
     with engine.begin() as conn:
+        if prepared.prepared_at is not None:
+            # Rows from this text written since the preview was built can only
+            # have come from confirming this same preview, so a second confirm
+            # is a double-tap however it was reached.
+            already = _find_submission_on(
+                conn,
+                prepared.raw_text,
+                since=prepared.prepared_at,
+                session_date=prepared.session_date,
+            )
+            if already is not None:
+                logger.info("Confirm replayed; nothing re-inserted (%s)", already)
+                result.duplicate_of_recent = True
+                result.duplicate_reason = "already_committed"
+                result.inserted_sets = int(already.get("inserted_sets", 0))
+                result.inserted_bodyweight = int(already.get("inserted_bodyweight", 0))
+                return result
+
         if replace_existing:
-            # Only reached when there is something to put back - the early
-            # return above means a failed extraction never empties the day.
-            result.replaced = delete_entries_for_date(conn, session_date)
-            logger.info("Replaced %s on %s", result.replaced, session_date)
+            # Only reached when there is something to put back - the
+            # has_insertable check above means a failed extraction or an
+            # all-review entry never empties the day.
+            result.replaced = delete_entries_for_date(conn, prepared.session_date)
+            logger.info("Replaced %s on %s", result.replaced, prepared.session_date)
+
         known = load_exercise_names(conn)
-        for workout_set, confidence in accepted_sets:
+        for workout_set, confidence in prepared.accepted_sets:
             exercise_id, matched_name, created = get_or_create_exercise(
                 conn, workout_set.exercise_name, workout_set.muscle_group, known
             )
@@ -1221,7 +1507,9 @@ def process_entry(
                 _INSERT_WORKOUT_SET,
                 {
                     "exercise_id": exercise_id,
-                    "logged_at": resolve_logged_at(workout_set.logged_at_local, session_date),
+                    "logged_at": resolve_logged_at(
+                        workout_set.logged_at_local, prepared.session_date
+                    ),
                     "weight_kg": workout_set.weight_kg,
                     "reps": workout_set.reps,
                     "cheat_reps": workout_set.cheat_reps,
@@ -1230,25 +1518,55 @@ def process_entry(
                     "is_dropset": workout_set.is_dropset,
                     "pain_flag": workout_set.pain_flag,
                     "notes": workout_set.notes,
-                    "raw_source": raw_text,
+                    "raw_source": prepared.raw_text,
                     "extraction_confidence": confidence,
                 },
             )
             result.inserted_sets += 1
 
-        if accepted_bodyweight is not None:
-            entry, confidence = accepted_bodyweight
+        if prepared.accepted_bodyweight is not None:
+            entry, confidence = prepared.accepted_bodyweight
             conn.execute(
                 _INSERT_BODYWEIGHT,
                 {
-                    "logged_at": resolve_logged_at(entry.logged_at_local, session_date),
+                    "logged_at": resolve_logged_at(entry.logged_at_local, prepared.session_date),
                     "weight_kg": entry.weight_kg,
                     "body_fat_pct": entry.body_fat_pct,
                     "notes": entry.notes,
-                    "raw_source": raw_text,
+                    "raw_source": prepared.raw_text,
                     "extraction_confidence": confidence,
                 },
             )
             result.inserted_bodyweight += 1
 
     return result
+
+
+def process_entry(
+    raw_text: str,
+    session_date: date,
+    engine: Optional[Engine] = None,
+    client: Any = None,
+    check_duplicates: bool = False,
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    replace_existing: bool = False,
+) -> PipelineResult:
+    """Prepare and commit one journal entry in a single call.
+
+    What the CLI uses, and what the web app used before the preview step split
+    the two halves apart.
+    """
+    # Resolved lazily on both sides: an empty or unparseable entry has to fail
+    # with its own message, not with "DATABASE_URL is not set".
+    if engine is None and check_duplicates:
+        engine = get_engine()
+
+    prepared = prepare_entry(
+        raw_text,
+        session_date,
+        engine=engine if check_duplicates else None,
+        client=client,
+        check_duplicates=check_duplicates,
+        confidence_threshold=confidence_threshold,
+    )
+    return commit_entry(prepared, engine=engine, replace_existing=replace_existing)
