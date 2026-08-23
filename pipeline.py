@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from typing import Any, Iterable, Mapping, Optional, Sequence
@@ -75,6 +76,18 @@ CONFIDENCE_THRESHOLD = float(env("CONFIDENCE_THRESHOLD", "0.7"))
 # rapidfuzz score (0-100) at or above which a proposed exercise name is treated
 # as the same exercise as an existing row.
 FUZZY_MATCH_THRESHOLD = float(env("FUZZY_MATCH_THRESHOLD", "85"))
+
+# Band immediately below FUZZY_MATCH_THRESHOLD. A new name scoring in here is
+# too far from an existing exercise to merge automatically, but close enough
+# that a typo is the likeliest explanation - which is exactly the case that
+# silently splits one lift's history across two rows.
+NEAR_MISS_FLOOR = float(env("NEAR_MISS_FLOOR", "70"))
+
+# Grounding similarity below which a name that WAS saved is still treated as
+# weakly supported by the text it was read from. Confidence already penalizes
+# this band by 0.15, which on its own does not drop a set with a weight and a
+# rep count under CONFIDENCE_THRESHOLD - so without a flag it passes unseen.
+WEAK_GROUNDING_SIMILARITY = float(env("WEAK_GROUNDING_SIMILARITY", "0.8"))
 
 # Groq's Llama chat models (llama-3.3-70b-versatile, llama-3.1-8b-instant) were
 # deprecated for free/developer tiers on 2026-06-17. openai/gpt-oss-120b is the
@@ -255,11 +268,30 @@ class ReviewItem:
 
 
 @dataclass
+class NameFlag:
+    """A saved exercise name that does not look right - niche, or just wrong.
+
+    Distinct from `ReviewItem` in the one way that matters: the row this refers
+    to WAS inserted. A flag is an amber "look at this", not a rejection, so it
+    never withholds data. Raised only when the name creates a NEW exercise,
+    because that is the moment a bad name becomes a permanent row; re-logging an
+    exercise that already exists is not suspicious and must not nag.
+    """
+
+    exercise_name: str
+    reason: str  # "near_miss" | "weak_grounding" | "unrecognized"
+    detail: str
+    nearest_name: Optional[str] = None
+    score: Optional[float] = None
+
+
+@dataclass
 class PipelineResult:
     inserted_sets: int = 0
     inserted_bodyweight: int = 0
     review_items: list[ReviewItem] = field(default_factory=list)
     exercises_created: list[str] = field(default_factory=list)
+    name_flags: list[NameFlag] = field(default_factory=list)
     exercises_matched: list[tuple[str, str]] = field(default_factory=list)
     duplicate_of_recent: bool = False
     replaced: Optional[dict[str, int]] = None
@@ -493,19 +525,159 @@ def name_match_score(proposed: str, existing: str) -> float:
     return score
 
 
-def find_matching_exercise(
-    proposed: str,
-    existing_names: Iterable[str],
-    threshold: float = FUZZY_MATCH_THRESHOLD,
-) -> Optional[str]:
-    """Return the best existing name at/above `threshold`, else None."""
+def nearest_existing_exercise(
+    proposed: str, existing_names: Iterable[str]
+) -> tuple[Optional[str], float]:
+    """The closest existing name and its score, whatever that score is.
+
+    Split out from `find_matching_exercise` because the near-miss flag needs the
+    score precisely when it is too low to merge on.
+    """
     best_name: Optional[str] = None
     best_score = 0.0
     for candidate in existing_names:
         score = name_match_score(proposed, candidate)
         if score > best_score:
             best_name, best_score = candidate, score
+    return best_name, best_score
+
+
+def find_matching_exercise(
+    proposed: str,
+    existing_names: Iterable[str],
+    threshold: float = FUZZY_MATCH_THRESHOLD,
+) -> Optional[str]:
+    """Return the best existing name at/above `threshold`, else None."""
+    best_name, best_score = nearest_existing_exercise(proposed, existing_names)
     return best_name if best_score >= threshold else None
+
+
+def _content_tokens(name: str) -> list[str]:
+    """Sorted name tokens with equipment/muscle qualifiers removed.
+
+    Qualifiers are exactly what `name_match_score` already forgives, so they
+    must not be what makes a name look suspicious.
+    """
+    return sorted(
+        token for token in normalize_tokens(name)
+        if token not in _QUALIFIER_TOKENS_SINGULAR
+    )
+
+
+def _is_probable_typo(proposed: str, existing: str, per_token_ratio: float = 80.0) -> bool:
+    """True when two names differ by misspelling rather than by movement.
+
+    The distinction the near-miss flag lives or dies on. "Bech Press" against
+    "Chest Bench Press" is a typo splitting one lift in two. "Incline Bench
+    Press" against "Chest Bench Press" is two different lifts that SHOULD be
+    separate rows - `QUALIFIER_TOKENS` already documents `incline` as marking a
+    genuinely different movement, so flagging it would contradict the matcher.
+
+    Tokens shared exactly are paired off, then what is left is matched up by
+    character similarity - that pairing is the misspelling. Only tokens that
+    find no partner at all are allowed to be qualifiers, which is what lets
+    "Bech Press" pair against "Chest Bench Press" (the spare "chest" is an
+    equipment/muscle word) while "Incline Bench Press" does not (the spare
+    "incline" is not). Qualifiers are deliberately NOT stripped up front: doing
+    so deletes the partner a typo inside one ("Shoulderr Press") needs to be
+    compared against.
+    """
+    shared = Counter(normalize_tokens(proposed)) & Counter(normalize_tokens(existing))
+    leftover_left = sorted((Counter(normalize_tokens(proposed)) - shared).elements())
+    unpaired_right = sorted((Counter(normalize_tokens(existing)) - shared).elements())
+
+    unpaired_left: list[str] = []
+    paired = 0
+    for token in leftover_left:
+        best_index, best_score = None, per_token_ratio
+        for index, candidate in enumerate(unpaired_right):
+            score = fuzz.ratio(token, candidate)
+            if score >= best_score:
+                best_index, best_score = index, score
+        if best_index is None:
+            unpaired_left.append(token)
+        else:
+            unpaired_right.pop(best_index)
+            paired += 1
+
+    if paired == 0:
+        return False
+    # A leftover with no partner is only forgivable as an equipment/muscle word;
+    # anything else is a genuine variation and must not read as a misspelling.
+    return all(token in _QUALIFIER_TOKENS_SINGULAR
+               for token in unpaired_left + unpaired_right)
+
+
+def flag_exercise_name(
+    proposed: str,
+    existing_names: Iterable[str],
+    raw_span: Optional[str] = None,
+    raw_text: str = "",
+    near_miss_floor: float = NEAR_MISS_FLOOR,
+    merge_threshold: float = FUZZY_MATCH_THRESHOLD,
+    weak_grounding: float = WEAK_GROUNDING_SIMILARITY,
+) -> Optional["NameFlag"]:
+    """Amber-flag a newly created exercise name that does not look right.
+
+    Three checks, in descending order of how much damage the case does, and at
+    most one flag is returned so the report stays readable:
+
+      1. `near_miss`      - close to an existing exercise but under the merge
+                            threshold. A typo here splits one lift's history in
+                            two, and every later chart inherits the split.
+      2. `weak_grounding` - the name is poorly supported by the text it was
+                            read from, i.e. the model may have tidied it into
+                            something that was never written.
+      3. `unrecognized`   - no muscle-group table, muscle word or movement verb
+                            knows this name. Either genuinely niche, or wrong.
+
+    Returns None when the name looks ordinary. Pure: no database, no network.
+    """
+    nearest, score = nearest_existing_exercise(proposed, existing_names)
+    if (nearest is not None
+            and near_miss_floor <= score < merge_threshold
+            and _is_probable_typo(proposed, nearest)):
+        return NameFlag(
+            exercise_name=proposed,
+            reason="near_miss",
+            detail=(f"close to existing {nearest!r} (score {score:.0f}, merge needs "
+                    f"{merge_threshold:.0f}) - if these are the same lift, the history "
+                    f"is now split across two exercises"),
+            nearest_name=nearest,
+            score=score,
+        )
+
+    # Same haystack rule `compute_confidence` uses: the span if the model gave
+    # one, otherwise the whole entry.
+    haystack = (raw_span or "").strip() or (raw_text or "")
+    if haystack:
+        # Take the better of the full name and the name stripped of qualifiers:
+        # the model routinely adds "Barbell"/"Dumbbell" to a name the text wrote
+        # bare, and that is normalization, not invention.
+        similarity = max(
+            _grounding_similarity(proposed, haystack),
+            _grounding_similarity(" ".join(_content_tokens(proposed)), haystack),
+        )
+        if similarity < weak_grounding:
+            return NameFlag(
+                exercise_name=proposed,
+                reason="weak_grounding",
+                detail=(f"only {similarity:.0%} similar to the text it was read from "
+                        f"({haystack.strip()[:60]!r}) - check the name was actually "
+                        f"written, not inferred"),
+                score=similarity,
+            )
+
+    if resolve_muscle_group(proposed) is None:
+        return NameFlag(
+            exercise_name=proposed,
+            reason="unrecognized",
+            detail=("no muscle group, muscle word or movement verb recognized - either "
+                    "a niche movement worth adding to muscle_groups.py, or not an "
+                    "exercise name at all"),
+        )
+
+    return None
 
 
 def compute_confidence(
@@ -581,6 +753,26 @@ def local_to_utc(local_dt: datetime, timezone_name: Optional[str] = None) -> dat
     tz = ZoneInfo(timezone_name or LOCAL_TIMEZONE)
     aware = local_dt.replace(tzinfo=tz) if local_dt.tzinfo is None else local_dt
     return aware.astimezone(_tz.utc)
+
+
+def local_today(timezone_name: Optional[str] = None) -> date:
+    """Today's date in the configured local zone, not the server's.
+
+    Every host this deploys to runs its containers on UTC, so `date.today()`
+    there is the UTC date - which is still yesterday for part of every local day
+    east of Greenwich. Writes and reads already route through LOCAL_TIMEZONE
+    (`local_to_utc`, `_local_day_bounds`), so the day boundary has to as well:
+    otherwise a late-night session is dated a day early, and at a Sunday
+    boundary that files it under the previous week entirely.
+
+    Resolved at call time for the same reason as `local_to_utc`.
+    """
+    from datetime import timezone as _tz
+
+    if ZoneInfo is None:  # pragma: no cover
+        raise RuntimeError("zoneinfo unavailable; Python 3.9+ required")
+    tz = ZoneInfo(timezone_name or LOCAL_TIMEZONE)
+    return datetime.now(_tz.utc).astimezone(tz).date()
 
 
 def resolve_logged_at(
@@ -1691,8 +1883,9 @@ def commit_draft(
                 duplicate_of_recent=True,
             )
 
-    # (model, confidence, the muscle group was chosen by the user not suggested)
-    accepted_sets: list[tuple[WorkoutSet, float, bool]] = []
+    # (model, confidence, the muscle group was chosen by the user not suggested,
+    #  the exercise name was typed by the user rather than extracted)
+    accepted_sets: list[tuple[WorkoutSet, float, bool, bool]] = []
     for row in draft.sets:
         if row.blank:
             continue
@@ -1721,6 +1914,7 @@ def commit_draft(
             workout_set,
             1.0 if row.edited or row.added else confidence,
             "muscle_group" in row.edited_fields,
+            row.added or "exercise_name" in row.edited_fields,
         ))
 
     accepted_bodyweight: Optional[tuple[BodyweightEntry, float]] = None
@@ -1753,13 +1947,39 @@ def commit_draft(
             result.replaced = delete_entries_for_date(conn, draft.session_date)
             logger.info("Replaced %s on %s", result.replaced, draft.session_date)
         known = load_exercise_names(conn)
-        for workout_set, confidence, chosen_group in accepted_sets:
+        for workout_set, confidence, chosen_group, name_typed in accepted_sets:
             exercise_id, matched_name, created = get_or_create_exercise(
                 conn, workout_set.exercise_name, workout_set.muscle_group, known,
                 chosen_group=chosen_group,
             )
             if created:
                 result.exercises_created.append(workout_set.exercise_name)
+                # Flag against everything known EXCEPT the row just inserted -
+                # `get_or_create_exercise` has already added it to `known`, and a
+                # name always scores 100 against itself. Names created earlier in
+                # this same entry stay in scope, so a typo of a lift first logged
+                # two sets ago is still caught.
+                #
+                # A name the user typed on the review screen is flagged with no
+                # source text, which skips the grounding check while leaving the
+                # near-miss and unrecognized ones in force. Grounding asks
+                # whether the model read the name or invented it; for a name a
+                # person wrote there is no extraction to score, the same reason
+                # `confidence` above is pinned to 1.0 for an edited row. Asking
+                # it anyway would flag every hand-typed name, and a flag that
+                # fires on ordinary lifts hides the real ones.
+                flag = flag_exercise_name(
+                    workout_set.exercise_name,
+                    [name for name in known if name != workout_set.exercise_name],
+                    None if name_typed else workout_set.raw_span,
+                    "" if name_typed else draft.raw_text,
+                )
+                if flag is not None:
+                    result.name_flags.append(flag)
+                    logger.info(
+                        "event=name_flagged exercise=%r reason=%s",
+                        workout_set.exercise_name, flag.reason,
+                    )
             elif matched_name and matched_name != workout_set.exercise_name:
                 result.exercises_matched.append((workout_set.exercise_name, matched_name))
 
