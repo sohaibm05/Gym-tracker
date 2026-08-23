@@ -45,7 +45,9 @@ below the confidence threshold is reported rather than saved
 | `review.py` | The review screen: renders a draft as an editable form, reads the submission back, and adds empty slots on request |
 | `insights.py` | Weekly report. Stage A computes every number; Stage B only writes prose |
 | `charts.py` | The `/progress` page - inline-SVG charts, no chart library |
+| `muscle_groups.py` | Static exercise-name -> primary muscle group tables and lookup |
 | `seed_sample_data.py` | Seeds three weeks of realistic data so the report can be tried out |
+| `backfill_muscle_groups.py` | One-off: fills `muscle_group` for exercises logged before the lookup existed |
 | `tests/` | Unit tests for the Stage A rules and the confidence / fuzzy-match logic |
 | `sample_entry.txt` | A messy journal entry in the real style, for trying the CLI |
 
@@ -235,6 +237,36 @@ state between the two requests. The draft travels in the form itself, which is
 why the flow works unchanged on a serverless deploy where the two requests may
 not reach the same process.
 
+### Muscle group is suggested, then reviewed
+
+Nobody writes "chest" in a gym journal, and the extraction is never asked for a
+muscle group — so the column filled itself in silently from the static table and
+nothing ever showed you the answer. `exercises.muscle_group` is written once per
+distinct movement and then never revisited, and `insights.volume_by_muscle_group`
+buckets on it exactly as stored, so a wrong or blank one is a chart that quietly
+misreports for months.
+
+It is now suggested into the review form like any other value, and correctable
+there. The suggestion comes from what the exercise is **already filed under**
+first — matched the same fuzzy way the insert path matches names, so a reworded
+name still finds its own row — and falls back to the table. Stored wins because
+`get_or_create_exercise` never revises a stored group on its own: offering a
+table answer that disagreed with one would be offering an edit that saving
+ignores.
+
+Two things are marked in red: a name the table cannot place (left alone it
+becomes "Unassigned" in the volume chart), and a group outside the ten canonical
+ones (it would become its own bucket). Neither blocks the save — muscle group is
+a filing decision, not a fact about the set. The ten standard groups are offered
+as a pick list, which is a `<datalist>`, so it suggests without refusing
+anything you insist on.
+
+A group **you type** is treated differently from one the app suggested: it is
+the only thing that will re-file an exercise that already exists. That
+distinction is why edits are tracked per field rather than per row. Without it
+correcting a group on an exercise you had logged before would appear to work and
+change nothing.
+
 ### Confidence is computed, not asked for
 
 LLMs are badly calibrated at rating their own certainty, so the model is
@@ -284,6 +316,51 @@ Unknown words fail closed, into a separate row.
 
 Both names must have at least two tokens for the subset bonus, so "Curl" never
 absorbs "Leg Curl". Threshold is 85, tunable via `FUZZY_MATCH_THRESHOLD`.
+
+### Muscle groups come from a table, not the model
+
+`exercises.muscle_group` is written by `get_or_create_exercise` only on INSERT,
+so it is decided once per distinct movement and then never revisited — a few
+dozen decisions over the life of the tool, not one per set. That makes it a
+lookup, not a judgement, and `muscle_groups.py` holds the table.
+
+Asking the model instead would have cost nothing in tokens — the field would
+ride along in the extraction JSON that is already requested. The reason not to
+is `GROQ_REASONING_EFFORT=low`: gpt-oss shares one completion budget between its
+reasoning and its answer, so adding a *classification* subtask to an
+*extraction* task buys a `json_validate_failed` risk on long entries in exchange
+for an answer a `dict` already knows. Asking the user instead would tax every
+log for information the exercise name already carries.
+
+Resolution runs four passes, most specific first: the full name against the
+table, the name with equipment tokens stripped, a muscle named in the name, then
+the movement verb. The table is consulted first because the obvious heuristic is
+wrong on exactly the names that matter — `Chest Supported Row` is a back
+exercise, `Leg Raise` is a core exercise, and `Leg Curl` is not a biceps
+exercise. `press` and `raise` are deliberately absent from the verb fallback:
+they span chest, shoulders and legs, so a guess would mislabel about a third of
+what it caught.
+
+Unrecognized names resolve to `None`, stored as NULL and reported as
+"Unassigned" — the same fail-closed rule the qualifier allowlist uses. Nothing
+is ever guessed onto the axis the weekly report's volume figures are grouped by.
+
+**Primary mover only.** The column is a single `TEXT` and the chart sums over
+it. A bench press is chest, triceps and front delts; recording all three would
+make "volume by muscle group" stop summing to actual total volume.
+
+`EQUIPMENT_TOKENS` is looser than the identity-matching `QUALIFIER_TOKENS`
+above, on purpose: seated and standing calf raises are two exercises that must
+keep separate progress histories but share one muscle group. Stripping a token
+there never merges two exercises, it only lets them share a lookup key. Genuine
+variations — `incline`, `close grip`, `romanian` — stay out of it, because they
+change which muscle leads the lift.
+
+Exercises logged before any of this existed carry NULL. `python
+backfill_muscle_groups.py --dry-run` shows what the table would fill in;
+without the flag it writes them. It only ever touches NULL rows, so a
+hand-corrected group is never overwritten, and it lists the names it did not
+recognize — that list is what to add to `EXERCISE_MUSCLE_GROUPS`.
 
 ### Cheat reps are counted, not flagged
 
@@ -379,8 +456,9 @@ so re-running it costs only another extraction.
 
 ## Charts
 
-`/progress` plots the logged data: weekly volume, estimated 1RM per exercise as
-small multiples, bodyweight, volume by muscle group, and a pain-flag view. Drawn
+`/progress` plots the logged data: weekly volume, estimated 1RM as small
+multiples sectioned by muscle group, bodyweight, volume by muscle group, and a
+pain-flag view. Drawn
 as inline SVG from a JSON blob, so there is no chart library, no external
 request, and nothing added to `requirements.txt`.
 
@@ -389,6 +467,16 @@ number on a chart and the same number in the report cannot drift apart.
 
 A few decisions that are easy to get wrong:
 
+- **e1RM is grouped by muscle, not averaged into it.** The exercises of one
+  muscle group sit together under a heading so "is my chest progressing" is one
+  glance rather than a hunt, but each keeps its own line. One averaged e1RM per
+  muscle group would read more easily and mean nothing: a 100kg bench press and
+  a 15kg cable fly have no useful mean, and the average would move when you
+  changed exercise selection rather than when you got stronger. Which exercises
+  appear is still decided by how much they are trained, so grouping never
+  reserves slots for a muscle you barely work. An exercise with no group on file
+  sections under **Unassigned**, last — which is also the nudge to go and set it
+  on the review screen.
 - **Each exercise carries a fitted trend line and its slope in kg/week.** The
   shape of a line does not give the rate: two lifts can both end higher while
   one is gaining three times as fast. The line drawn and the rate quoted beside
@@ -479,14 +567,16 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-412 tests, no network and no database required — they cover the Stage A rule
-branches (e1RM, plateau detection, the program-stagnation rollup, every
+655 tests, no network and no database required — they cover the Stage A
+rule branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold), `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
-resolution and JSON-mode retry behaviour, and the review screen's draft/edit/save
-round trip. These are pure functions, so they are cheap to cover, and they are
-exactly the code where a silent bug produces a wrong training recommendation, or
-a saved row that does not match what was on screen, and nobody notices.
+resolution and JSON-mode retry behaviour, the muscle-group tables and how their answer is suggested and overridden — both their
+resolution cases and mechanical guards that every key is in the normalized form
+lookup actually produces — and the review screen's draft/edit/save round trip.
+These are pure functions, so they are cheap to cover, and they are exactly the
+code where a silent bug produces a wrong training recommendation, or a saved row
+that does not match what was on screen, and nobody notices.
 
 ## Not built (by design)
 

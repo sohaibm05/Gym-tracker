@@ -371,6 +371,20 @@ def _invalid_date_page() -> HTMLResponse:
     )
 
 
+def _known_groups() -> Optional[dict[str, Optional[str]]]:
+    """What each known exercise is already filed under, for the suggestion.
+
+    Best effort, like `_existing_counts`: without it the suggestion falls back
+    to the static table, which is a worse answer but not a wrong one.
+    """
+    try:
+        with get_engine().connect() as conn:
+            return pipeline.load_exercise_groups(conn)
+    except Exception:  # noqa: BLE001 - the save step will surface a real outage
+        logger.warning("event=known_groups_failed", exc_info=True)
+        return None
+
+
 def _existing_counts(session_date: date) -> Optional[dict[str, int]]:
     """What is already logged on that date, for the review banner.
 
@@ -406,7 +420,7 @@ async def log_entry(
     if parsed_date is None:
         return _invalid_date_page()
 
-    draft = pipeline.build_draft(raw_text, parsed_date)
+    draft = pipeline.build_draft(raw_text, parsed_date, known_groups=_known_groups())
     draft.replace_existing = mode == "replace"
     logger.info(
         "event=entry_drafted date=%s mode=%s sets=%d bodyweight=%s flagged=%d blocked=%d error=%s",
@@ -447,7 +461,7 @@ async def save_reviewed(request: Request, _user: str = Depends(require_auth)) ->
     """
     form = await request.form()
     try:
-        draft = review.draft_from_form(form)
+        draft = review.draft_from_form(form, known_groups=_known_groups())
     except ValueError:
         return _invalid_date_page()
 

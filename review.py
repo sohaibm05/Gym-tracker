@@ -23,6 +23,7 @@ import json
 from datetime import datetime
 from typing import Any, Mapping, Optional, Sequence
 
+import muscle_groups
 import pipeline
 from pipeline import CONFIDENCE_THRESHOLD, DraftRow, EntryDraft
 
@@ -134,18 +135,28 @@ def _origin_blob(row: DraftRow, columns: Sequence[str]) -> str:
 
 PLACEHOLDERS = {"logged_at_local": "HH:MM"}
 
+# Columns offered as a pick list. `<datalist>` suggests without restricting, so
+# a group the table does not know can still be typed in — it just gets flagged.
+DATALISTS = {"muscle_group": "muscle-groups"}
+
+MUSCLE_GROUP_OPTIONS = '<datalist id="muscle-groups">' + "".join(
+    f'<option value="{html.escape(group)}">' for group in muscle_groups.CANONICAL_GROUPS
+) + "</datalist>"
+
 
 def _text_field(prefix: str, column: str, label: str, css: str, mode: str, row: DraftRow) -> str:
     field_id = f"{prefix}.{column}"
     classes = "bad" if row.issues_for(column) else ""
     placeholder = PLACEHOLDERS.get(column, "")
+    listed = DATALISTS.get(column)
     return (
         f'<div class="field {css}">'
         f'<label for="{html.escape(field_id)}">{html.escape(label)}</label>'
         f'<input type="text" inputmode="{mode}" id="{html.escape(field_id)}" '
         f'name="{html.escape(field_id)}" class="{classes}" autocomplete="off" '
         f'placeholder="{html.escape(placeholder)}" '
-        f'value="{html.escape(display_value(row.values.get(column)))}">'
+        + (f'list="{html.escape(listed)}" ' if listed else "")
+        + f'value="{html.escape(display_value(row.values.get(column)))}">'
         f"</div>"
     )
 
@@ -371,11 +382,13 @@ def render_review_body(
 <h1>Check before saving</h1>
 <p class="muted">This is exactly what will be written to the database for
 {html.escape(draft.session_date.isoformat())}. Correct anything that is wrong,
-untick anything that should not be saved, then save. Nothing has been stored yet.</p>
+untick anything that should not be saved, then save. Nothing has been stored yet.
+Muscle group is suggested from the exercise name, not read from your entry &mdash;
+correcting one re-files that exercise for good.</p>
 {_banner(draft, existing)}
 {entry}
 <form method="post" action="/save">
-{hidden}
+{hidden}{MUSCLE_GROUP_OPTIONS}
 <h2>Sets ({sum(1 for row in draft.sets if not row.blank)})</h2>
 {cards}
 {bodyweight}
@@ -422,27 +435,33 @@ def _row_values(
     return values
 
 
-def _was_edited(form: Mapping[str, Any], prefix: str, values: Mapping[str, Any]) -> bool:
-    """True when a submitted value differs from what the extraction proposed.
+def _edited_fields(
+    form: Mapping[str, Any], prefix: str, values: Mapping[str, Any]
+) -> frozenset[str]:
+    """Which submitted values differ from what was put on the screen.
 
     Compared in submitted form — display strings and booleans — so a float that
-    round-tripped through the input does not read as a change.
+    round-tripped through the input does not read as a change. Per column rather
+    than per row because the muscle group needs it: one the user chose may
+    overwrite what an exercise is filed under, one the app suggested must not.
     """
     try:
         origin = json.loads(str(form.get(f"{prefix}.origin", "")))
     except (TypeError, ValueError):
-        return False
+        return frozenset()
     if not isinstance(origin, dict):
-        return False
-    return any(
-        origin.get(column) != (value if isinstance(value, bool) else display_value(value))
+        return frozenset()
+    return frozenset(
+        column
         for column, value in values.items()
+        if origin.get(column) != (value if isinstance(value, bool) else display_value(value))
     )
 
 
 def draft_from_form(
     form: Mapping[str, Any],
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    known_groups: Optional[Mapping[str, Optional[str]]] = None,
 ) -> EntryDraft:
     """Rebuild a draft from a submitted review form, rescored against the edits.
 
@@ -468,12 +487,16 @@ def draft_from_form(
     for index in range(max(0, set_count)):
         prefix = f"s{index}"
         values = _row_values(form, prefix, pipeline.SET_COLUMNS, checkbox_columns)
+        changed = _edited_fields(form, prefix, values)
         row = pipeline.draft_set_row(
             values,
             raw_text,
             confidence_threshold,
-            edited=_was_edited(form, prefix, values),
+            edited=bool(changed),
             added=f"{prefix}.added" in form,
+            edited_fields=changed,
+            known_groups=known_groups,
+            resuggest_muscle_group=True,
         )
         row.include = f"{prefix}.include" in form
         draft.sets.append(row)
@@ -484,7 +507,7 @@ def draft_from_form(
             values,
             raw_text,
             confidence_threshold,
-            edited=_was_edited(form, "bw", values),
+            edited=bool(_edited_fields(form, "bw", values)),
             added="bw.added" in form,
         )
         row.include = "bw.include" in form
