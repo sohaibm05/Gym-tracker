@@ -296,6 +296,11 @@ def main(argv: list[str] | None = None) -> int:
     for proposed, matched in result.exercises_matched:
         print(f"Fuzzy match  : {proposed!r} -> existing {matched!r}")
 
+    if result.name_flags:
+        print(f"\nCheck these names ({len(result.name_flags)}) — saved anyway:")
+        for flag in result.name_flags:
+            print(f"  ! [{flag.reason}] {flag.exercise_name!r}: {flag.detail}")
+
     if result.review_items:
         print(f"\nNeeds manual review ({len(result.review_items)}) — NOT inserted:")
         for item in result.review_items:
