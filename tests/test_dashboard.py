@@ -217,6 +217,65 @@ class TestRendering:
         assert "num" not in header
         assert '<th class="num">e1RM (kg)</th>' in body
 
+    @pytest.mark.parametrize("sheet", ["PROGRESS_CSS", "PROGRESS_JS"])
+    def test_no_stray_control_characters_reach_the_page(self, sheet):
+        """These blocks are plain Python strings, so a backslash-escaped CSS code
+        point is eaten as a Python octal escape and a control character lands in
+        the stylesheet in place of the glyph."""
+        text = getattr(charts, sheet)
+        assert [c for c in text if ord(c) < 32 and c not in "\n\t"] == []
+
+    def test_a_fold_marker_is_drawn(self):
+        assert 'summary::before' in charts.PROGRESS_CSS
+        assert '"▾"' in charts.PROGRESS_CSS
+
+    def test_cards_are_foldable(self):
+        body = charts.render_progress_body(self._data())
+        assert body.count('<details class="fold"') == 5
+
+    def test_a_card_with_something_to_show_starts_open(self):
+        body = charts.render_progress_body(self._data())
+        assert '<details class="fold" open><summary><h2>Weekly volume' in body
+
+    def test_an_all_clear_card_folds_and_says_so_on_its_summary(self):
+        """Folding it away must not cost the answer it was showing."""
+        data = self._data()
+        data["pain"] = []
+        body = charts.render_progress_body(data)
+        card = body.split("Pain flags")[1]
+        assert card.startswith("</h2><span class=\"note\">none in this window")
+        assert '<details class="fold"><summary><h2>Pain flags' in body
+
+    def test_a_card_with_flags_stays_open_and_counts_them(self):
+        body = charts.render_progress_body(self._data())
+        assert '<details class="fold" open><summary><h2>Pain flags' in body
+        assert "1 exercise(s)" in body
+
+    def test_a_serious_flag_is_called_out_on_the_summary(self):
+        data = self._data()
+        data["pain"][0]["status"] = "serious"
+        data["pain"][0]["streak"] = 3
+        assert "1 needing attention" in charts.render_progress_body(data)
+
+    def test_muscle_group_sections_are_foldable_and_start_open(self):
+        body = charts.render_progress_body(
+            self._data(series=self._series(("Bench", "Chest"), ("Row", "Back"))))
+        assert body.count('<details class="fold group" open>') == 2
+
+    def test_every_group_section_is_closed_off(self):
+        """An unclosed <details> would swallow the rest of the card."""
+        body = charts.render_progress_body(
+            self._data(series=self._series(("Bench", "Chest"), ("Row", "Back"))))
+        assert body.count("<details") == body.count("</details>")
+        assert (body.count('<div class="smalls">')
+                == body.count('<details class="fold group"'))
+
+    def test_a_chart_redraws_when_its_section_opens(self):
+        """A host inside a closed <details> measures zero, and clientWidth falls
+        back to a guess that would never correct itself."""
+        assert "addEventListener('toggle'" in charts.PROGRESS_JS
+        assert "if (evt.target.open) draw(evt.target)" in charts.PROGRESS_JS
+
     def test_renders_the_expected_cards(self):
         body = charts.render_progress_body(self._data())
         for heading in ("Weekly volume", "Estimated 1RM by muscle group", "Bodyweight",

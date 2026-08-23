@@ -467,6 +467,18 @@ number on a chart and the same number in the report cannot drift apart.
 
 A few decisions that are easy to get wrong:
 
+- **Every card folds, and a card with nothing to say folds itself.** Bodyweight
+  with no readings, volume on a week you have not trained, pain flags on a clean
+  window — each collapses to its heading with the answer beside it ("none in
+  this window"), so folding never costs you what the card was telling you.
+  Anything with something to show starts open: you opened the page to look at
+  it. Muscle-group sections fold too, which is how you get one muscle on screen
+  at a time.
+  Built on `<details>`, the same element the table twins already use, so it
+  works without JavaScript — but a chart *drawn* inside a closed one has no
+  width to measure, and `clientWidth` falls back to a guess that would never
+  correct itself. Opening a section redraws what is inside it at the size it
+  actually got.
 - **e1RM is grouped by muscle, not averaged into it.** The exercises of one
   muscle group sit together under a heading so "is my chest progressing" is one
   glance rather than a hunt, but each keeps its own line. One averaged e1RM per
@@ -567,7 +579,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-655 tests, no network and no database required — they cover the Stage A
+666 tests, no network and no database required — they cover the Stage A
 rule branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold), `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
