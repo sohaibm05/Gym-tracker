@@ -278,6 +278,19 @@ def _render_result(result: pipeline.PipelineResult, session_date: date) -> str:
         names = ", ".join(html.escape(name) for name in result.exercises_created)
         parts.append(f'<div class="card muted">New exercises created: {names}</div>')
 
+    if result.name_flags:
+        rows = "".join(
+            f"<li><strong>{html.escape(flag.exercise_name)}</strong> "
+            f"&mdash; {html.escape(flag.detail)}</li>"
+            for flag in result.name_flags
+        )
+        parts.append(
+            '<div class="card warn"><strong>Check these names '
+            f"({len(result.name_flags)}) &mdash; saved anyway</strong><ul>{rows}</ul>"
+            "<p class=\"muted\">Flagged only when the name creates a new exercise. "
+            "Fix a wrong one by re-submitting the entry with <strong>Replace</strong>.</p></div>"
+        )
+
     if result.exercises_matched:
         rows = "".join(
             f"<li>{html.escape(proposed)} &rarr; matched existing <strong>{html.escape(matched)}</strong></li>"
