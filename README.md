@@ -362,6 +362,48 @@ without the flag it writes them. It only ever touches NULL rows, so a
 hand-corrected group is never overwritten, and it lists the names it did not
 recognize — that list is what to add to `EXERCISE_MUSCLE_GROUPS`.
 
+### A name that does not look right is flagged, not withheld
+
+The confidence gate is binary: a set is either inserted or held back for review.
+That leaves a gap. A name can be perfectly extractable and still be wrong —
+`Bech Press` reads cleanly, scores well, and quietly becomes a second exercise
+alongside `Chest Bench Press`, splitting one lift's history in two. Nothing in
+the confidence path notices, because nothing about the extraction was uncertain.
+
+So there is a third outcome between "inserted" and "held back": **inserted, with
+an amber flag**. `NameFlag` never withholds data. It is raised only when a name
+creates a *new* exercise, because that is the moment a bad name becomes a
+permanent row — re-logging something that already exists is not suspicious, and
+a flag that nags about it would be ignored within a week.
+
+Three checks, in descending order of damage, at most one reported per name:
+
+| Reason | Means | Why it matters |
+|---|---|---|
+| `near_miss` | Scored 70–85 against an existing exercise *and* the difference reads as a misspelling | The history is now split across two rows, and every later chart inherits the split |
+| `weak_grounding` | The name is under 80% similar to the text it was read from | The model may have inferred the name rather than read it |
+| `unrecognized` | No muscle-group table, muscle word or movement verb knows it | Either genuinely niche and worth adding to `muscle_groups.py`, or not an exercise |
+
+The whole design problem is silence. A flag that fires on ordinary lifts gets
+ignored, and then the real ones are invisible too — so `near_miss` distinguishes
+a misspelling from a variation before it fires. Shared tokens are paired off,
+then leftovers are matched by character similarity; only tokens that find no
+partner are allowed to be equipment qualifiers. That is what lets `Bech Press`
+flag against `Chest Bench Press` (the spare `chest` is a qualifier) while
+`Incline Bench Press` stays silent (the spare `incline` is not) — which has to
+hold, because `QUALIFIER_TOKENS` above already documents `incline` as marking a
+genuinely different movement. Qualifiers are pointedly not stripped up front:
+that would delete the partner a typo *inside* one (`Shoulderr Press`) needs to
+be compared against.
+
+Two consequences worth knowing. A typo scoring at or above 85 is never flagged,
+because the matcher already merged it and no history was split. And
+`weak_grounding` forgives equipment the model added to a name the text wrote
+bare (`Barbell Hack Squat` from "hack squat"), since the matcher forgives it
+too. Across a 41-exercise programme built from scratch, nothing flags.
+
+Tunable via `NEAR_MISS_FLOOR` and `WEAK_GROUNDING_SIMILARITY`.
+
 ### Cheat reps are counted, not flagged
 
 Entries like `Lateral raises 7.5kg 10 reps 3 were cheat` mean three reps *inside*
@@ -538,6 +580,10 @@ first request after a long gap can be slow.
 - Set `DATABASE_URL`, `GROQ_API_KEY`, `APP_USERNAME`, `APP_PASSWORD` and
   `LOCAL_TIMEZONE` in Project Settings → Environment Variables (`.env` is
   gitignored, so it is not deployed)
+- `LOCAL_TIMEZONE` is not optional in practice. Vercel's containers run on UTC,
+  and it is what decides which day — and therefore which week — a session is
+  filed under. Leave it unset and a workout logged late at night is dated a day
+  early; on a Sunday night that puts it in the previous week's volume
 - `vercel.json` pins `maxDuration` to 60s, which covers a Groq call plus inserts
 
 Use the Supabase **transaction pooler (port 6543)** rather than session mode
@@ -579,16 +625,18 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-666 tests, no network and no database required — they cover the Stage A
+713 tests, no network and no database required — they cover the Stage A
 rule branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold), `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
-resolution and JSON-mode retry behaviour, the muscle-group tables and how their answer is suggested and overridden — both their
-resolution cases and mechanical guards that every key is in the normalized form
-lookup actually produces — and the review screen's draft/edit/save round trip.
-These are pure functions, so they are cheap to cover, and they are exactly the
-code where a silent bug produces a wrong training recommendation, or a saved row
-that does not match what was on screen, and nobody notices.
+resolution and JSON-mode retry behaviour, the muscle-group tables and how their
+answer is suggested and overridden — both their resolution cases and mechanical
+guards that every key is in the normalized form lookup actually produces — the
+name flag, most of whose tests assert that ordinary lifts and real variations
+stay silent, and the review screen's draft/edit/save round trip. These are pure
+functions, so they are cheap to cover, and they are exactly the code where a
+silent bug produces a wrong training recommendation, or a saved row that does
+not match what was on screen, and nobody notices.
 
 ## Not built (by design)
 
