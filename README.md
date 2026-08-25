@@ -101,9 +101,22 @@ python migrate_multi_user.py               # apply
 ```
 
 It creates the tables and columns accounts need, then hands everything already
-logged to one owner account built from `APP_USERNAME` / `APP_PASSWORD` — so you
-carry on logging in with the credentials you already use, and your history is
-where you left it. Anyone else registers at `/signup`. Re-running it is a no-op.
+logged to one owner account built from `APP_USERNAME` / `APP_PASSWORD`, so your
+history is where you left it. Anyone else registers at `/signup`. Re-running it
+is a no-op.
+
+Your old credentials carry over **only if they satisfy the account rules**,
+which are stricter than the string comparison they used to face: a username of
+3–32 characters made of letters, numbers, dots, dashes and underscores, not one
+of the reserved names (`admin`, `root`, `me`, `api`, `system`, and the route
+names), and a password of at least 8 characters. `APP_USERNAME=admin` or a short
+password stops the migration with `Owner credentials rejected` before it changes
+anything. Pick different ones for the owner account and pass them explicitly —
+the data still lands there, you just sign in with the new pair:
+
+```bash
+python migrate_multi_user.py --username sohaib --password '...'
+```
 
 Without a Python environment against that database — a Supabase or Neon SQL
 console, say — paste `migrations/002_multi_user.sql` in as it stands. It takes
@@ -151,14 +164,16 @@ Or from the command line, where every write has to say whose it is:
 python manage_users.py create alice                                 # prompts for a password
 python manage_users.py list                                         # id, username, sets, timezone
 
-python parse_workout_log.py sample_entry.txt 2026-08-14 --dry-run   # no writes, no account needed
+python parse_workout_log.py sample_entry.txt 2026-08-14 --user alice --dry-run  # no writes
 python parse_workout_log.py sample_entry.txt 2026-08-14 --user alice
 
 python seed_sample_data.py --user alice --reset   # three weeks of sample data
 ```
 
 `--reset` clears only that account's rows, so seeding a demo user cannot wipe
-real training. `--user` defaults to `$APP_USERNAME` when it is set.
+real training. `--user` defaults to `$APP_USERNAME` when it is set, and is
+resolved before anything else runs — including `--dry-run`, which writes nothing
+but still asks which account it is standing in for.
 
 Stuck on configuration? `--check-config` reports where every setting is coming
 from and tests both connections, without printing a secret:
@@ -203,10 +218,19 @@ draft:
 result = pipeline.commit_draft(draft, user.user_id, engine=get_engine(), ...)
 ```
 
-`user_id` is a **required positional** parameter on every function that reads or
-writes training data — no default, anywhere. A default would have to pick an
-account, and the account it picks is wrong for everyone else. Calling
-`commit_draft(draft)` is a `TypeError`, not a silent write to user 1.
+`user_id` is a **required positional** parameter on every function in
+`pipeline.py` and `insights.py` that reads or writes training data — no default
+on any of them. A default would have to pick an account, and the account it
+picks is wrong for everyone else. Calling `commit_draft(draft)` is a
+`TypeError`, not a silent write to user 1.
+
+There is exactly one deliberate exception, and it is not in either of those
+modules: `backfill_muscle_groups.backfill` takes `user_id=None` meaning *every
+account*. It is a maintenance script that fills `NULL` muscle groups from a
+static lookup table, so the value it writes comes from the table rather than
+from anybody's data, and a row that already has a group is never touched.
+`--user` narrows it when you want that. Nothing else defaults, and nothing on
+the request path defaults at all.
 
 The sharpest edge is `delete_entries_for_date`, which backs the **Replace**
 option. Unscoped, one person correcting Tuesday's entry would clear Tuesday for
