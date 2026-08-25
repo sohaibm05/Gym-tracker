@@ -12,6 +12,8 @@ services:
         sync: false
       - key: DATABASE_URL
         sync: false
+      # Only read by migrate_multi_user.py and the CLI scripts. Logins go
+      # through the `users` table; nobody authenticates against these.
       - key: APP_USERNAME
         sync: false
       - key: APP_PASSWORD
@@ -22,3 +24,7 @@ services:
         value: UTC
       - key: PAIN_SAFEGUARD_ENABLED
         value: "true"
+      - key: PBKDF2_ITERATIONS
+        value: "600000"
+      - key: SESSION_TTL_DAYS
+        value: "30"

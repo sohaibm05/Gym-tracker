@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """CLI entry point: parse a journal text file into Postgres.
 
-    python parse_workout_log.py <file> <date>
+    python parse_workout_log.py <file> <date> --user <username>
 
-`<date>` is the session date in YYYY-MM-DD. All extraction, validation and
-insert logic lives in pipeline.py — this script only handles argument parsing
-and printing.
+`<date>` is the session date in YYYY-MM-DD. `--user` says whose training this
+is; the database is multi-user, so there is no default account and every row
+written here belongs to exactly one of them. Times are resolved in that user's
+timezone, falling back to LOCAL_TIMEZONE.
+
+All extraction, validation and insert logic lives in pipeline.py — this script
+only handles argument parsing and printing.
 """
 
 from __future__ import annotations
@@ -28,6 +32,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Text file containing the journal entry")
     parser.add_argument("date", nargs="?", help="Session date, YYYY-MM-DD")
     parser.add_argument(
+        "--user",
+        help="Username to log against (default: $APP_USERNAME). "
+             "List accounts with: python manage_users.py list",
+    )
+    parser.add_argument(
         "--check-config",
         action="store_true",
         help="Report where each setting comes from, test the connections, and exit",
@@ -46,8 +55,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _local_time_label(workout_set, session_date: date) -> str:
-    """Resolved wall-clock time for a set, in LOCAL_TIMEZONE.
+def _local_time_label(workout_set, session_date: date, zone_name: str = "") -> str:
+    """Resolved wall-clock time for a set, in the user's zone.
 
     Prefixed with "~" when the text carried no usable time marker and the
     default session hour was applied, so a missed "4:35" is visible.
@@ -56,7 +65,7 @@ def _local_time_label(workout_set, session_date: date) -> str:
 
     # Read the zone once and use it for both the resolve and the display, so the
     # two can never disagree.
-    zone_name = pipeline.LOCAL_TIMEZONE
+    zone_name = zone_name or pipeline.LOCAL_TIMEZONE
     resolved = pipeline.resolve_logged_at(
         workout_set.logged_at_local, session_date, zone_name
     )
@@ -65,7 +74,9 @@ def _local_time_label(workout_set, session_date: date) -> str:
     return f"{prefix}{local:%H:%M}"
 
 
-def format_set_line(workout_set, confidence: float, session_date: date) -> str:
+def format_set_line(
+    workout_set, confidence: float, session_date: date, zone_name: str = ""
+) -> str:
     """One dry-run line: verdict, confidence, resolved time, load, reps, flags."""
     verdict = "INSERT" if confidence >= pipeline.CONFIDENCE_THRESHOLD else "REVIEW"
     weight = f"{workout_set.weight_kg:g}kg" if workout_set.weight_kg is not None else "?kg"
@@ -85,7 +96,7 @@ def format_set_line(workout_set, confidence: float, session_date: date) -> str:
         flags += "  (PAIN)"
 
     return (
-        f"  [{verdict}] {confidence:.2f}  {_local_time_label(workout_set, session_date):>6}  "
+        f"  [{verdict}] {confidence:.2f}  {_local_time_label(workout_set, session_date, zone_name):>6}  "
         f"{workout_set.exercise_name:<28} {detail}{flags}"
     )
 
@@ -98,6 +109,8 @@ def _parse_date(value: str) -> date:
         raise SystemExit(2)
 
 
+# APP_USERNAME / APP_PASSWORD are still listed because the migration and the
+# --user default read them, but nobody logs into the web app with them any more.
 SETTINGS = [
     ("DATABASE_URL", True),
     ("GROQ_API_KEY", True),
@@ -209,6 +222,22 @@ def check_config() -> int:
         except Exception as exc:  # noqa: BLE001 - surface whatever failed
             report("database connection", False, str(exc).strip().splitlines()[0])
 
+        # Accounts are the thing most likely to be missing on a database that
+        # was set up before this app had them.
+        try:
+            import auth as _auth
+
+            with pipeline.get_engine().connect() as conn:
+                accounts = _auth.user_count(conn)
+            report("accounts table", True, f"{accounts} account(s)")
+            if accounts == 0:
+                print("         note: nobody has registered yet - open /signup, or "
+                      "run: python manage_users.py create <username>")
+        except Exception as exc:  # noqa: BLE001
+            report("accounts table", False,
+                   f"{str(exc).strip().splitlines()[0]} "
+                   "- run: python migrate_multi_user.py")
+
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         report("GROQ_API_KEY set", False, "not set")
@@ -239,6 +268,40 @@ def check_config() -> int:
     return 0 if ok else 1
 
 
+def _resolve_user(username: str | None):
+    """Look up the account to log against, or explain what to do instead.
+
+    There is no implicit account: writing a set without saying whose it is would
+    have to pick one, and picking the wrong one files somebody else's training
+    under your name.
+    """
+    username = username or os.getenv("APP_USERNAME") or ""
+    if not username:
+        print(
+            "Which user? Pass --user <username>, or set APP_USERNAME.\n"
+            "List accounts with: python manage_users.py list",
+            file=sys.stderr,
+        )
+        return None
+
+    import auth
+
+    with pipeline.get_engine().connect() as conn:
+        user = auth.get_user_by_username(conn, username)
+
+    if user is None:
+        print(
+            f"No account named {username!r}. "
+            "List accounts with: python manage_users.py list",
+            file=sys.stderr,
+        )
+        return None
+    if not user.is_active:
+        print(f"Account {user.username!r} is suspended.", file=sys.stderr)
+        return None
+    return user
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(
@@ -257,20 +320,27 @@ def main(argv: list[str] | None = None) -> int:
         print(f"No such file: {args.file}", file=sys.stderr)
         return 2
 
+    user = _resolve_user(args.user)
+    if user is None:
+        return 2
+
     session_date = _parse_date(args.date)
     raw_text = args.file.read_text(encoding="utf-8").strip()
     if not raw_text:
         print(f"{args.file} is empty — nothing to parse.", file=sys.stderr)
         return 2
 
+    zone = user.timezone or pipeline.LOCAL_TIMEZONE
+
     if args.dry_run:
         payload = pipeline.extract_entities(raw_text, session_date)
         scored_sets, scored_bodyweight, review = pipeline.validate_extraction(payload, raw_text)
         print(f"Dry run — nothing inserted. Session date: {session_date}")
-        print(f"Times shown in {pipeline.LOCAL_TIMEZONE}; \"~\" means no time marker "
+        print(f"User: {user.username}")
+        print(f"Times shown in {zone}; \"~\" means no time marker "
               f"in the text, so the default hour was used.\n")
         for workout_set, confidence in scored_sets:
-            print(format_set_line(workout_set, confidence, session_date))
+            print(format_set_line(workout_set, confidence, session_date, zone))
         if scored_bodyweight:
             entry, confidence = scored_bodyweight
             verdict = "INSERT" if confidence >= pipeline.CONFIDENCE_THRESHOLD else "REVIEW"
@@ -279,11 +349,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  [REVIEW] {item.kind}: {item.reason}")
         return 0
 
-    result = pipeline.process_entry(raw_text, session_date, replace_existing=args.replace)
+    result = pipeline.process_entry(
+        raw_text,
+        session_date,
+        user.user_id,
+        replace_existing=args.replace,
+        timezone_name=user.timezone,
+    )
 
     if result.error:
         print(f"Error: {result.error}", file=sys.stderr)
 
+    print(f"User         : {user.username}")
     print(f"Session date : {session_date}")
     if result.replaced:
         print(f"Replaced     : removed {result.replaced['sets']} set(s), "
