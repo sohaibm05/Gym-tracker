@@ -569,9 +569,14 @@ class FakeEngine:
         return [params for params in self.log if "extraction_confidence" in params]
 
 
-def commit(draft, engine=None, **kwargs):
+# Any id works against FakeEngine; what matters is that the write path now
+# demands one, so no row can be inserted without an owner.
+USER_ID = 1
+
+
+def commit(draft, engine=None, user_id=USER_ID, **kwargs):
     engine = engine or FakeEngine()
-    result = pipeline.commit_draft(draft, engine=engine, **kwargs)
+    result = pipeline.commit_draft(draft, user_id, engine=engine, **kwargs)
     return result, engine
 
 
@@ -675,9 +680,9 @@ class TestUnattendedPathIsUnchanged:
 
     def test_a_low_score_is_held_back_for_review(self, monkeypatch):
         monkeypatch.setattr(pipeline, "extract_entities", lambda *a, **k: PAYLOAD)
-        monkeypatch.setattr(pipeline, "load_exercise_names", lambda conn: {})
+        monkeypatch.setattr(pipeline, "load_exercise_names", lambda conn, user_id: {})
         engine = FakeEngine()
-        result = pipeline.process_entry(RAW_ENTRY, SESSION, engine=engine)
+        result = pipeline.process_entry(RAW_ENTRY, SESSION, USER_ID, engine=engine)
         assert result.inserted_sets == 1
         assert len(result.review_items) == 2
         assert all("below threshold" in item.reason for item in result.review_items)
@@ -685,6 +690,6 @@ class TestUnattendedPathIsUnchanged:
     def test_an_invalid_row_is_reported_the_same_way_as_before(self, monkeypatch):
         payload = {"sets": [{"exercise_name": "Bench", "reps": "eleven"}], "bodyweight": None}
         monkeypatch.setattr(pipeline, "extract_entities", lambda *a, **k: payload)
-        monkeypatch.setattr(pipeline, "load_exercise_names", lambda conn: {})
-        result = pipeline.process_entry(RAW_ENTRY, SESSION, engine=FakeEngine())
+        monkeypatch.setattr(pipeline, "load_exercise_names", lambda conn, user_id: {})
+        result = pipeline.process_entry(RAW_ENTRY, SESSION, USER_ID, engine=FakeEngine())
         assert result.review_items[0].reason.startswith("failed validation:")
