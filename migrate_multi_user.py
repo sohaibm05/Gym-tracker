@@ -11,9 +11,13 @@ that the owner logs in with the same credentials as before, and anyone else can
 register their own account at /signup.
 
 The statements themselves live in migrations/002_multi_user.sql, which is the
-single source of truth for the shape of the change; this script only supplies
-the owner id, runs each statement in its own transaction, and skips the ones
-already applied so a re-run is a no-op.
+single source of truth for the shape of the change and is idempotent on its
+own; this script only creates the owner account, names it to the migration,
+and runs each statement in its own transaction. A re-run is a no-op.
+
+That file can also be pasted straight into psql or a SQL console - see its
+header - which is why the owner is named through a setting rather than
+substituted into the SQL here.
 """
 
 from __future__ import annotations
@@ -33,32 +37,49 @@ import pipeline  # noqa: E402
 
 MIGRATION = Path(__file__).resolve().parent / "migrations" / "002_multi_user.sql"
 
-_ADD_CONSTRAINT = re.compile(
-    r"ALTER TABLE\s+(?P<table>\w+)\s+ADD CONSTRAINT\s+(?P<name>\w+)", re.IGNORECASE
-)
+# The migration reads the owner's username from this setting, set for the
+# transaction the statement that needs it runs in.
+OWNER_SETTING = "gym_tracker.owner_username"
+
+# $$ ... $$ or $tag$ ... $tag$, which is what a PL/pgSQL block in the migration
+# is wrapped in.
+_DOLLAR_QUOTE = re.compile(r"\$\w*\$")
 
 
 def statements(sql: str) -> list[str]:
-    """Split the migration into executable statements, comments removed."""
+    """Split the migration into executable statements, comments removed.
+
+    A semicolon inside a dollar-quoted body belongs to the PL/pgSQL block it is
+    written in, not to the migration, so splitting has to skip over those
+    bodies whole - otherwise a DO block arrives at the server in pieces.
+    """
     without_comments = "\n".join(
         line for line in sql.splitlines() if not line.lstrip().startswith("--")
     )
-    return [part.strip() for part in without_comments.split(";") if part.strip()]
 
+    parts: list[str] = []
+    start = position = 0
+    tag: str | None = None
+    while position < len(without_comments):
+        if tag is None:
+            opening = _DOLLAR_QUOTE.match(without_comments, position)
+            if opening:
+                tag = opening.group(0)
+                position = opening.end()
+            elif without_comments[position] == ";":
+                parts.append(without_comments[start:position])
+                position += 1
+                start = position
+            else:
+                position += 1
+        elif without_comments.startswith(tag, position):
+            position += len(tag)
+            tag = None
+        else:
+            position += 1
+    parts.append(without_comments[start:])
 
-def constraint_exists(conn, table: str, name: str) -> bool:
-    return bool(
-        conn.execute(
-            text(
-                """
-                SELECT 1 FROM pg_constraint c
-                JOIN pg_class t ON t.oid = c.conrelid
-                WHERE t.relname = :table AND c.conname = :name
-                """
-            ),
-            {"table": table, "name": name},
-        ).scalar()
-    )
+    return [part.strip() for part in parts if part.strip()]
 
 
 def table_exists(conn, table: str) -> bool:
@@ -129,31 +150,24 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     owner = None
-    applied = skipped = 0
     for part in parts:
-        match = _ADD_CONSTRAINT.search(part)
-        if match:
-            with engine.connect() as conn:
-                if constraint_exists(conn, match["table"], match["name"]):
-                    skipped += 1
-                    continue
-
-        # The owner is created the moment a statement first needs its id, which
-        # is the backfill. It cannot be created any earlier: the CREATE TABLE
-        # that gives it somewhere to live is one of the statements above it.
-        if ":owner_id" in part and owner is None:
+        # The owner is created the moment a statement first asks who it is,
+        # which is the backfill. It cannot be created any earlier: the CREATE
+        # TABLE that gives it somewhere to live is one of the statements above.
+        names_owner = OWNER_SETTING in part
+        if names_owner and owner is None:
             owner = ensure_owner(engine, username, password)
 
         # One transaction per statement: a step that has already been applied
-        # must not roll back the ones before it.
+        # must not roll back the ones before it. The setting is transaction
+        # local, so it is set inside the same one the statement runs in.
         with engine.begin() as conn:
-            conn.execute(text(part), {"owner_id": owner.user_id if owner else None})
-        applied += 1
-
-    if owner is None:
-        # Every backfill statement was a no-op, which means a previous run
-        # already did them. Find the account so the summary can still report.
-        owner = ensure_owner(engine, username, password)
+            if names_owner:
+                conn.execute(
+                    text("SELECT set_config(:name, :value, true)"),
+                    {"name": OWNER_SETTING, "value": owner.username},
+                )
+            conn.execute(text(part))
 
     with engine.connect() as conn:
         counts = {
@@ -164,7 +178,7 @@ def main(argv: list[str] | None = None) -> int:
             for table in ("exercises", "workout_logs", "bodyweight_logs", "weekly_reports")
         }
 
-    print(f"\nApplied {applied} statement(s), skipped {skipped} already in place.")
+    print(f"\nRan {len(parts)} statement(s) from {MIGRATION.name}.")
     print(f"Owned by {owner.username!r}:")
     for table, count in counts.items():
         print(f"  {table:<16} {count}")

@@ -91,8 +91,9 @@ psql "$DATABASE_URL" -f migrations/001_add_cheat_reps.sql
 ```
 
 **Upgrading a database that predates accounts** — do *not* run `schema.sql` over
-it. Run the migration script instead, which needs Python because it has to hash
-the owner's password:
+it. Run the migration script instead, which creates the owner account for you
+(Python, because the password has to be hashed) and then applies
+`migrations/002_multi_user.sql`:
 
 ```bash
 python migrate_multi_user.py --dry-run     # print the statements, change nothing
@@ -103,6 +104,23 @@ It creates the tables and columns accounts need, then hands everything already
 logged to one owner account built from `APP_USERNAME` / `APP_PASSWORD` — so you
 carry on logging in with the credentials you already use, and your history is
 where you left it. Anyone else registers at `/signup`. Re-running it is a no-op.
+
+Without a Python environment against that database — a Supabase or Neon SQL
+console, say — paste `migrations/002_multi_user.sql` in as it stands. It takes
+the single account already in `users` as the owner. When there is none yet, or
+more than one, name the owner first, in the same session, and hash the password
+with the application's own hasher (the login form rejects anything else):
+
+```bash
+python -c "import auth; print(auth.hash_password('YOUR-PASSWORD'))"
+```
+
+```sql
+SELECT set_config('gym_tracker.owner_username',      'sohaib', false);
+SELECT set_config('gym_tracker.owner_password_hash', 'pbkdf2_sha256$600000$...', false);
+SELECT set_config('gym_tracker.owner_timezone',      'Asia/Karachi', false);  -- optional
+-- then the contents of migrations/002_multi_user.sql
+```
 
 **Supabase:** enable RLS on every table. The app connects as the table owner so
 it bypasses RLS, but Supabase auto-exposes a REST API over the `public` schema to
