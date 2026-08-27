@@ -73,7 +73,7 @@ ALTER TABLE weekly_reports  ADD COLUMN IF NOT EXISTS user_id INTEGER;
 -- A database whose rows all have an owner already needs none of this and asks
 -- for nothing, which is what keeps the second run quiet.
 
-DO $owner$
+DO $$
 DECLARE
     typed_name    text    := trim(coalesce(current_setting('gym_tracker.owner_username', true), ''));
     wanted        text    := lower(typed_name);
@@ -115,11 +115,13 @@ BEGIN
         END IF;
     END IF;
 
-    SELECT EXISTS (SELECT 1 FROM exercises       WHERE user_id IS NULL)
-        OR EXISTS (SELECT 1 FROM workout_logs    WHERE user_id IS NULL)
-        OR EXISTS (SELECT 1 FROM bodyweight_logs WHERE user_id IS NULL)
-        OR EXISTS (SELECT 1 FROM weekly_reports  WHERE user_id IS NULL)
-      INTO unowned;
+    -- An assignment, not SELECT ... INTO: the INTO form reads as a plain-SQL
+    -- CREATE TABLE AS to anything that sees this line outside the block, which
+    -- is exactly what a tool that mis-splits the file does to it.
+    unowned :=  EXISTS (SELECT 1 FROM exercises       WHERE user_id IS NULL)
+             OR EXISTS (SELECT 1 FROM workout_logs    WHERE user_id IS NULL)
+             OR EXISTS (SELECT 1 FROM bodyweight_logs WHERE user_id IS NULL)
+             OR EXISTS (SELECT 1 FROM weekly_reports  WHERE user_id IS NULL);
 
     IF NOT unowned THEN
         -- Either a re-run, or a database with nothing in it yet. Nothing to
@@ -150,7 +152,7 @@ BEGIN
 
     RAISE NOTICE 'Rows without an owner now belong to user_id %.', owner_id;
 END
-$owner$;
+$$;
 
 -- --- 4. Lock it down ------------------------------------------------------
 -- A no-op on a column that is already NOT NULL, so this survives a re-run.
@@ -164,7 +166,7 @@ ALTER TABLE weekly_reports  ALTER COLUMN user_id SET NOT NULL;
 -- Postgres has no ADD CONSTRAINT IF NOT EXISTS, so each one is added only when
 -- the catalogue says it is missing.
 
-DO $fks$
+DO $$
 DECLARE
     target text;
 BEGIN
@@ -182,7 +184,7 @@ BEGIN
         END IF;
     END LOOP;
 END
-$fks$;
+$$;
 
 -- --- 6. Uniqueness becomes per-user ---------------------------------------
 -- An exercise name is unique within an account, not across the deployment;
@@ -198,7 +200,7 @@ ALTER TABLE weekly_reports DROP CONSTRAINT IF EXISTS weekly_reports_week_start_d
 DROP INDEX IF EXISTS exercises_name_key;
 DROP INDEX IF EXISTS weekly_reports_week_start_date_key;
 
-DO $uniques$
+DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
@@ -216,7 +218,7 @@ BEGIN
             ADD CONSTRAINT weekly_reports_user_week_unique UNIQUE (user_id, week_start_date);
     END IF;
 END
-$uniques$;
+$$;
 
 -- --- 7. Indexes, now user-first -------------------------------------------
 

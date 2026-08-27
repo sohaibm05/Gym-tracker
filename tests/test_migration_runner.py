@@ -10,6 +10,7 @@ each fragment reaches the server as nonsense.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -58,9 +59,9 @@ class TestTheMigrationFile:
 
     def test_every_block_is_closed(self):
         for part in migrate_multi_user.statements(MIGRATION_SQL):
-            if part.startswith("DO $"):
-                tag = part[3 : part.index("$", 3) + 1]
-                assert part.endswith(tag), f"unterminated block: {part[:80]}"
+            opening = re.match(r"DO (\$\w*\$)", part)
+            if opening:
+                assert part.endswith(opening.group(1)), f"unterminated: {part[:80]}"
 
     def test_the_owner_is_named_through_the_setting_the_runner_sets(self):
         naming = [
