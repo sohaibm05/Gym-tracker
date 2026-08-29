@@ -3,6 +3,11 @@
 Turns messy free-text gym journal entries into structured Postgres rows, and
 generates a weekly progress report on top of them.
 
+Several people can share one deployment. Everyone registers their own account
+at `/signup`, and every query the app makes is filtered by the account you are
+signed in as — training, exercises, bodyweight and reports are all private to
+the person who logged them.
+
 You keep logging in your phone's Notes app exactly as you do now — typos,
 voice-to-text run-ons, times like "6:20ish", commentary like "almost died" —
 then paste the text into a small web form. The pipeline extracts the sets,
@@ -17,6 +22,7 @@ here; the schema is just shaped for it.
 
 ```
 Notes app (unchanged)
+  -> sign in                                   app.py            POST /login
   -> paste into the mobile web form            app.py            POST /log
   -> Groq extraction, JSON mode, 1 retry       pipeline.extract_entities
   -> Pydantic validation + computed score      pipeline.build_draft
@@ -27,6 +33,7 @@ Notes app (unchanged)
   -> rescored against what you actually typed  review.draft_from_form
   -> fuzzy match against existing exercises    pipeline.find_matching_exercise
   -> parameterized INSERT into Postgres        pipeline.commit_draft
+       every row carries the user_id from your session cookie
   -> Power BI reads Postgres directly (later, not part of this build)
 ```
 
@@ -38,9 +45,12 @@ below the confidence threshold is reported rather than saved
 
 | File | What it is |
 |---|---|
-| `schema.sql` | Postgres schema: `exercises`, `workout_logs`, `bodyweight_logs`, `weekly_reports` |
+| `schema.sql` | Postgres schema: `users`, `user_sessions`, `exercises`, `workout_logs`, `bodyweight_logs`, `weekly_reports` |
+| `auth.py` | Accounts: password hashing, username rules, login sessions, rate limiting. No HTML, no FastAPI, opens no connections |
 | `pipeline.py` | All extraction / validation / insert logic. The CLI and web app both import this; neither reimplements any of it |
-| `parse_workout_log.py` | CLI: `python parse_workout_log.py <file> <date>` |
+| `parse_workout_log.py` | CLI: `python parse_workout_log.py <file> <date> --user <name>` |
+| `manage_users.py` | Admin CLI: list / create / passwd / timezone / suspend / restore / delete accounts |
+| `migrate_multi_user.py` | One-off: upgrades a single-user database to accounts, moving what it already holds onto an owner account |
 | `app.py` | FastAPI web app — the phone-facing form, plus the weekly-report button |
 | `review.py` | The review screen: renders a draft as an editable form, reads the submission back, and adds empty slots on request |
 | `insights.py` | Weekly report. Stage A computes every number; Stage B only writes prose |
@@ -48,7 +58,7 @@ below the confidence threshold is reported rather than saved
 | `muscle_groups.py` | Static exercise-name -> primary muscle group tables and lookup |
 | `seed_sample_data.py` | Seeds three weeks of realistic data so the report can be tried out |
 | `backfill_muscle_groups.py` | One-off: fills `muscle_group` for exercises logged before the lookup existed |
-| `tests/` | Unit tests for the Stage A rules and the confidence / fuzzy-match logic |
+| `tests/` | Unit tests for the Stage A rules, the confidence / fuzzy-match logic, passwords and sessions, and per-account isolation |
 | `sample_entry.txt` | A messy journal entry in the real style, for trying the CLI |
 
 ## Setup
@@ -80,12 +90,48 @@ setup. They are additive and re-runnable:
 psql "$DATABASE_URL" -f migrations/001_add_cheat_reps.sql
 ```
 
-**Supabase:** enable RLS on all four tables. The app connects as the table owner
-so it bypasses RLS, but Supabase auto-exposes a REST API over the `public`
-schema to the anon key, and without RLS that key can read and delete your data.
-No policies are needed — RLS on with zero policies denies the API entirely:
+**Upgrading a database that predates accounts** — do *not* run `schema.sql` over
+it. Run the migration script instead, which creates the owner account for you
+(Python, because the password has to be hashed) and then applies
+`migrations/002_multi_user.sql`:
+
+```bash
+python migrate_multi_user.py --dry-run     # print the statements, change nothing
+python migrate_multi_user.py               # apply
+```
+
+It creates the tables and columns accounts need, then hands everything already
+logged to one owner account built from `APP_USERNAME` / `APP_PASSWORD` — so you
+carry on logging in with the credentials you already use, and your history is
+where you left it. Anyone else registers at `/signup`. Re-running it is a no-op.
+
+Without a Python environment against that database — a Supabase or Neon SQL
+console, say — paste `migrations/002_multi_user.sql` in as it stands. It takes
+the single account already in `users` as the owner. When there is none yet, or
+more than one, name the owner first, in the same session, and hash the password
+with the application's own hasher (the login form rejects anything else):
+
+```bash
+python -c "import auth; print(auth.hash_password('YOUR-PASSWORD'))"
+```
 
 ```sql
+SELECT set_config('gym_tracker.owner_username',      'sohaib', false);
+SELECT set_config('gym_tracker.owner_password_hash', 'pbkdf2_sha256$600000$...', false);
+SELECT set_config('gym_tracker.owner_timezone',      'Asia/Karachi', false);  -- optional
+-- then the contents of migrations/002_multi_user.sql
+```
+
+**Supabase:** enable RLS on every table. The app connects as the table owner so
+it bypasses RLS, but Supabase auto-exposes a REST API over the `public` schema to
+the anon key, and without RLS that key can read and delete your data. With
+accounts in the picture it would also expose password hashes and live session
+tokens, so `users` and `user_sessions` matter most of all. No policies are needed
+— RLS on with zero policies denies the API entirely:
+
+```sql
+ALTER TABLE users           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_sessions   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE exercises       ENABLE ROW LEVEL SECURITY;
 ALTER TABLE workout_logs    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE bodyweight_logs ENABLE ROW LEVEL SECURITY;
@@ -95,12 +141,24 @@ ALTER TABLE weekly_reports  ENABLE ROW LEVEL SECURITY;
 ### Try it
 
 ```bash
-python parse_workout_log.py sample_entry.txt 2026-08-14 --dry-run   # no writes
-python parse_workout_log.py sample_entry.txt 2026-08-14
-
-python seed_sample_data.py --reset      # three weeks of sample data
 uvicorn app:app --reload                # then open http://127.0.0.1:8000
+                                        # and register at /signup
 ```
+
+Or from the command line, where every write has to say whose it is:
+
+```bash
+python manage_users.py create alice                                 # prompts for a password
+python manage_users.py list                                         # id, username, sets, timezone
+
+python parse_workout_log.py sample_entry.txt 2026-08-14 --dry-run   # no writes, no account needed
+python parse_workout_log.py sample_entry.txt 2026-08-14 --user alice
+
+python seed_sample_data.py --user alice --reset   # three weeks of sample data
+```
+
+`--reset` clears only that account's rows, so seeding a demo user cannot wipe
+real training. `--user` defaults to `$APP_USERNAME` when it is set.
 
 Stuck on configuration? `--check-config` reports where every setting is coming
 from and tests both connections, without printing a secret:
@@ -127,6 +185,63 @@ A leading `~` means the text carried no time marker and the default session hour
 was applied — which is how you spot a time the extraction missed.
 
 ## The decisions worth knowing about
+
+### Ownership comes from the session, never from the request
+
+There is no route anywhere that takes a user id from a query string, a form
+field or a header. Every route resolves the signed-in account from the session
+cookie, and that id is what reaches the data layer.
+
+This matters most at `POST /save`. The review screen round-trips the whole draft
+through hidden form fields, so everything the browser posts back is attacker-
+controlled by definition — you can edit it in devtools. If ownership travelled in
+that form, hand-editing one field would write into somebody else's account.
+So `commit_draft` takes `user_id` as an argument rather than reading it off the
+draft:
+
+```python
+result = pipeline.commit_draft(draft, user.user_id, engine=get_engine(), ...)
+```
+
+`user_id` is a **required positional** parameter on every function that reads or
+writes training data — no default, anywhere. A default would have to pick an
+account, and the account it picks is wrong for everyone else. Calling
+`commit_draft(draft)` is a `TypeError`, not a silent write to user 1.
+
+The sharpest edge is `delete_entries_for_date`, which backs the **Replace**
+option. Unscoped, one person correcting Tuesday's entry would clear Tuesday for
+every account on the deployment. `tests/test_multi_user.py` asserts that every
+statement touching an owned table names `user_id` in both the SQL and the bound
+parameters.
+
+### Exercises are per-user, not a shared catalogue
+
+`exercises` was `UNIQUE (name)`; it is now `UNIQUE (user_id, name)`.
+
+A shared catalogue looks tempting — one canonical "Bench Press" row, less
+duplication — but it breaks two things this app already does. Fuzzy matching
+compares a proposed name against everything known, so a shared table would let
+one person's typo merge into another person's lift. And the review screen lets
+you correct an exercise's muscle group, which with a shared row would silently
+refile it under everyone else's charts too.
+
+The cost is a duplicate row per person per lift. The benefit is that your filing
+decisions are yours.
+
+### Each account has its own timezone
+
+`LOCAL_TIMEZONE` decides which calendar day, and therefore which week, a session
+belongs to. With one user, one env var was the right answer. With several it
+would date a Karachi user's late-night session by London's midnight — and at a
+Sunday boundary that files it in the wrong week's volume entirely.
+
+So `users.timezone` overrides it per account, set at signup or under Account →
+Timezone, and `NULL` falls back to the deployment default. It is threaded to
+everything that converts between local and UTC: inserts, the day bounds behind
+Replace, the report window and the dashboard.
+
+Changing it does not move anything already logged. Stored timestamps are UTC and
+still mark the same instant; only the boundaries drawn around them move.
 
 ### The LLM does not produce any number in the report
 
@@ -565,17 +680,49 @@ A few decisions that are easy to get wrong:
 - **Parameterized SQL everywhere.** Every statement is `sqlalchemy.text()` with
   bound `:param` placeholders. No value — user-typed or model-generated — is ever
   formatted into a query string.
-- **Secrets are env vars only.** `GROQ_API_KEY`, `DATABASE_URL`, `APP_USERNAME`,
-  `APP_PASSWORD` are never hardcoded, never rendered to the page, never logged.
-  `.env` is gitignored; `.env.example` holds placeholders only.
-- **HTTP Basic Auth** on every route except `/healthz`, compared with
-  `secrets.compare_digest`. Basic Auth credentials are base64, not encrypted, so
-  this is **only safe over HTTPS** — Render terminates TLS by default, but confirm
-  your deployed URL is `https://` before relying on it. The app logs a warning on
-  any non-local request that arrives over plain HTTP.
+- **Secrets are env vars only.** `GROQ_API_KEY` and `DATABASE_URL` are never
+  hardcoded, never rendered to the page, never logged. `.env` is gitignored;
+  `.env.example` holds placeholders only. Account passwords are not env vars at
+  all — they live in `users.password_hash`, hashed.
+- **Passwords are PBKDF2-HMAC-SHA256**, 600,000 rounds by default, with a
+  16-byte salt per user. The cost factor is stored inside each hash, so raising
+  `PBKDF2_ITERATIONS` re-hashes people on their next login instead of locking
+  them out. A login attempt for a username that does not exist still runs one
+  full hash, so response time does not reveal which accounts are real.
+- **Sessions are opaque random tokens**, and only their SHA-256 is stored. A
+  database dump therefore cannot be replayed as a live login. The cookie is
+  `HttpOnly`, `SameSite=Lax`, and `Secure` whenever the request arrived over
+  HTTPS. Changing a password revokes every session for that account.
+- **`SameSite=Lax` is what stands in for a CSRF token.** Every form on the site
+  is a same-site POST, which Lax allows; the browser withholds the cookie on a
+  cross-site POST, so another origin cannot submit these forms on a signed-in
+  user's behalf.
+- **Login and signup are rate-limited** per client, 10 attempts per 5 minutes and
+  5 signups per hour. The counter is per-process, so a serverless deploy running
+  several instances allows a multiple of that — enough to make an unattended
+  guessing loop impractical, not enough to stop a targeted one.
+- **The login form does not say which half was wrong.** A wrong password and a
+  missing account give the same message, so the form cannot be used to test which
+  usernames exist.
+- **`?next=` is checked before redirecting.** Only a bare absolute path is
+  accepted, so the login page cannot be used to bounce someone to an attacker's
+  copy of it.
+- **HTTP Basic Auth still works for scripts**, checked against the `users` table
+  rather than an env var. Basic credentials are base64, not encrypted, so it is
+  **only safe over HTTPS** — Render terminates TLS by default, but confirm your
+  deployed URL is `https://` before relying on it. The app logs a warning on any
+  non-local Basic request that arrives over plain HTTP.
 - **Model output is escaped before it reaches the page.** Extracted exercise
   names are rendered through `html.escape`, so a name containing markup cannot
   inject anything.
+
+### What multi-user does not give you
+
+Isolation here is enforced in the application — every query filters on the
+`user_id` from the session — and by foreign keys, not by Postgres row-level
+security against a per-user database role. Anyone with the `DATABASE_URL` can
+read every account. That is the same trust boundary the single-user version had;
+it is worth saying out loud now that the data is no longer all yours.
 
 ## Deployment
 
@@ -588,13 +735,15 @@ first request after a long gap can be slow.
 `app` in `app.py`, so there is nothing to configure beyond environment variables.
 
 - Import the repo at vercel.com, accept the detected settings
-- Set `DATABASE_URL`, `GROQ_API_KEY`, `APP_USERNAME`, `APP_PASSWORD` and
-  `LOCAL_TIMEZONE` in Project Settings → Environment Variables (`.env` is
-  gitignored, so it is not deployed)
+- Set `DATABASE_URL`, `GROQ_API_KEY` and `LOCAL_TIMEZONE` in Project Settings →
+  Environment Variables (`.env` is gitignored, so it is not deployed).
+  `APP_USERNAME` / `APP_PASSWORD` are only needed if you are migrating an
+  existing single-user database; nobody logs in with them
 - `LOCAL_TIMEZONE` is not optional in practice. Vercel's containers run on UTC,
   and it is what decides which day — and therefore which week — a session is
   filed under. Leave it unset and a workout logged late at night is dated a day
-  early; on a Sunday night that puts it in the previous week's volume
+  early; on a Sunday night that puts it in the previous week's volume. It is now
+  only the *default*: each account can set its own under Account → Timezone
 - `vercel.json` pins `maxDuration` to 60s, which covers a Groq call plus inserts
 
 Use the Supabase **transaction pooler (port 6543)** rather than session mode
@@ -612,8 +761,8 @@ other serverless host.
 
 - Build: `pip install -r requirements.txt`
 - Start: `uvicorn app:app --host 0.0.0.0 --port $PORT`
-- Set `GROQ_API_KEY`, `DATABASE_URL`, `APP_USERNAME`, `APP_PASSWORD` in the
-  dashboard, plus any tuning vars from `.env.example`.
+- Set `GROQ_API_KEY` and `DATABASE_URL` in the dashboard, plus any tuning vars
+  from `.env.example`. Accounts are created at `/signup`, not here.
 
 Free instances spin down after 15 minutes idle and take 30–50s to wake. That is
 fine for personal use and is exactly why the duplicate-submission guard exists.
@@ -636,7 +785,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-741 tests, no network and no database required — they cover the Stage A
+866 tests, no network and no database required — they cover the Stage A
 rule branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold), `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
@@ -644,11 +793,21 @@ resolution and JSON-mode retry behaviour, the muscle-group tables and how their
 answer is suggested and overridden — both their resolution cases and mechanical
 guards that every key is in the normalized form lookup actually produces — the
 name flag, most of whose tests assert that ordinary lifts and real variations
-stay silent, the duplicate guard's day scoping and its two ways forward, and the
-review screen's draft/edit/save round trip. These are pure functions, so they are
-cheap to cover, and they are exactly the code where a silent bug produces a wrong
-training recommendation, or a saved row that does not match what was on screen,
-and nobody notices.
+stay silent, the duplicate guard's day and account scoping and its two ways
+forward, and the review screen's draft/edit/save round trip. These are pure
+functions, so they are cheap to cover, and they are exactly the code where a
+silent bug produces a wrong training recommendation, or a saved row that does
+not match what was on screen, and nobody notices.
+
+Two files cover accounts. `tests/test_auth.py` takes the password and session
+machinery — salting, the stored cost factor, malformed hashes never
+authenticating, username folding, the rate limiter's per-client keying.
+`tests/test_multi_user.py` takes isolation from both ends: it drives the
+database functions against a recording connection and asserts every statement
+touching an owned table names `user_id` in the SQL *and* binds it, then drives
+the app itself and asserts the id those functions receive always came from the
+session cookie — including that a `user_id` planted in the posted review form is
+ignored.
 
 ## Not built (by design)
 
@@ -659,3 +818,13 @@ and nobody notices.
   later upgrade.
 - **Power BI dashboards.** The schema is shaped for them; building them is not
   part of this.
+- **Password reset by email.** There is no mail transport in this stack and
+  adding one for a handful of users is not worth it. A forgotten password is
+  reset from the CLI: `python manage_users.py passwd <username>`.
+- **Sharing training between accounts** — a coach view, a shared program, a
+  leaderboard. Isolation is currently absolute, which is the safe default and
+  the easy thing to relax later. Nothing here reads across accounts.
+- **Postgres row-level security per user.** Isolation is enforced in the
+  application and by foreign keys. Real RLS would need a database role per user
+  and a connection that assumes it, which the pooled free-tier setup does not
+  make easy.

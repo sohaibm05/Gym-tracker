@@ -1,9 +1,16 @@
 -- Gym Tracker schema (Postgres / Supabase free tier)
 --
 -- Design notes:
+--   * Every row of training data belongs to exactly one row in `users`. There
+--     is no shared data and no global view: the application always filters by
+--     the logged-in user_id, and the foreign keys below make an orphaned row
+--     impossible. Deleting a user deletes their training with it.
+--   * `exercises` is per-user, not a shared catalogue. Two people can both have
+--     a "Lat Pulldown" filed under different muscle groups, and one person
+--     correcting their own filing cannot touch anyone else's.
 --   * All `logged_at` columns are timestamptz. The application converts local
---     wall-clock time (LOCAL_TIMEZONE env var) to UTC at insert time. This is a
---     single-user personal tool, so one fixed timezone is assumed throughout.
+--     wall-clock time to UTC at insert time, using the user's own timezone
+--     (users.timezone) and falling back to the LOCAL_TIMEZONE env var.
 --   * `raw_source` keeps the original journal text for every row so any parse
 --     can be audited or re-run later.
 --   * `extraction_confidence` is computed by the pipeline from checkable
@@ -11,19 +18,63 @@
 --     the LLM. Rows below CONFIDENCE_THRESHOLD are not inserted at all, so in
 --     practice stored values are >= that threshold.
 --   * Schema is shaped for direct Power BI consumption: narrow fact tables
---     (workout_logs, bodyweight_logs), one dimension table (exercises), and a
---     precomputed report table (weekly_reports).
+--     (workout_logs, bodyweight_logs), dimension tables (exercises, users), and
+--     a precomputed report table (weekly_reports).
 --
 -- Safe to re-run: every object is created IF NOT EXISTS.
+--
+-- Upgrading a database that predates accounts? Do not run this file — run
+-- `python migrate_multi_user.py`, which adds the tables and columns below to
+-- the existing one and moves the data you already have onto an owner account.
+
+CREATE TABLE IF NOT EXISTS users (
+    user_id       SERIAL PRIMARY KEY,
+    -- Lowercased. `display_name` keeps the capitalisation the person typed;
+    -- this column is what logins and the unique index compare against, so
+    -- "Sohaib" and "sohaib" cannot both be registered.
+    username      TEXT NOT NULL UNIQUE,
+    display_name  TEXT NOT NULL,
+    -- PBKDF2-HMAC-SHA256, `pbkdf2_sha256$iterations$salt$hash`. See auth.py.
+    password_hash TEXT NOT NULL,
+    -- IANA name. NULL means "use the deployment's LOCAL_TIMEZONE", which is
+    -- what decides the calendar day - and so the week - a session falls in.
+    timezone      TEXT,
+    is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_login_at TIMESTAMPTZ,
+
+    CONSTRAINT users_username_lowercase CHECK (username = lower(username))
+);
+
+-- Login sessions. Only the SHA-256 of each token is stored, so a database dump
+-- cannot be replayed as a live login.
+CREATE TABLE IF NOT EXISTS user_sessions (
+    token_hash   TEXT PRIMARY KEY,
+    user_id      INTEGER NOT NULL REFERENCES users (user_id) ON DELETE CASCADE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id
+    ON user_sessions (user_id);
+-- Supports the expiry sweep.
+CREATE INDEX IF NOT EXISTS idx_user_sessions_expires_at
+    ON user_sessions (expires_at);
 
 CREATE TABLE IF NOT EXISTS exercises (
     exercise_id  SERIAL PRIMARY KEY,
-    name         TEXT NOT NULL UNIQUE,
-    muscle_group TEXT
+    user_id      INTEGER NOT NULL REFERENCES users (user_id) ON DELETE CASCADE,
+    name         TEXT NOT NULL,
+    muscle_group TEXT,
+
+    -- Per-user, not global: the same lift name may exist once for each person.
+    CONSTRAINT exercises_user_name_unique UNIQUE (user_id, name)
 );
 
 CREATE TABLE IF NOT EXISTS workout_logs (
     log_id                BIGSERIAL PRIMARY KEY,
+    user_id               INTEGER NOT NULL REFERENCES users (user_id) ON DELETE CASCADE,
     exercise_id           INTEGER NOT NULL REFERENCES exercises (exercise_id),
     logged_at             TIMESTAMPTZ NOT NULL,
     weight_kg             NUMERIC(6, 2),
@@ -52,6 +103,7 @@ CREATE TABLE IF NOT EXISTS workout_logs (
 
 CREATE TABLE IF NOT EXISTS bodyweight_logs (
     log_id                BIGSERIAL PRIMARY KEY,
+    user_id               INTEGER NOT NULL REFERENCES users (user_id) ON DELETE CASCADE,
     logged_at             TIMESTAMPTZ NOT NULL,
     weight_kg             NUMERIC(5, 2) NOT NULL,
     body_fat_pct          NUMERIC(4, 1),
@@ -68,27 +120,31 @@ CREATE TABLE IF NOT EXISTS bodyweight_logs (
                OR (extraction_confidence >= 0 AND extraction_confidence <= 1))
 );
 
--- week_start_date is UNIQUE so regenerating a report for an already-computed
--- week is an upsert (ON CONFLICT ... DO UPDATE), never a duplicate row.
+-- (user_id, week_start_date) is UNIQUE so regenerating a report for an
+-- already-computed week is an upsert (ON CONFLICT ... DO UPDATE), never a
+-- duplicate row - and one person regenerating never overwrites another's.
 CREATE TABLE IF NOT EXISTS weekly_reports (
     report_id       SERIAL PRIMARY KEY,
-    week_start_date DATE NOT NULL UNIQUE,
+    user_id         INTEGER NOT NULL REFERENCES users (user_id) ON DELETE CASCADE,
+    week_start_date DATE NOT NULL,
     summary_text    TEXT,
     recommendations JSONB,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT weekly_reports_user_week_unique UNIQUE (user_id, week_start_date)
 );
 
--- Progress queries are always "this exercise, over time".
-CREATE INDEX IF NOT EXISTS idx_workout_logs_exercise_logged_at
-    ON workout_logs (exercise_id, logged_at);
+-- Progress queries are always "this user, this exercise, over time".
+CREATE INDEX IF NOT EXISTS idx_workout_logs_user_exercise_logged_at
+    ON workout_logs (user_id, exercise_id, logged_at);
 
--- Bodyweight trend is a straight time series.
-CREATE INDEX IF NOT EXISTS idx_bodyweight_logs_logged_at
-    ON bodyweight_logs (logged_at);
+-- Bodyweight trend is a straight per-user time series.
+CREATE INDEX IF NOT EXISTS idx_bodyweight_logs_user_logged_at
+    ON bodyweight_logs (user_id, logged_at);
 
 -- Supports the /log duplicate-submission guard, which looks up recent rows by
--- their originating journal text.
-CREATE INDEX IF NOT EXISTS idx_workout_logs_created_at
-    ON workout_logs (created_at);
-CREATE INDEX IF NOT EXISTS idx_bodyweight_logs_created_at
-    ON bodyweight_logs (created_at);
+-- their originating journal text within one account.
+CREATE INDEX IF NOT EXISTS idx_workout_logs_user_created_at
+    ON workout_logs (user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_bodyweight_logs_user_created_at
+    ON bodyweight_logs (user_id, created_at);

@@ -1561,9 +1561,16 @@ def draft_bodyweight_row(
     return row
 
 
-def load_exercise_groups(conn: Connection) -> dict[str, Optional[str]]:
-    """Every known exercise name and the muscle group it is filed under."""
-    rows = conn.execute(text("SELECT name, muscle_group FROM exercises")).fetchall()
+def load_exercise_groups(conn: Connection, user_id: int) -> dict[str, Optional[str]]:
+    """One user's exercise names and the muscle group each is filed under.
+
+    Scoped like `load_exercise_names`: a suggestion must reflect how this person
+    files their own training, not how somebody else files theirs.
+    """
+    rows = conn.execute(
+        text("SELECT name, muscle_group FROM exercises WHERE user_id = :user_id"),
+        {"user_id": user_id},
+    ).fetchall()
     return {row[0]: row[1] for row in rows}
 
 
@@ -1680,13 +1687,18 @@ def get_engine(database_url: Optional[str] = None, serverless: Optional[bool] = 
     return create_engine(url, pool_pre_ping=True, future=True)
 
 
-def load_exercise_names(conn: Connection) -> dict[str, int]:
-    rows = conn.execute(text("SELECT name, exercise_id FROM exercises")).fetchall()
+def load_exercise_names(conn: Connection, user_id: int) -> dict[str, int]:
+    """One user's exercise names. Fuzzy matching only ever sees their own."""
+    rows = conn.execute(
+        text("SELECT name, exercise_id FROM exercises WHERE user_id = :user_id"),
+        {"user_id": user_id},
+    ).fetchall()
     return {row[0]: row[1] for row in rows}
 
 
 def get_or_create_exercise(
     conn: Connection,
+    user_id: int,
     proposed_name: str,
     muscle_group: Optional[str],
     known: dict[str, int],
@@ -1695,6 +1707,10 @@ def get_or_create_exercise(
     """Resolve an exercise name to an id, fuzzy-matching before inserting.
 
     Returns (exercise_id, matched_existing_name_or_None, created).
+
+    The exercise table is per-user: `known` holds only this user's names, and
+    both the update and the insert below are scoped to `user_id`. Two people can
+    each have a "Lat Pulldown", filed however each of them wants.
 
     `chosen_group` says the muscle group came from a person on the review
     screen rather than from the table. Only then is an existing exercise's group
@@ -1708,9 +1724,10 @@ def get_or_create_exercise(
         if chosen_group:
             conn.execute(
                 text("UPDATE exercises SET muscle_group = :muscle_group "
-                     "WHERE exercise_id = :exercise_id "
+                     "WHERE exercise_id = :exercise_id AND user_id = :user_id "
                      "AND muscle_group IS DISTINCT FROM :muscle_group"),
-                {"muscle_group": muscle_group, "exercise_id": exercise_id},
+                {"muscle_group": muscle_group, "exercise_id": exercise_id,
+                 "user_id": user_id},
             )
         return exercise_id, matched, False
 
@@ -1723,15 +1740,15 @@ def get_or_create_exercise(
     row = conn.execute(
         text(
             """
-            INSERT INTO exercises (name, muscle_group)
-            VALUES (:name, :muscle_group)
-            ON CONFLICT (name) DO UPDATE
+            INSERT INTO exercises (user_id, name, muscle_group)
+            VALUES (:user_id, :name, :muscle_group)
+            ON CONFLICT (user_id, name) DO UPDATE
                 SET muscle_group = COALESCE(exercises.muscle_group,
                                             EXCLUDED.muscle_group)
             RETURNING exercise_id
             """
         ),
-        {"name": proposed_name, "muscle_group": muscle_group},
+        {"user_id": user_id, "name": proposed_name, "muscle_group": muscle_group},
     ).fetchone()
     exercise_id = int(row[0])
     known[proposed_name] = exercise_id
@@ -1741,10 +1758,10 @@ def get_or_create_exercise(
 _INSERT_WORKOUT_SET = text(
     """
     INSERT INTO workout_logs (
-        exercise_id, logged_at, weight_kg, reps, cheat_reps, set_number,
+        user_id, exercise_id, logged_at, weight_kg, reps, cheat_reps, set_number,
         is_warmup, is_dropset, pain_flag, notes, raw_source, extraction_confidence
     ) VALUES (
-        :exercise_id, :logged_at, :weight_kg, :reps, :cheat_reps, :set_number,
+        :user_id, :exercise_id, :logged_at, :weight_kg, :reps, :cheat_reps, :set_number,
         :is_warmup, :is_dropset, :pain_flag, :notes, :raw_source, :extraction_confidence
     )
     """
@@ -1753,81 +1770,117 @@ _INSERT_WORKOUT_SET = text(
 _INSERT_BODYWEIGHT = text(
     """
     INSERT INTO bodyweight_logs (
-        logged_at, weight_kg, body_fat_pct, notes, raw_source, extraction_confidence
+        user_id, logged_at, weight_kg, body_fat_pct, notes, raw_source,
+        extraction_confidence
     ) VALUES (
-        :logged_at, :weight_kg, :body_fat_pct, :notes, :raw_source, :extraction_confidence
+        :user_id, :logged_at, :weight_kg, :body_fat_pct, :notes, :raw_source,
+        :extraction_confidence
     )
     """
 )
 
 
-def _local_day_bounds(session_date: date) -> tuple[datetime, datetime]:
-    """The UTC window covering one local calendar day."""
-    start = local_to_utc(datetime.combine(session_date, time.min))
-    end = local_to_utc(datetime.combine(session_date + timedelta(days=1), time.min))
+def _local_day_bounds(
+    session_date: date, timezone_name: Optional[str] = None
+) -> tuple[datetime, datetime]:
+    """The UTC window covering one local calendar day, in the user's own zone."""
+    start = local_to_utc(datetime.combine(session_date, time.min), timezone_name)
+    end = local_to_utc(
+        datetime.combine(session_date + timedelta(days=1), time.min), timezone_name
+    )
     return start, end
 
 
-def count_entries_for_date(engine: Engine, session_date: date) -> dict[str, int]:
-    """How much is already logged against a local date."""
-    start, end = _local_day_bounds(session_date)
-    params = {"start": start, "end": end}
+def count_entries_for_date(
+    engine: Engine,
+    session_date: date,
+    user_id: int,
+    timezone_name: Optional[str] = None,
+) -> dict[str, int]:
+    """How much this user has already logged against a local date."""
+    start, end = _local_day_bounds(session_date, timezone_name)
+    params = {"start": start, "end": end, "user_id": user_id}
     with engine.connect() as conn:
         sets = conn.execute(
-            text("SELECT count(*) FROM workout_logs WHERE logged_at >= :start AND logged_at < :end"),
+            text("SELECT count(*) FROM workout_logs WHERE user_id = :user_id "
+                 "AND logged_at >= :start AND logged_at < :end"),
             params,
         ).scalar_one()
         bodyweight = conn.execute(
-            text("SELECT count(*) FROM bodyweight_logs "
-                 "WHERE logged_at >= :start AND logged_at < :end"),
+            text("SELECT count(*) FROM bodyweight_logs WHERE user_id = :user_id "
+                 "AND logged_at >= :start AND logged_at < :end"),
             params,
         ).scalar_one()
     return {"sets": int(sets), "bodyweight": int(bodyweight)}
 
 
-def delete_entries_for_date(conn: Connection, session_date: date) -> dict[str, int]:
-    """Remove every log row on a local date. Caller owns the transaction.
+def delete_entries_for_date(
+    conn: Connection,
+    session_date: date,
+    user_id: int,
+    timezone_name: Optional[str] = None,
+) -> dict[str, int]:
+    """Remove one user's log rows on a local date. Caller owns the transaction.
 
     Takes a Connection rather than an Engine so the delete and the insert that
     replaces it commit together: a failure mid-way must never leave the day
     emptied with nothing put back.
+
+    `user_id` is not optional and is not defaulted anywhere up the call chain.
+    This is the one destructive statement in the codebase; an unscoped version
+    of it would clear that date for every account on the deployment.
     """
-    start, end = _local_day_bounds(session_date)
-    params = {"start": start, "end": end}
+    start, end = _local_day_bounds(session_date, timezone_name)
+    params = {"start": start, "end": end, "user_id": user_id}
     sets = conn.execute(
-        text("DELETE FROM workout_logs WHERE logged_at >= :start AND logged_at < :end"), params
+        text("DELETE FROM workout_logs WHERE user_id = :user_id "
+             "AND logged_at >= :start AND logged_at < :end"), params
     ).rowcount
     bodyweight = conn.execute(
-        text("DELETE FROM bodyweight_logs WHERE logged_at >= :start AND logged_at < :end"), params
+        text("DELETE FROM bodyweight_logs WHERE user_id = :user_id "
+             "AND logged_at >= :start AND logged_at < :end"), params
     ).rowcount
     return {"sets": int(sets or 0), "bodyweight": int(bodyweight or 0)}
 
 
 def _submission_clauses(
     raw_text: str,
+    user_id: int,
     window_minutes: int,
     session_date: Optional[date],
+    timezone_name: Optional[str] = None,
+    alias: str = "",
 ) -> tuple[str, dict[str, Any]]:
     """The WHERE fragment identifying rows written from one journal entry.
 
     Matching is exact text equality — `raw_source` is TEXT, so nothing is
     truncated and two different entries cannot collide here.
+
+    Scoped to one account before anything else: a duplicate is an entry *this*
+    user already saved, never one somebody else did.
+
+    `alias` qualifies every column, for callers that join. `user_id` lives on
+    `exercises` as well as on the log tables, so an unqualified predicate would
+    become ambiguous the moment this fragment lands inside a join.
     """
+    col = f"{alias}." if alias else ""
     params: dict[str, Any] = {
         "raw_source": raw_text,
         "window": f"{int(window_minutes)} minutes",
+        "user_id": user_id,
     }
     clauses = [
-        "raw_source = :raw_source",
-        "created_at >= now() - CAST(:window AS interval)",
+        f"{col}user_id = :user_id",
+        f"{col}raw_source = :raw_source",
+        f"{col}created_at >= now() - CAST(:window AS interval)",
     ]
 
     if session_date is not None:
         # Scoped to the day being logged. Without this, pasting the same short
         # entry ("rest day, weighed 82.4") against two dates in one sitting
         # reads as a double-tap and the second date is silently dropped.
-        start, end = _local_day_bounds(session_date)
-        clauses.append("logged_at >= :day_start AND logged_at < :day_end")
+        start, end = _local_day_bounds(session_date, timezone_name)
+        clauses.append(f"{col}logged_at >= :day_start AND {col}logged_at < :day_end")
         params["day_start"] = start
         params["day_end"] = end
 
@@ -1837,20 +1890,28 @@ def _submission_clauses(
 def find_recent_submission(
     engine: Engine,
     raw_text: str,
+    user_id: int,
     window_minutes: int = DUPLICATE_WINDOW_MINUTES,
     session_date: Optional[date] = None,
+    timezone_name: Optional[str] = None,
 ) -> Optional[dict[str, int]]:
     """Return counts for an identical entry inserted within the window, else None.
 
     Backs the /log duplicate-submission guard: Render's free tier cold-starts for
     30-50s, which is exactly when a user double-taps submit.
 
-    `session_date` scopes the match to the day being logged. It is optional only
-    so the older two-argument call still works; every caller that knows the date
-    should pass it, or logging one short entry against two dates in one sitting
-    reads as a double-tap and the second date is dropped.
+    Scoped to one account, so two people pasting the same template entry on the
+    same evening each get their own saved, rather than the second being told it
+    was a duplicate of the first.
+
+    `session_date` narrows it further, to the day being logged. It is optional
+    only so a caller that does not know the date still works; every caller that
+    does know it should pass it, or logging one short entry against two dates in
+    one sitting reads as a double-tap and the second date is dropped.
     """
-    where, params = _submission_clauses(raw_text, window_minutes, session_date)
+    where, params = _submission_clauses(
+        raw_text, user_id, window_minutes, session_date, timezone_name
+    )
     with engine.connect() as conn:
         sets = conn.execute(
             text(f"SELECT count(*) FROM workout_logs WHERE {where}"), params
@@ -1867,23 +1928,31 @@ def find_recent_submission(
 def describe_recent_submission(
     engine: Engine,
     raw_text: str,
+    user_id: int,
     window_minutes: int = DUPLICATE_WINDOW_MINUTES,
     session_date: Optional[date] = None,
+    timezone_name: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """What the matched entry actually saved, per exercise.
 
     A guard that says "duplicate" and shows nothing is impossible to argue with,
     and impossible to trust when the sets it claims to have saved are not the
     ones you meant to log. This is the evidence for the claim.
+
+    The join is scoped on both sides, so evidence for one account's duplicate
+    can never be named using another account's exercise row.
     """
-    where, params = _submission_clauses(raw_text, window_minutes, session_date)
+    where, params = _submission_clauses(
+        raw_text, user_id, window_minutes, session_date, timezone_name, alias="w"
+    )
     with engine.connect() as conn:
         rows = conn.execute(
             text(
                 f"""
                 SELECT e.name AS exercise, count(*) AS sets, min(w.logged_at) AS first_logged
                 FROM workout_logs w
-                JOIN exercises e ON e.exercise_id = w.exercise_id
+                JOIN exercises e
+                  ON e.exercise_id = w.exercise_id AND e.user_id = w.user_id
                 WHERE {where}
                 GROUP BY e.name
                 ORDER BY min(w.logged_at), e.name
@@ -1904,13 +1973,21 @@ def describe_recent_submission(
 
 def commit_draft(
     draft: EntryDraft,
+    user_id: int,
     engine: Optional[Engine] = None,
     check_duplicates: bool = False,
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
     review_excluded: bool = False,
+    timezone_name: Optional[str] = None,
     override_duplicate: bool = False,
 ) -> PipelineResult:
-    """Write the ticked rows of a draft. The only function that inserts.
+    """Write the ticked rows of a draft for one user. The only function that inserts.
+
+    `user_id` is an argument rather than a field on the draft on purpose. The
+    draft round-trips through a hidden-field HTML form on the review screen, and
+    anything carried there is whatever the browser posted back; ownership is
+    taken from the session instead, so a tampered form cannot write into
+    somebody else's account.
 
     A row that reaches here has either been looked at on the review screen or
     cleared the threshold unattended, so the threshold is not applied again —
@@ -1943,7 +2020,11 @@ def commit_draft(
 
     if check_duplicates and not override_duplicate:
         prior = find_recent_submission(
-            engine, draft.raw_text, session_date=draft.session_date
+            engine,
+            draft.raw_text,
+            user_id,
+            session_date=draft.session_date,
+            timezone_name=timezone_name,
         )
         if prior is not None:
             logger.info("Duplicate submission held for a decision (%s)", prior)
@@ -1952,7 +2033,11 @@ def commit_draft(
                 inserted_bodyweight=prior["inserted_bodyweight"],
                 duplicate_of_recent=True,
                 duplicate_evidence=describe_recent_submission(
-                    engine, draft.raw_text, session_date=draft.session_date
+                    engine,
+                    draft.raw_text,
+                    user_id,
+                    session_date=draft.session_date,
+                    timezone_name=timezone_name,
                 ),
             )
 
@@ -2017,13 +2102,15 @@ def commit_draft(
         if draft.replace_existing:
             # Only reached when there is something to put back - the early
             # return above means a failed extraction never empties the day.
-            result.replaced = delete_entries_for_date(conn, draft.session_date)
+            result.replaced = delete_entries_for_date(
+                conn, draft.session_date, user_id, timezone_name
+            )
             logger.info("Replaced %s on %s", result.replaced, draft.session_date)
-        known = load_exercise_names(conn)
+        known = load_exercise_names(conn, user_id)
         for workout_set, confidence, chosen_group, name_typed in accepted_sets:
             exercise_id, matched_name, created = get_or_create_exercise(
-                conn, workout_set.exercise_name, workout_set.muscle_group, known,
-                chosen_group=chosen_group,
+                conn, user_id, workout_set.exercise_name, workout_set.muscle_group,
+                known, chosen_group=chosen_group,
             )
             if created:
                 result.exercises_created.append(workout_set.exercise_name)
@@ -2059,8 +2146,11 @@ def commit_draft(
             conn.execute(
                 _INSERT_WORKOUT_SET,
                 {
+                    "user_id": user_id,
                     "exercise_id": exercise_id,
-                    "logged_at": resolve_logged_at(workout_set.logged_at_local, draft.session_date),
+                    "logged_at": resolve_logged_at(
+                        workout_set.logged_at_local, draft.session_date, timezone_name
+                    ),
                     "weight_kg": workout_set.weight_kg,
                     "reps": workout_set.reps,
                     "cheat_reps": workout_set.cheat_reps,
@@ -2080,7 +2170,10 @@ def commit_draft(
             conn.execute(
                 _INSERT_BODYWEIGHT,
                 {
-                    "logged_at": resolve_logged_at(entry.logged_at_local, draft.session_date),
+                    "user_id": user_id,
+                    "logged_at": resolve_logged_at(
+                        entry.logged_at_local, draft.session_date, timezone_name
+                    ),
                     "weight_kg": entry.weight_kg,
                     "body_fat_pct": entry.body_fat_pct,
                     "notes": entry.notes,
@@ -2096,13 +2189,15 @@ def commit_draft(
 def process_entry(
     raw_text: str,
     session_date: date,
+    user_id: int,
     engine: Optional[Engine] = None,
     client: Any = None,
     check_duplicates: bool = False,
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
     replace_existing: bool = False,
+    timezone_name: Optional[str] = None,
 ) -> PipelineResult:
-    """Extract and insert one journal entry with nobody watching.
+    """Extract and insert one journal entry for one user, with nobody watching.
 
     The CLI path: no review screen, so the confidence threshold does the
     deciding and anything under it is reported rather than saved. The web app
@@ -2118,7 +2213,13 @@ def process_entry(
 
     if check_duplicates:
         # The unattended path has nobody to ask, so it still refuses outright.
-        prior = find_recent_submission(engine, raw_text, session_date=session_date)
+        prior = find_recent_submission(
+            engine,
+            raw_text,
+            user_id,
+            session_date=session_date,
+            timezone_name=timezone_name,
+        )
         if prior is not None:
             logger.info("Duplicate submission suppressed (%s)", prior)
             return PipelineResult(
@@ -2138,7 +2239,9 @@ def process_entry(
 
     return commit_draft(
         draft,
+        user_id,
         engine=engine,
         confidence_threshold=confidence_threshold,
         review_excluded=True,
+        timezone_name=timezone_name,
     )
