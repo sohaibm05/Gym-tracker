@@ -266,6 +266,11 @@ class _Engine:
         return _Connection(self.existing)
 
 
+# Any id works against the fakes above; what matters is that commit_draft now
+# demands one, so a caller cannot write a row without saying whose it is.
+USER_ID = 1
+
+
 def commit_one(name, raw_text, existing=(), edited_fields=frozenset(), added=False):
     """Save a single set through the real insert path and return the result."""
     draft = pipeline.draft_from_payload(
@@ -278,7 +283,7 @@ def commit_one(name, raw_text, existing=(), edited_fields=frozenset(), added=Fal
     row.include = True
     row.edited_fields = edited_fields
     row.added = added
-    return pipeline.commit_draft(draft, engine=_Engine(existing))
+    return pipeline.commit_draft(draft, USER_ID, engine=_Engine(existing))
 
 
 class TestFlagsReachTheResult:

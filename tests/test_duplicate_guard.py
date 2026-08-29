@@ -19,6 +19,7 @@ import review
 
 SESSION = date(2026, 8, 22)
 RAW = "Chest bench press 28kg 11 reps. Was 82.4kg this morning."
+USER_ID = 7
 
 
 # --------------------------------------------------------------------------
@@ -30,18 +31,18 @@ class TestSubmissionClauses:
     """The WHERE fragment that decides what a duplicate is."""
 
     def test_matches_on_exact_text_and_a_time_window(self):
-        where, params = pipeline._submission_clauses(RAW, 5, None)
+        where, params = pipeline._submission_clauses(RAW, USER_ID, 5, None)
         assert "raw_source = :raw_source" in where
         assert "created_at >= now() - CAST(:window AS interval)" in where
         assert params["raw_source"] == RAW and params["window"] == "5 minutes"
 
     def test_without_a_date_it_is_not_scoped_to_a_day(self):
-        where, params = pipeline._submission_clauses(RAW, 5, None)
+        where, params = pipeline._submission_clauses(RAW, USER_ID, 5, None)
         assert "logged_at" not in where
         assert "day_start" not in params
 
     def test_a_date_scopes_the_match_to_that_local_day(self):
-        where, params = pipeline._submission_clauses(RAW, 5, SESSION)
+        where, params = pipeline._submission_clauses(RAW, USER_ID, 5, SESSION)
         assert "logged_at >= :day_start AND logged_at < :day_end" in where
         assert params["day_start"], params["day_end"]
 
@@ -52,8 +53,8 @@ class TestSubmissionClauses:
         a double-tap, but without day scoping the second read as one and was
         silently dropped.
         """
-        _, saturday = pipeline._submission_clauses(RAW, 5, date(2026, 8, 22))
-        _, sunday = pipeline._submission_clauses(RAW, 5, date(2026, 8, 23))
+        _, saturday = pipeline._submission_clauses(RAW, USER_ID, 5, date(2026, 8, 22))
+        _, sunday = pipeline._submission_clauses(RAW, USER_ID, 5, date(2026, 8, 23))
         assert saturday["day_start"] != sunday["day_start"]
         # Disjoint, not merely different: Saturday ends where Sunday begins.
         assert saturday["day_end"] == sunday["day_start"]
@@ -151,20 +152,26 @@ def draft_for(replace=False):
 class TestGuardHoldsForADecision:
     def test_a_match_writes_nothing_and_reports_the_prior_save(self):
         engine = _Engine(prior_count=3)
-        result = pipeline.commit_draft(draft_for(), engine=engine, check_duplicates=True)
+        result = pipeline.commit_draft(
+            draft_for(), USER_ID, engine=engine, check_duplicates=True
+        )
         assert result.duplicate_of_recent is True
         assert result.inserted_sets == 3
         assert engine.inserted == []
 
     def test_no_match_saves_normally(self):
         engine = _Engine(prior_count=0)
-        result = pipeline.commit_draft(draft_for(), engine=engine, check_duplicates=True)
+        result = pipeline.commit_draft(
+            draft_for(), USER_ID, engine=engine, check_duplicates=True
+        )
         assert result.duplicate_of_recent is False
         assert result.inserted_sets == 1
 
     def test_the_guard_is_scoped_to_the_day_being_logged(self):
         engine = _Engine(prior_count=1)
-        pipeline.commit_draft(draft_for(), engine=engine, check_duplicates=True)
+        pipeline.commit_draft(
+            draft_for(), USER_ID, engine=engine, check_duplicates=True
+        )
         counts = [(sql, p) for sql, p in engine.statements if "count(*)" in sql]
         assert counts, "the guard never ran"
         assert all("logged_at" in sql for sql, _ in counts)
@@ -173,14 +180,18 @@ class TestGuardHoldsForADecision:
     def test_the_match_comes_with_evidence(self):
         """A guard that shows nothing cannot be argued with, or trusted."""
         engine = _Engine(prior_count=2, evidence_rows=[("Chest Bench Press", 2, None)])
-        result = pipeline.commit_draft(draft_for(), engine=engine, check_duplicates=True)
+        result = pipeline.commit_draft(
+            draft_for(), USER_ID, engine=engine, check_duplicates=True
+        )
         assert result.duplicate_evidence == [
             {"exercise": "Chest Bench Press", "sets": 2, "first_logged": None}
         ]
 
     def test_evidence_is_empty_when_nothing_is_matched(self):
         engine = _Engine(prior_count=0)
-        result = pipeline.commit_draft(draft_for(), engine=engine, check_duplicates=True)
+        result = pipeline.commit_draft(
+            draft_for(), USER_ID, engine=engine, check_duplicates=True
+        )
         assert result.duplicate_evidence == []
 
 
@@ -188,7 +199,11 @@ class TestOverridingTheGuard:
     def test_override_saves_despite_a_match(self):
         engine = _Engine(prior_count=3)
         result = pipeline.commit_draft(
-            draft_for(), engine=engine, check_duplicates=True, override_duplicate=True
+            draft_for(),
+            USER_ID,
+            engine=engine,
+            check_duplicates=True,
+            override_duplicate=True,
         )
         assert result.duplicate_of_recent is False
         assert result.inserted_sets == 1
@@ -202,6 +217,7 @@ class TestOverridingTheGuard:
         engine = _Engine(prior_count=3)
         result = pipeline.commit_draft(
             draft_for(replace=True),
+            USER_ID,
             engine=engine,
             check_duplicates=True,
             override_duplicate=True,
@@ -212,9 +228,50 @@ class TestOverridingTheGuard:
     def test_override_does_not_skip_the_guard_when_not_asked(self):
         engine = _Engine(prior_count=3)
         result = pipeline.commit_draft(
-            draft_for(), engine=engine, check_duplicates=True, override_duplicate=False
+            draft_for(),
+            USER_ID,
+            engine=engine,
+            check_duplicates=True,
+            override_duplicate=False,
         )
         assert result.duplicate_of_recent is True
+
+
+class TestGuardIsScopedToTheAccount:
+    """Per-day and per-account scoping arrived from different branches and meet
+    here. Either one dropped leaves a guard that looks like it works."""
+
+    def test_the_counts_read_only_this_account(self):
+        engine = _Engine(prior_count=1)
+        pipeline.commit_draft(
+            draft_for(), USER_ID, engine=engine, check_duplicates=True
+        )
+        counts = [(sql, p) for sql, p in engine.statements if "count(*)" in sql]
+        assert counts, "the guard never ran"
+        assert all("user_id = :user_id" in sql for sql, _ in counts)
+        assert all(p["user_id"] == USER_ID for _, p in counts)
+
+    def test_the_day_scope_survived_alongside_it(self):
+        """Both predicates, in the same WHERE, not one replacing the other."""
+        where, params = pipeline._submission_clauses(RAW, USER_ID, 5, SESSION)
+        assert "user_id = :user_id" in where and "logged_at >= :day_start" in where
+        assert params["user_id"] == USER_ID and params["day_start"]
+
+    def test_the_owner_is_bound_not_interpolated(self):
+        """The fragment is interpolated into the SQL, so the id must not be."""
+        where, params = pipeline._submission_clauses(RAW, USER_ID, 5, None)
+        assert "user_id = :user_id" in where and str(USER_ID) not in where
+        assert params["user_id"] == USER_ID
+
+    def test_the_evidence_join_is_scoped_on_both_sides(self):
+        """`user_id` is on `exercises` too, so an unqualified predicate would be
+        ambiguous — and an unscoped join could name another account's lift."""
+        engine = _Engine(prior_count=2, evidence_rows=[("Chest Bench Press", 2, None)])
+        pipeline.commit_draft(
+            draft_for(), USER_ID, engine=engine, check_duplicates=True
+        )
+        sql = next(sql for sql, _ in engine.statements if "GROUP BY e.name" in sql)
+        assert "e.user_id = w.user_id" in sql and "w.user_id = :user_id" in sql
 
 
 # --------------------------------------------------------------------------

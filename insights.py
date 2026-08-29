@@ -733,26 +733,41 @@ def fallback_summary(stage_a: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------
 
 
-def load_set_records(engine: Engine, since: date, until: date) -> list[SetRecord]:
-    """Load logged sets in [since, until), converting UTC timestamps to local dates."""
+def load_set_records(
+    engine: Engine,
+    since: date,
+    until: date,
+    user_id: int,
+    timezone_name: Optional[str] = None,
+) -> list[SetRecord]:
+    """Load one user's logged sets in [since, until), as local dates.
+
+    The join to `exercises` is filtered on the same user_id as the logs, not
+    just on exercise_id: the two tables are both per-user, and stating it on
+    both sides means a mistake in one cannot leak a name from another account.
+    """
     query = text(
         """
         SELECT e.name, e.muscle_group, w.logged_at, w.weight_kg, w.reps,
                w.cheat_reps, w.is_warmup, w.pain_flag
         FROM workout_logs w
-        JOIN exercises e ON e.exercise_id = w.exercise_id
-        WHERE w.logged_at >= :since AND w.logged_at < :until
+        JOIN exercises e ON e.exercise_id = w.exercise_id AND e.user_id = w.user_id
+        WHERE w.user_id = :user_id
+          AND w.logged_at >= :since AND w.logged_at < :until
         ORDER BY w.logged_at
         """
     )
-    since_utc = pipeline.local_to_utc(datetime.combine(since, datetime.min.time()))
-    until_utc = pipeline.local_to_utc(datetime.combine(until, datetime.min.time()))
+    zone_name = timezone_name or pipeline.LOCAL_TIMEZONE
+    since_utc = pipeline.local_to_utc(datetime.combine(since, datetime.min.time()), zone_name)
+    until_utc = pipeline.local_to_utc(datetime.combine(until, datetime.min.time()), zone_name)
 
     from zoneinfo import ZoneInfo
 
-    local_zone = ZoneInfo(pipeline.LOCAL_TIMEZONE)
+    local_zone = ZoneInfo(zone_name)
     with engine.connect() as conn:
-        rows = conn.execute(query, {"since": since_utc, "until": until_utc}).fetchall()
+        rows = conn.execute(
+            query, {"since": since_utc, "until": until_utc, "user_id": user_id}
+        ).fetchall()
 
     records = []
     for (name, muscle_group, logged_at, weight_kg, reps, cheat_reps,
@@ -774,24 +789,28 @@ def load_set_records(engine: Engine, since: date, until: date) -> list[SetRecord
 
 def save_report(
     engine: Engine,
+    user_id: int,
     week_start: date,
     summary_text: str,
     recommendations: dict[str, Any],
 ) -> None:
-    """Upsert on week_start_date so regenerating a week overwrites it."""
+    """Upsert on (user, week) so regenerating a week overwrites only that user's."""
     with engine.begin() as conn:
         conn.execute(
             text(
                 """
-                INSERT INTO weekly_reports (week_start_date, summary_text, recommendations)
-                VALUES (:week_start_date, :summary_text, CAST(:recommendations AS jsonb))
-                ON CONFLICT (week_start_date) DO UPDATE
+                INSERT INTO weekly_reports (user_id, week_start_date, summary_text,
+                                            recommendations)
+                VALUES (:user_id, :week_start_date, :summary_text,
+                        CAST(:recommendations AS jsonb))
+                ON CONFLICT (user_id, week_start_date) DO UPDATE
                     SET summary_text    = EXCLUDED.summary_text,
                         recommendations = EXCLUDED.recommendations,
                         created_at      = now()
                 """
             ),
             {
+                "user_id": user_id,
                 "week_start_date": week_start,
                 "summary_text": summary_text,
                 "recommendations": json.dumps(recommendations, default=str),
@@ -801,19 +820,21 @@ def save_report(
 
 def generate_weekly_report(
     engine: Engine,
+    user_id: int,
     week_start: Optional[date] = None,
     client: Any = None,
     use_llm: bool = True,
     persist: bool = True,
+    timezone_name: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Stage A, then Stage B, then upsert into weekly_reports."""
+    """Stage A, then Stage B, then upsert into weekly_reports, for one user."""
     if week_start is None:
-        week_start = week_start_for(pipeline.local_today())
+        week_start = week_start_for(pipeline.local_today(timezone_name))
     week_start = week_start_for(week_start)
 
     since = week_start - timedelta(weeks=ANALYSIS_WEEKS)
     until = week_start + timedelta(days=7)
-    records = load_set_records(engine, since, until)
+    records = load_set_records(engine, since, until, user_id, timezone_name)
 
     stage_a = build_stage_a(records, week_start)
 
@@ -841,7 +862,7 @@ def generate_weekly_report(
     }
 
     if persist:
-        save_report(engine, week_start, summary_text, payload)
+        save_report(engine, user_id, week_start, summary_text, payload)
 
     return {
         "week_start_date": week_start,
@@ -861,22 +882,32 @@ def generate_weekly_report(
 # --------------------------------------------------------------------------
 
 
-def load_bodyweight(engine: Engine, since: date, until: date) -> list[tuple[date, float]]:
-    """Bodyweight readings in [since, until), oldest first, as local dates."""
+def load_bodyweight(
+    engine: Engine,
+    since: date,
+    until: date,
+    user_id: int,
+    timezone_name: Optional[str] = None,
+) -> list[tuple[date, float]]:
+    """One user's bodyweight readings in [since, until), oldest first, as local dates."""
     from zoneinfo import ZoneInfo
 
     query = text(
         """
         SELECT logged_at, weight_kg FROM bodyweight_logs
-        WHERE logged_at >= :since AND logged_at < :until
+        WHERE user_id = :user_id
+          AND logged_at >= :since AND logged_at < :until
         ORDER BY logged_at
         """
     )
-    since_utc = pipeline.local_to_utc(datetime.combine(since, datetime.min.time()))
-    until_utc = pipeline.local_to_utc(datetime.combine(until, datetime.min.time()))
-    zone = ZoneInfo(pipeline.LOCAL_TIMEZONE)
+    zone_name = timezone_name or pipeline.LOCAL_TIMEZONE
+    since_utc = pipeline.local_to_utc(datetime.combine(since, datetime.min.time()), zone_name)
+    until_utc = pipeline.local_to_utc(datetime.combine(until, datetime.min.time()), zone_name)
+    zone = ZoneInfo(zone_name)
     with engine.connect() as conn:
-        rows = conn.execute(query, {"since": since_utc, "until": until_utc}).fetchall()
+        rows = conn.execute(
+            query, {"since": since_utc, "until": until_utc, "user_id": user_id}
+        ).fetchall()
     return [(logged_at.astimezone(zone).date(), float(weight)) for logged_at, weight in rows]
 
 
@@ -1022,15 +1053,21 @@ def pain_summary(records: Iterable[SetRecord]) -> list[dict[str, Any]]:
     return summary
 
 
-def build_dashboard(engine: Engine, weeks: int = 12, today: Optional[date] = None) -> dict[str, Any]:
-    """Everything the progress page plots. No LLM anywhere in here."""
-    today = today or pipeline.local_today()
+def build_dashboard(
+    engine: Engine,
+    user_id: int,
+    weeks: int = 12,
+    today: Optional[date] = None,
+    timezone_name: Optional[str] = None,
+) -> dict[str, Any]:
+    """Everything one user's progress page plots. No LLM anywhere in here."""
+    today = today or pipeline.local_today(timezone_name)
     this_week = week_start_for(today)
     since = this_week - timedelta(weeks=weeks - 1)
     until = this_week + timedelta(days=7)
 
-    records = load_set_records(engine, since, until)
-    bodyweight = load_bodyweight(engine, since, until)
+    records = load_set_records(engine, since, until, user_id, timezone_name)
+    bodyweight = load_bodyweight(engine, since, until, user_id, timezone_name)
 
     week_starts = [since + timedelta(weeks=offset) for offset in range(weeks)]
     current = [r for r in records if r.session_date >= this_week]
@@ -1051,7 +1088,7 @@ def build_dashboard(engine: Engine, weeks: int = 12, today: Optional[date] = Non
     return {
         "week_start": this_week.isoformat(),
         "weeks": weeks,
-        "timezone": pipeline.LOCAL_TIMEZONE,
+        "timezone": timezone_name or pipeline.LOCAL_TIMEZONE,
         "kpis": {
             "volume_this_week": volume_now,
             "volume_delta_pct": volume_delta,

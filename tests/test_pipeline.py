@@ -728,7 +728,7 @@ class TestReplaceIsOptIn:
 
     def test_empty_entry_never_reports_a_replace(self):
         """Nothing to insert means nothing should have been deleted."""
-        result = pipeline.process_entry("   ", date(2026, 8, 20))
+        result = pipeline.process_entry("   ", date(2026, 8, 20), user_id=1)
         assert result.replaced is None and result.error
 
 
