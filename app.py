@@ -38,7 +38,7 @@ import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
@@ -420,20 +420,13 @@ def _render_result(result: pipeline.PipelineResult, session_date: date) -> str:
     if result.error:
         parts.append(f'<div class="card err"><strong>Error.</strong> {html.escape(result.error)}</div>')
 
-    if result.duplicate_of_recent:
-        parts.append(
-            '<div class="card warn"><strong>Duplicate submission.</strong> '
-            "This exact text was already processed within the last "
-            f"{pipeline.DUPLICATE_WINDOW_MINUTES} minutes, so nothing was re-inserted. "
-            f"The earlier run saved {result.inserted_sets} set(s) and "
-            f"{result.inserted_bodyweight} bodyweight entry/entries.</div>"
-        )
-    else:
-        parts.append(
-            f'<div class="card ok"><strong>Inserted {result.inserted_sets} set(s)</strong> and '
-            f"{result.inserted_bodyweight} bodyweight entry/entries for "
-            f"{html.escape(session_date.isoformat())}.</div>"
-        )
+    # A duplicate never reaches here: /save intercepts it and asks instead,
+    # so by this point something really was written.
+    parts.append(
+        f'<div class="card ok"><strong>Inserted {result.inserted_sets} set(s)</strong> and '
+        f"{result.inserted_bodyweight} bodyweight entry/entries for "
+        f"{html.escape(session_date.isoformat())}.</div>"
+    )
 
     if result.replaced:
         removed = result.replaced
@@ -863,11 +856,18 @@ def _existing_counts(session_date: date, user: "auth.User") -> Optional[dict[str
         return None
 
 
-def _review_page(draft: pipeline.EntryDraft, user: "auth.User") -> HTMLResponse:
+def _review_page(
+    draft: pipeline.EntryDraft,
+    user: "auth.User",
+    duplicate: Optional[dict[str, Any]] = None,
+) -> HTMLResponse:
     return _page(
-        "Check before saving",
+        "Already saved once" if duplicate else "Check before saving",
         review.render_review_body(
-            draft, _existing_counts(draft.session_date, user), pipeline.CONFIDENCE_THRESHOLD
+            draft,
+            _existing_counts(draft.session_date, user),
+            pipeline.CONFIDENCE_THRESHOLD,
+            duplicate=duplicate,
         ),
         extra_css=review.REVIEW_CSS,
         user=user,
@@ -946,6 +946,9 @@ async def save_reviewed(
                     user.user_id, draft.session_date, draft.blocked_count)
         return _review_page(draft, user)
 
+    # Set only by the duplicate decision page below, so a first save always
+    # passes through the guard.
+    override = bool(str(form.get("override_duplicate", "")).strip())
     # The owning user comes from the session, not from the form that was just
     # posted back — the draft's hidden fields are whatever the browser sent.
     result = pipeline.commit_draft(
@@ -954,7 +957,30 @@ async def save_reviewed(
         engine=get_engine(),
         check_duplicates=True,
         timezone_name=user.timezone,
+        override_duplicate=override,
     )
+
+    if result.duplicate_of_recent:
+        # Nothing was written. Hand the draft straight back with the two ways
+        # forward rather than dead-ending on a refusal the user cannot answer.
+        logger.info(
+            "event=duplicate_decision_offered user_id=%d date=%s prior_sets=%d "
+            "prior_bodyweight=%d",
+            user.user_id,
+            draft.session_date,
+            result.inserted_sets,
+            result.inserted_bodyweight,
+        )
+        return _review_page(
+            draft,
+            user,
+            duplicate={
+                "inserted_sets": result.inserted_sets,
+                "inserted_bodyweight": result.inserted_bodyweight,
+                "evidence": result.duplicate_evidence,
+            },
+        )
+
     logger.info(
         "event=entry_saved user_id=%d date=%s replace=%s inserted_sets=%d "
         "inserted_bodyweight=%d skipped=%d review=%d duplicate=%s replaced=%s",

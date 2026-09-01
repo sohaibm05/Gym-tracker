@@ -91,8 +91,9 @@ psql "$DATABASE_URL" -f migrations/001_add_cheat_reps.sql
 ```
 
 **Upgrading a database that predates accounts** — do *not* run `schema.sql` over
-it. Run the migration script instead, which needs Python because it has to hash
-the owner's password:
+it. Run the migration script instead, which creates the owner account for you
+(Python, because the password has to be hashed) and then applies
+`migrations/002_multi_user.sql`:
 
 ```bash
 python migrate_multi_user.py --dry-run     # print the statements, change nothing
@@ -100,9 +101,39 @@ python migrate_multi_user.py               # apply
 ```
 
 It creates the tables and columns accounts need, then hands everything already
-logged to one owner account built from `APP_USERNAME` / `APP_PASSWORD` — so you
-carry on logging in with the credentials you already use, and your history is
-where you left it. Anyone else registers at `/signup`. Re-running it is a no-op.
+logged to one owner account built from `APP_USERNAME` / `APP_PASSWORD`, so your
+history is where you left it. Anyone else registers at `/signup`. Re-running it
+is a no-op.
+
+Your old credentials carry over **only if they satisfy the account rules**,
+which are stricter than the string comparison they used to face: a username of
+3–32 characters made of letters, numbers, dots, dashes and underscores, not one
+of the reserved names (`admin`, `root`, `me`, `api`, `system`, and the route
+names), and a password of at least 8 characters. `APP_USERNAME=admin` or a short
+password stops the migration with `Owner credentials rejected` before it changes
+anything. Pick different ones for the owner account and pass them explicitly —
+the data still lands there, you just sign in with the new pair:
+
+```bash
+python migrate_multi_user.py --username sohaib --password '...'
+```
+
+Without a Python environment against that database — a Supabase or Neon SQL
+console, say — paste `migrations/002_multi_user.sql` in as it stands. It takes
+the single account already in `users` as the owner. When there is none yet, or
+more than one, name the owner first, in the same session, and hash the password
+with the application's own hasher (the login form rejects anything else):
+
+```bash
+python -c "import auth; print(auth.hash_password('YOUR-PASSWORD'))"
+```
+
+```sql
+SELECT set_config('gym_tracker.owner_username',      'sohaib', false);
+SELECT set_config('gym_tracker.owner_password_hash', 'pbkdf2_sha256$600000$...', false);
+SELECT set_config('gym_tracker.owner_timezone',      'Asia/Karachi', false);  -- optional
+-- then the contents of migrations/002_multi_user.sql
+```
 
 **Supabase:** enable RLS on every table. The app connects as the table owner so
 it bypasses RLS, but Supabase auto-exposes a REST API over the `public` schema to
@@ -133,14 +164,16 @@ Or from the command line, where every write has to say whose it is:
 python manage_users.py create alice                                 # prompts for a password
 python manage_users.py list                                         # id, username, sets, timezone
 
-python parse_workout_log.py sample_entry.txt 2026-08-14 --dry-run   # no writes, no account needed
+python parse_workout_log.py sample_entry.txt 2026-08-14 --user alice --dry-run  # no writes
 python parse_workout_log.py sample_entry.txt 2026-08-14 --user alice
 
 python seed_sample_data.py --user alice --reset   # three weeks of sample data
 ```
 
 `--reset` clears only that account's rows, so seeding a demo user cannot wipe
-real training. `--user` defaults to `$APP_USERNAME` when it is set.
+real training. `--user` defaults to `$APP_USERNAME` when it is set, and is
+resolved before anything else runs — including `--dry-run`, which writes nothing
+but still asks which account it is standing in for.
 
 Stuck on configuration? `--check-config` reports where every setting is coming
 from and tests both connections, without printing a secret:
@@ -185,10 +218,19 @@ draft:
 result = pipeline.commit_draft(draft, user.user_id, engine=get_engine(), ...)
 ```
 
-`user_id` is a **required positional** parameter on every function that reads or
-writes training data — no default, anywhere. A default would have to pick an
-account, and the account it picks is wrong for everyone else. Calling
-`commit_draft(draft)` is a `TypeError`, not a silent write to user 1.
+`user_id` is a **required positional** parameter on every function in
+`pipeline.py` and `insights.py` that reads or writes training data — no default
+on any of them. A default would have to pick an account, and the account it
+picks is wrong for everyone else. Calling `commit_draft(draft)` is a
+`TypeError`, not a silent write to user 1.
+
+There is exactly one deliberate exception, and it is not in either of those
+modules: `backfill_muscle_groups.backfill` takes `user_id=None` meaning *every
+account*. It is a maintenance script that fills `NULL` muscle groups from a
+static lookup table, so the value it writes comes from the table rather than
+from anybody's data, and a row that already has a group is never touched.
+`--user` narrows it when you want that. Nothing else defaults, and nothing on
+the request path defaults at all.
 
 The sharpest edge is `delete_entries_for_date`, which backs the **Replace**
 option. Unscoped, one person correcting Tuesday's entry would clear Tuesday for
@@ -589,9 +631,20 @@ into a neighbouring date - tested at an offset zone, not just UTC.
 
 Render's free tier cold-starts in 30–50s after idle, which is exactly when you
 double-tap submit. The check sits on `/save`, the step that writes: it looks for
-the same raw text inserted in the last `DUPLICATE_WINDOW_MINUTES` (5) and returns
-the earlier result rather than inserting the entry twice. `/log` writes nothing,
-so re-running it costs only another extraction.
+the same raw text inserted in the last `DUPLICATE_WINDOW_MINUTES` (5) **against
+the day being logged**. `/log` writes nothing, so re-running it costs only
+another extraction.
+
+It asks rather than refuses. Re-pasting an entry to correct a bad parse is the
+same bytes arriving twice as a double-tapped submit, so the guard cannot tell
+them apart and does not try. On a match nothing is written and the review screen
+comes straight back — rows intact and still editable — with the earlier save
+listed exercise by exercise as the evidence for the claim, and two ways forward:
+replace that day, or add a second copy. Going back is the third.
+
+The day scoping matters for short entries: without it, "rest day, weighed 82.4"
+logged against Saturday and then against Sunday reads as a double-tap, and the
+second date is silently dropped.
 
 ## Charts
 
@@ -606,6 +659,18 @@ number on a chart and the same number in the report cannot drift apart.
 
 A few decisions that are easy to get wrong:
 
+- **Every card folds, and a card with nothing to say folds itself.** Bodyweight
+  with no readings, volume on a week you have not trained, pain flags on a clean
+  window — each collapses to its heading with the answer beside it ("none in
+  this window"), so folding never costs you what the card was telling you.
+  Anything with something to show starts open: you opened the page to look at
+  it. Muscle-group sections fold too, which is how you get one muscle on screen
+  at a time.
+  Built on `<details>`, the same element the table twins already use, so it
+  works without JavaScript — but a chart *drawn* inside a closed one has no
+  width to measure, and `clientWidth` falls back to a guess that would never
+  correct itself. Opening a section redraws what is inside it at the size it
+  actually got.
 - **e1RM is grouped by muscle, not averaged into it.** The exercises of one
   muscle group sit together under a heading so "is my chest progressing" is one
   glance rather than a hunt, but each keeps its own line. One averaged e1RM per
@@ -744,7 +809,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-815 tests, no network and no database required — they cover the Stage A
+866 tests, no network and no database required — they cover the Stage A
 rule branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold), `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
@@ -752,7 +817,8 @@ resolution and JSON-mode retry behaviour, the muscle-group tables and how their
 answer is suggested and overridden — both their resolution cases and mechanical
 guards that every key is in the normalized form lookup actually produces — the
 name flag, most of whose tests assert that ordinary lifts and real variations
-stay silent, and the review screen's draft/edit/save round trip. These are pure
+stay silent, the duplicate guard's day and account scoping and its two ways
+forward, and the review screen's draft/edit/save round trip. These are pure
 functions, so they are cheap to cover, and they are exactly the code where a
 silent bug produces a wrong training recommendation, or a saved row that does
 not match what was on screen, and nobody notices.
