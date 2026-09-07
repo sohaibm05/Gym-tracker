@@ -321,6 +321,13 @@ class TestDuplicatePage:
         body = review.render_review_body(draft_for(), duplicate=DUPLICATE)
         assert 'value="replace" class="danger"' in body
 
+    def test_the_first_button_is_the_one_that_cannot_lose_data(self):
+        """The rows on this page are still editable, and pressing Enter in a
+        text field submits via the first button. Replace deletes the whole day,
+        so it must not be the one a stray keystroke reaches."""
+        body = review.render_review_body(draft_for(), duplicate=DUPLICATE)
+        assert body.index('value="add"') < body.index('value="replace"')
+
 
 class TestOrdinaryPageIsUnchanged:
     def test_it_still_carries_a_hidden_mode(self):

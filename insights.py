@@ -16,10 +16,9 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timedelta
+from dataclasses import asdict, dataclass
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
 
 from sqlalchemy import text
@@ -583,7 +582,9 @@ def build_stage_a(
 
     return {
         "week_start_date": week_start.isoformat(),
-        "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        # datetime.utcnow() is deprecated from 3.12 and returns a naive value
+        # that only looks like UTC. Format the aware one instead.
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "config": {
             "pain_safeguard_enabled": pain_safeguard_enabled,
             "working_rep_range": [rep_low, rep_high],

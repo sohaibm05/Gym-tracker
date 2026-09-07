@@ -408,6 +408,11 @@ class TestSignedOut:
         assert response.status_code == 303
         assert client.state["calls"] == []
 
+    def test_the_api_schema_is_not_published(self, client):
+        """docs_url and redoc_url are off; without openapi_url off too, the
+        schema behind them still serves every route and form field to anyone."""
+        assert client.get("/openapi.json").status_code == 404
+
     def test_the_health_probe_stays_open(self, client):
         assert client.get("/healthz").status_code == 200
 
@@ -459,7 +464,21 @@ class TestLoggingIn:
         assert response.headers["location"] == "/progress"
 
     @pytest.mark.parametrize(
-        "hostile", ["https://evil.example/phish", "//evil.example", "http://evil.example"]
+        "hostile",
+        [
+            "https://evil.example/phish",
+            "//evil.example",
+            "http://evil.example",
+            # Browsers normalise "\\" to "/" while parsing a URL, so these reach
+            # evil.example just as "//evil.example" does. Rejecting only a
+            # leading "//" leaves the redirect wide open.
+            "/\\evil.example",
+            "/\\/evil.example",
+            "\\\\evil.example",
+            # A raw CR or LF in a Location header is a response-splitting
+            # primitive; a path has no use for control characters at all.
+            "/progress\r\nSet-Cookie: gt_session=stolen",
+        ],
     )
     def test_you_cannot_be_bounced_off_the_site(self, client, hostile):
         """An open redirect on the login page is worth more to an attacker than

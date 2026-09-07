@@ -524,7 +524,10 @@ def render_progress_body(data: dict[str, Any]) -> str:
             f'<div class="viz-root">{blob}<h1>Progress</h1>'
             '<section class="card"><p class="empty">Nothing logged yet. '
             'Once a few sessions are in, this page fills up with volume, '
-            'estimated 1RM per exercise, and your bodyweight trend.</p></section></div>'
+            'estimated 1RM per exercise, and your bodyweight trend.</p></section>'
+            # No charts to hover, but PROGRESS_JS looks this up unconditionally.
+            # Both branches emit it so the script has one shape to rely on.
+            '<div id="viz-tip" role="status" aria-live="polite"></div></div>'
         )
 
     k = data["kpis"]

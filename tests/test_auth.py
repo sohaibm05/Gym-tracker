@@ -184,7 +184,7 @@ class TestSessionRefreshWindow:
     def test_naive_timestamps_are_read_as_utc(self):
         """Some drivers hand back naive datetimes; comparing one against an
         aware `now` would raise, and this path runs on every request."""
-        created = datetime.utcnow() - timedelta(days=20)
+        created = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=20)
         assert auth._past_halfway(created, created + timedelta(days=30))
 
 

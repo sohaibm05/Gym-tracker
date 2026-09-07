@@ -15,8 +15,11 @@
 --     can be audited or re-run later.
 --   * `extraction_confidence` is computed by the pipeline from checkable
 --     signals (see pipeline.compute_confidence). It is never self-reported by
---     the LLM. Rows below CONFIDENCE_THRESHOLD are not inserted at all, so in
---     practice stored values are >= that threshold.
+--     the LLM. In the web app it marks a row red on the review screen rather
+--     than gating the insert, so a value below CONFIDENCE_THRESHOLD here means
+--     someone saw the row and saved it anyway; the CLI, which has nobody
+--     watching, still refuses one. A row edited or typed by hand is stored at
+--     1.0 - there is no extraction left to score.
 --   * Schema is shaped for direct Power BI consumption: narrow fact tables
 --     (workout_logs, bodyweight_logs), dimension tables (exercises, users), and
 --     a precomputed report table (weekly_reports).

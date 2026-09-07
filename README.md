@@ -730,7 +730,18 @@ A few decisions that are easy to get wrong:
   usernames exist.
 - **`?next=` is checked before redirecting.** Only a bare absolute path is
   accepted, so the login page cannot be used to bounce someone to an attacker's
-  copy of it.
+  copy of it. Rejecting a leading `//` is not enough on its own: browsers
+  normalise `\` to `/` while parsing a URL, so `/\evil.example` lands off-site
+  just the same, and control characters are refused too — a raw CR or LF in a
+  `Location` header is a response-splitting primitive.
+- **The API schema is not published.** `docs_url`, `redoc_url` *and*
+  `openapi_url` are all off. Turning off only the two documentation UIs leaves
+  `/openapi.json` serving an unauthenticated map of every route and form field
+  on the site.
+- **A failed start does not answer with a traceback.** If a module fails to
+  import, every URL reports that the app is down and the traceback goes to the
+  logs. Serving it would hand file paths, module layout and installed versions
+  to anyone who asks, from an app that has no working login in that state.
 - **HTTP Basic Auth still works for scripts**, checked against the `users` table
   rather than an env var. Basic credentials are base64, not encrypted, so it is
   **only safe over HTTPS** — Render terminates TLS by default, but confirm your
@@ -739,6 +750,10 @@ A few decisions that are easy to get wrong:
 - **Model output is escaped before it reaches the page.** Extracted exercise
   names are rendered through `html.escape`, so a name containing markup cannot
   inject anything.
+- **The review form's row count is bounded.** `set_count` is just a number in
+  the POST body and the reader builds one row per unit of it, so it is clamped
+  (`review.MAX_SET_ROWS`) before the loop. Unbounded, one signed-in request can
+  ask for a hundred million rows and take the worker's memory with it.
 
 ### What multi-user does not give you
 
@@ -809,7 +824,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-866 tests, no network and no database required — they cover the Stage A
+873 tests, no network and no database required — they cover the Stage A
 rule branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold), `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp

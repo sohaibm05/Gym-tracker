@@ -20,7 +20,6 @@ from insights import (
     exercise_e1rm_series,
     pain_summary,
     weekly_volume_series,
-    week_start_for,
 )
 
 MONDAY = date(2026, 8, 3)
