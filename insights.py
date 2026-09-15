@@ -118,6 +118,20 @@ def epley_1rm(weight_kg: Optional[float], reps: Optional[int]) -> Optional[float
     return float(weight_kg) * (1.0 + reps / 30.0)
 
 
+def clean_rep_count(reps: Optional[int], cheat_reps: Optional[int] = 0) -> Optional[int]:
+    """The clean-rep rule, over plain numbers.
+
+    Split out from `clean_reps` so callers holding raw column values — the live
+    logger deciding whether a set is a personal record — apply the same rule
+    without having to build a SetRecord first. One implementation, so a PR
+    announced mid-workout can never disagree with the weekly report about how
+    many reps counted.
+    """
+    if reps is None:
+        return None
+    return max(0, reps - (cheat_reps or 0))
+
+
 def clean_reps(record: SetRecord) -> Optional[int]:
     """Reps performed without cheating or assistance.
 
@@ -125,9 +139,7 @@ def clean_reps(record: SetRecord) -> Optional[int]:
     not total reps — drive estimated 1RM and the rep-range rules. Volume still
     uses total reps, because the work was performed.
     """
-    if record.reps is None:
-        return None
-    return max(0, record.reps - (record.cheat_reps or 0))
+    return clean_rep_count(record.reps, record.cheat_reps)
 
 
 def is_working_set(record: SetRecord) -> bool:

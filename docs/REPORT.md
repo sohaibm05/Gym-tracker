@@ -84,9 +84,17 @@ journal text ──▶ extract (LLM) ──▶ score & validate ──▶ REVIEW
 | **Structured JSON logs → Filebeat → Elasticsearch → Kibana** | **Added for this assignment** |
 | **Grafana dashboards, node-exporter, alert rules** | **Added for this assignment** |
 | **Fault injection and the cardinality demo** | **Added for this assignment** |
+| Live set-by-set logging, routines, PRs, measurements (installable PWA) | Added after this assignment |
 
-929 automated tests pass, 63 of them covering the observability layer added
+1010 automated tests pass, 63 of them covering the observability layer added
 here.
+
+A second input method — an installable app for logging set by set during a
+workout — was added after this assignment was written. It writes the same
+`workout_logs` table, so every metric, log line and chart described below
+covers it too, and its API routes are labelled by route template like the rest
+(`/api/session/{session_id}/sets`), so it added endpoints without adding
+cardinality. See the README for what it does.
 
 ### How to try it
 

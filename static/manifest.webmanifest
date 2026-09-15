@@ -1,0 +1,53 @@
+{
+  "name": "Gym Tracker — Workout",
+  "short_name": "Workout",
+  "description": "Log workouts set by set, with rest timers, personal records and progress tracking.",
+  "id": "/workout",
+  "start_url": "/workout",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b0d10",
+  "theme_color": "#0b0d10",
+  "categories": ["health", "fitness", "productivity"],
+  "icons": [
+    {
+      "src": "/static/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/static/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/static/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/static/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Start a workout",
+      "short_name": "Workout",
+      "url": "/workout",
+      "description": "Open the live logger"
+    },
+    {
+      "name": "Measurements",
+      "short_name": "Measure",
+      "url": "/workout#measure",
+      "description": "Record body measurements"
+    }
+  ]
+}

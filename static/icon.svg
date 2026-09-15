@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Gym Tracker">
+  <!-- A barbell. Drawn on a full-bleed background rather than as a transparent
+       glyph so it works as a maskable icon: Android crops installed icons to
+       whatever shape the launcher uses, and anything relying on transparency
+       loses its edges. Everything meaningful sits inside the middle 80%, which
+       is the safe zone every crop preserves. -->
+  <rect width="512" height="512" rx="114" fill="#f26b21"/>
+  <g fill="#14171c">
+    <!-- inner plates -->
+    <rect x="150" y="146" width="54" height="220" rx="16"/>
+    <rect x="308" y="146" width="54" height="220" rx="16"/>
+  </g>
+  <g fill="#1f6f8b">
+    <!-- outer plates, shorter, as on a loaded bar -->
+    <rect x="104" y="192" width="38" height="128" rx="13"/>
+    <rect x="370" y="192" width="38" height="128" rx="13"/>
+  </g>
+  <!-- the bar itself, passing through -->
+  <rect x="72" y="238" width="368" height="36" rx="18" fill="#f7f7f8"/>
+  <rect x="204" y="238" width="104" height="36" fill="#f7f7f8"/>
+</svg>

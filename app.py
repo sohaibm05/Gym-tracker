@@ -89,6 +89,17 @@ try:
 except Exception:  # noqa: BLE001 - observability must never block startup
     faults = logging_setup = app_metrics = None  # type: ignore[assignment]
 
+# The live workout app: its JSON API and the static shell that calls it. Guarded
+# for the same reason as the block above — a deployment missing these files
+# should still serve the journal-paste flow, the charts and the weekly report
+# rather than failing to boot. `/workout` simply will not exist.
+try:
+    from fastapi.staticfiles import StaticFiles  # noqa: E402
+
+    import api  # noqa: E402
+except Exception:  # noqa: BLE001 - the rest of the app works without it
+    api = StaticFiles = None  # type: ignore[assignment]
+
 if logging_setup is not None:
     # JSON on stdout by default: that is what the Docker json-file driver
     # captures and Filebeat tails. LOG_FORMAT=text switches to a readable line
@@ -1421,3 +1432,95 @@ async def weekly_report_generate(
 <p><a href="/weekly-report">Generate another</a></p>""",
         user=user,
     )
+
+
+# --------------------------------------------------------------------------
+# Live workout PWA: JSON API and static shell
+# --------------------------------------------------------------------------
+#
+# Mounted last, after every module-level name it needs exists. The API router is
+# handed `get_engine` and `require_user` rather than importing them, because
+# app.py imports api.py and the reverse import would be a cycle.
+
+if api is not None:
+    api.configure(get_engine=get_engine, require_user=require_user)
+    app.include_router(api.router)
+
+    _PWA_DIR = Path(__file__).resolve().parent / "static"
+    if _PWA_DIR.is_dir():
+        # The client-side app's own files: its JS, CSS, icons and manifest.
+        # Everything under here is public — it contains no data, only the shell
+        # that fetches data from /api once a session cookie is present.
+        app.mount("/static", StaticFiles(directory=str(_PWA_DIR)), name="static")
+
+    @app.get("/workout", response_class=HTMLResponse)
+    async def workout_app(user: "auth.User" = Depends(require_user)) -> HTMLResponse:
+        """The live workout screen: routines, logging, records, measurements.
+
+        Behind `require_user` like every other data page, so an unauthenticated
+        visit lands on the login form rather than on an app shell that would
+        immediately 401 against every endpoint it called.
+
+        Serves the shell only. Everything it displays is fetched from /api, and
+        `static/sw.js` caches the shell so opening it on a dead connection shows
+        the app rather than the browser's offline page.
+        """
+        shell = _PWA_DIR / "index.html"
+        if not shell.is_file():  # pragma: no cover - only if static/ is missing
+            return HTMLResponse(
+                "<h1>Workout app is not installed</h1>"
+                "<p>static/index.html is missing from this deployment.</p>",
+                status_code=500,
+            )
+        return HTMLResponse(shell.read_text(encoding="utf-8"))
+
+    @app.get("/manifest.webmanifest", include_in_schema=False)
+    async def web_manifest() -> Response:
+        """Served from the site root, not /static.
+
+        A manifest's `start_url` and `scope` resolve relative to where the
+        manifest itself is served, so one under /static/ would scope the
+        installed app to /static/ and open it there — a blank page.
+        """
+        manifest = _PWA_DIR / "manifest.webmanifest"
+        if not manifest.is_file():  # pragma: no cover
+            raise HTTPException(status_code=404)
+        return Response(
+            manifest.read_text(encoding="utf-8"),
+            media_type="application/manifest+json",
+        )
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon() -> Response:
+        """Browsers request /favicon.ico on their own, whatever <link> tags say.
+
+        Serving the PNG here keeps that automatic request out of the error logs,
+        where a recurring 404 trains people to ignore 404s.
+        """
+        icon = _PWA_DIR / "icon-192.png"
+        if not icon.is_file():  # pragma: no cover
+            raise HTTPException(status_code=404)
+        return Response(
+            icon.read_bytes(),
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    @app.get("/sw.js", include_in_schema=False)
+    async def service_worker() -> Response:
+        """Also from the root, for the same reason as the manifest.
+
+        A service worker can only control pages at or below its own path, so one
+        served from /static/sw.js could never control /workout. This is the one
+        file whose URL is load-bearing.
+        """
+        worker = _PWA_DIR / "sw.js"
+        if not worker.is_file():  # pragma: no cover
+            raise HTTPException(status_code=404)
+        return Response(
+            worker.read_text(encoding="utf-8"),
+            media_type="application/javascript",
+            # Browsers revalidate the worker on every navigation anyway, but an
+            # intermediary caching it would pin people to an old app version.
+            headers={"Cache-Control": "no-cache"},
+        )
