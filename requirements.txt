@@ -10,3 +10,7 @@ python-dotenv>=1.0
 # zoneinfo reads the IANA database from the OS. Slim serverless images often
 # ship without it, which makes ZoneInfo("Asia/Karachi") raise at runtime.
 tzdata>=2024.1
+# Prometheus instrumentation (metrics.py, /metrics). The app degrades to no-op
+# metrics if this is missing rather than failing to start, so a trimmed
+# serverless bundle loses observability but still serves requests.
+prometheus-client>=0.20

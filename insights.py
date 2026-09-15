@@ -845,7 +845,13 @@ def generate_weekly_report(
             summary_text = narrate(stage_a, client=client)
         except Exception as exc:  # noqa: BLE001 - never lose the report over narration
             narration_error = str(exc)
-            logger.error("Stage B narration failed, using deterministic summary: %s", exc)
+            logger.error(
+                "narration failed, falling back to the deterministic summary",
+                extra={
+                    "event.action": "narration_failed",
+                    "error.message": str(exc),
+                },
+            )
     if not summary_text:
         summary_text = fallback_summary(stage_a)
 

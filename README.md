@@ -18,6 +18,33 @@ Nothing reaches the database until you have looked at it and pressed save.
 Power BI connects straight to the Postgres tables. That side is out of scope
 here; the schema is just shaped for it.
 
+## Observability
+
+This project carries a full metrics and logging stack: Prometheus and Grafana
+for metrics (including node-exporter for the host), and Filebeat, Elasticsearch
+and Kibana for logs.
+
+```bash
+./scripts/stack.sh up      # everything, then wait for health
+./scripts/stack.sh urls    # where to find it
+./scripts/stack.sh down    # stop, keeping the data
+```
+
+| | |
+|---|---|
+| App | <http://localhost:8000> |
+| Metrics | <http://localhost:8000/metrics> |
+| Prometheus | <http://localhost:9090> |
+| Grafana | <http://localhost:3000> (`admin`/`admin`) |
+| Kibana | <http://localhost:5601> |
+
+The full write-up — metric list, architecture, log pipeline, and the two
+experiments — is in **[docs/REPORT.md](docs/REPORT.md)**.
+
+Note that the compose stack is a **local lab**: Elasticsearch runs without
+authentication and Grafana with a default password, both of which would be wrong
+on a shared network. See the security note in the report.
+
 ## How it works
 
 ```
@@ -60,6 +87,29 @@ below the confidence threshold is reported rather than saved
 | `backfill_muscle_groups.py` | One-off: fills `muscle_group` for exercises logged before the lookup existed |
 | `tests/` | Unit tests for the Stage A rules, the confidence / fuzzy-match logic, passwords and sessions, and per-account isolation |
 | `sample_entry.txt` | A messy journal entry in the real style, for trying the CLI |
+
+### Observability (Assignment 1)
+
+| File | What it is |
+|---|---|
+| `metrics.py` | Every Prometheus metric the app exports, declared in one place. Counter, Gauge, Histogram and Summary; application and business |
+| `logging_setup.py` | Structured JSON logging in ECS field names, request-id correlation, and redaction of secrets and health data |
+| `faults.py` | Deliberate, reversible fault injection for the Part E experiment. Inert unless explicitly armed; refuses to arm in production |
+| `Dockerfile` | The application image. One worker, logs to stdout |
+| `docker-compose.yml` | The whole stack: app, Postgres, Prometheus, Grafana, node-exporter, Elasticsearch, Kibana, Filebeat |
+| `observability/prometheus/` | Scrape config and alerting rules |
+| `observability/grafana/` | Provisioned datasources and three dashboards, as version-controlled JSON |
+| `observability/filebeat/` | Log shipping and parsing config |
+| `observability/elasticsearch/` | ILM retention policy |
+| `observability/kibana/` | Data view and eight saved searches |
+| `observability/cardinality_demo.py` | The Part E2 cardinality explosion demo, capped at 100 series |
+| `observability/results/` | Recorded output of the experiments |
+| `scripts/stack.sh` | Start, check, load, and safely tear down the stack |
+| `scripts/load_generator.py` | Deterministic, repeatable load for the experiments |
+| `scripts/experiment_anomaly.sh` | Part E1: baseline, fault, recovery |
+| `scripts/experiment_cardinality.sh` | Part E2 |
+| `scripts/setup_kibana.sh` | Imports the Kibana data view and saved searches |
+| `docs/REPORT.md` | **The assignment report — Parts A to E** |
 
 ## Setup
 
@@ -809,7 +859,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-866 tests, no network and no database required — they cover the Stage A
+929 tests, no network and no database required — they cover the Stage A
 rule branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold), `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
@@ -822,6 +872,16 @@ forward, and the review screen's draft/edit/save round trip. These are pure
 functions, so they are cheap to cover, and they are exactly the code where a
 silent bug produces a wrong training recommendation, or a saved row that does
 not match what was on screen, and nobody notices.
+
+63 of those cover the observability layer (`tests/test_observability.py`):
+that all four Prometheus metric types are present and behave like their type,
+that no metric carries an unbounded label — a test that fails if anyone adds a
+user id or request id as a label — that the open-drafts gauge can come back
+down, that the JSON log carries the fields Kibana needs, that request ids
+propagate and that malformed inbound ones are replaced rather than sanitised,
+that secrets and journal text are redacted by key and by shape, that fault
+injection is off by default and refuses to arm in production, and that the
+cardinality demo's 100-series cap holds.
 
 Two files cover accounts. `tests/test_auth.py` takes the password and session
 machinery — salting, the stored cost factor, malformed hashes never

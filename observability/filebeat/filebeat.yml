@@ -1,0 +1,144 @@
+# Filebeat: Docker container logs -> Elasticsearch.
+#
+# The path a log line takes
+# -------------------------
+#   1. The app writes one JSON object per line to stdout.
+#   2. Docker's json-file driver wraps each line in its own envelope and appends
+#      it to /var/lib/docker/containers/<id>/<id>-json.log:
+#          {"log":"{\"@timestamp\":\"...\",\"message\":\"...\"}\n",
+#           "stream":"stdout","time":"2026-09-15T05:48:49.068Z"}
+#   3. Filebeat tails that file. The `container` input strips Docker's envelope,
+#      leaving the application's own JSON string in the `message` field.
+#   4. `decode_json_fields` parses that string and promotes its keys to the top
+#      level of the event, so `http.request.id` becomes a real, queryable field
+#      rather than a substring of a message.
+#   5. Filebeat ships the event to Elasticsearch, which indexes every field.
+#
+# Step 4 is the one that turns text into data. Without it a Kibana search for a
+# request id is a full-text match against a blob; with it, it is a term query
+# against an indexed keyword field.
+#
+# Autodiscover rather than a static path: containers get new ids every time they
+# are recreated, so a hardcoded path breaks on the first `docker compose up
+# --build`. Autodiscover watches the Docker API and starts a harvester when a
+# matching container appears.
+
+filebeat.autodiscover:
+  providers:
+    - type: docker
+      # Only containers carrying this label. Elasticsearch and Kibana are
+      # themselves chatty, and indexing their logs into the same cluster is a
+      # feedback loop: an Elasticsearch error produces a log line, which is
+      # indexed by Elasticsearch, which can produce another error.
+      templates:
+        - condition:
+            contains:
+              docker.container.labels.co_elastic_logs/enabled: "true"
+          config:
+            - type: container
+              paths:
+                - /var/lib/docker/containers/${data.docker.container.id}/*.log
+              # Stop tailing a container's file once it has been gone this long,
+              # so a rebuilt container does not leave a harvester open forever.
+              close_removed: true
+              clean_removed: true
+
+processors:
+  # Parse the application's JSON out of `message` and lift its fields to the
+  # root of the document.
+  - decode_json_fields:
+      fields: ["message"]
+      # "" means the root of the event, so `log.level` in the app's JSON lands
+      # as the document's `log.level` rather than under a nested prefix.
+      target: ""
+      # The app's values win over Filebeat's defaults. This is what lets the
+      # app's own `@timestamp` — the moment the event happened — replace
+      # Filebeat's, which is the moment the line was read. The two differ by the
+      # shipping delay, which is exactly the error you do not want when
+      # correlating a log against a metric spike.
+      overwrite_keys: true
+      # A line that is not valid JSON gets an `error.message` field instead of
+      # being silently dropped. Losing a malformed log is how a parsing bug
+      # hides for months.
+      add_error_key: true
+      # Dotted keys in the JSON ("http.request.id") are expanded into nested
+      # objects, which is what Elasticsearch's mapping expects.
+      expand_keys: true
+
+  # Which container, image and compose service produced this line. Added by the
+  # add_docker_metadata processor from the Docker API.
+  - add_docker_metadata:
+      host: "unix:///var/run/docker.sock"
+
+  # The machine the container is running on.
+  - add_host_metadata:
+      when.not.contains.tags: forwarded
+
+  # Drop Filebeat's own bookkeeping fields. They are per-event overhead that
+  # nothing in this project queries.
+  - drop_fields:
+      fields: ["agent.ephemeral_id", "ecs.version", "input.type", "log.offset"]
+      ignore_missing: true
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+output.elasticsearch:
+  hosts: ["http://elasticsearch:9200"]
+  # No `index:` here on purpose. With ILM enabled, the destination is the
+  # rollover alias configured under setup.ilm below, and Filebeat refuses to
+  # start if an explicit index name is set as well — the two would disagree
+  # about where writes go the moment the first rollover happened.
+
+# Filebeat normally creates an index template named after itself. This one is
+# renamed to match the alias, so the template, the alias and the ILM policy all
+# describe the same set of indices.
+setup.template.name: "filebeat-gym-tracker"
+setup.template.pattern: "filebeat-gym-tracker-*"
+setup.template.overwrite: true
+
+# ---------------------------------------------------------------------------
+# Retention: where logs live and when they are deleted
+# ---------------------------------------------------------------------------
+#
+# Index Lifecycle Management, enforced by Elasticsearch rather than by a cron
+# job. The policy in observability/elasticsearch/ilm-policy.json rolls the write
+# index over at 1GB or 1 day, whichever comes first, and deletes an index 7 days
+# after it was rolled over.
+#
+# Two separate lifetimes, easily confused:
+#   * The FILE on the Docker host: capped by the json-file driver's max-size and
+#     max-file in docker-compose.yml (10MB x 3 per container). Docker deletes
+#     the oldest, whether or not Filebeat has read it — which is why Filebeat
+#     needs a persistent registry and a cluster that stays up.
+#   * The DOCUMENT in Elasticsearch: governed by the ILM policy, 7 days here.
+#
+# Surviving a restart: Filebeat's registry (/usr/share/filebeat/data, a named
+# volume) records the byte offset it has reached in every file, so a restarted
+# Filebeat resumes where it stopped rather than re-indexing everything. Indexed
+# documents live in the Elasticsearch volume and survive any container restart;
+# `docker compose down -v` deletes both.
+
+setup.ilm.enabled: true
+setup.ilm.rollover_alias: "filebeat-gym-tracker"
+setup.ilm.pattern: "{now/d}-000001"
+setup.ilm.policy_name: "gym-tracker-logs"
+setup.ilm.policy_file: /usr/share/filebeat/ilm-policy.json
+setup.ilm.overwrite: true
+
+# Kibana's index pattern and dashboards are set up by scripts/setup_kibana.sh
+# rather than here, so the data view is created with an explicit id the saved
+# searches can reference.
+setup.kibana:
+  host: "http://kibana:5601"
+
+# ---------------------------------------------------------------------------
+# Filebeat's own logs
+# ---------------------------------------------------------------------------
+# To stderr, at warning and above. Filebeat's container is deliberately NOT
+# labelled for collection, so these are read with `docker compose logs filebeat`
+# and never indexed — no feedback loop.
+logging.level: warning
+logging.to_stderr: true
+logging.metrics.enabled: false

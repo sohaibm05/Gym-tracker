@@ -1,0 +1,44 @@
+# Grafana datasources, provisioned from this file rather than clicked into the
+# UI. A datasource configured by hand lives only in Grafana's own database: it
+# disappears with the volume, cannot be reviewed in a pull request, and has to
+# be recreated from memory on the next machine.
+
+apiVersion: 1
+
+datasources:
+
+  - name: Prometheus
+    type: prometheus
+    # Explicit uid: the dashboards in observability/grafana/dashboards/ refer to
+    # this datasource by uid. Left unset, Grafana generates a random one and the
+    # provisioned dashboards would all load with "datasource not found".
+    uid: prometheus
+    access: proxy
+    # Grafana runs in the same Docker network, so this is the container name.
+    # Not localhost: inside the Grafana container, localhost is Grafana.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Should match the scrape_interval in prometheus.yml. Grafana uses it to
+      # pick a sensible default step, so a query does not ask for points finer
+      # than the data can possibly contain.
+      timeInterval: 15s
+      httpMethod: POST
+
+  # The logs, queryable from Grafana as well as Kibana. Kibana is the better
+  # tool for free-text search; having the same index here lets a dashboard put
+  # a latency chart and the log lines behind it on one screen.
+  - name: Elasticsearch
+    type: elasticsearch
+    uid: elasticsearch
+    access: proxy
+    url: http://elasticsearch:9200
+    database: "filebeat-gym-tracker-*"
+    editable: false
+    jsonData:
+      index: "filebeat-gym-tracker-*"
+      timeField: "@timestamp"
+      esVersion: "8.0.0"
+      logMessageField: message
+      logLevelField: log.level

@@ -1,0 +1,270 @@
+# Gym Tracker + full observability stack — Assignment 1.
+#
+#   docker compose up -d --build       bring everything up
+#   docker compose down                stop, keep the data
+#   docker compose down -v             stop and delete every volume
+#
+# Ports on the host:
+#   8000  gym-tracker      the app itself
+#   8001  cardinality-demo Part E2 (profile "experiment", not started by default)
+#   9090  prometheus
+#   9100  node-exporter
+#   3000  grafana          admin / admin on first login
+#   9200  elasticsearch
+#   5601  kibana
+#
+# THIS FILE IS A LOCAL LAB, NOT A PRODUCTION DEPLOYMENT.
+# Elasticsearch runs with security disabled and Grafana with a default password,
+# because requiring a TLS handshake and a credential rotation to look at a chart
+# on localhost teaches nothing about observability. Both would be wrong on a
+# network anyone else can reach — see the "Security" note in docs/REPORT.md.
+
+name: gym-tracker-observability
+
+services:
+
+  # ------------------------------------------------------------------------
+  # The application and its database
+  # ------------------------------------------------------------------------
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: gym-postgres
+    environment:
+      POSTGRES_USER: gym
+      POSTGRES_PASSWORD: gym
+      POSTGRES_DB: gymtracker
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Applied once, on an empty data directory. `schema.sql` is safe to re-run
+      # (every object is CREATE ... IF NOT EXISTS) but Postgres only runs this
+      # directory on first initialisation anyway.
+      - ./schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gym -d gymtracker"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [gym-net]
+
+  app:
+    build: .
+    container_name: gym-tracker
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://gym:gym@postgres:5432/gymtracker
+      # Passed through from your shell or .env. The app only needs it for the
+      # LLM extraction on POST /log; every other route, and the whole metrics
+      # and logging pipeline, works without it.
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-120b}
+      LOCAL_TIMEZONE: ${LOCAL_TIMEZONE:-UTC}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # JSON on stdout is what makes the Filebeat side of this work.
+      LOG_FORMAT: json
+      SERVICE_NAME: gym-tracker
+      APP_VERSION: ${APP_VERSION:-1.0.0}
+      APP_ENV: development
+      # --- Part E fault injection. Inert unless FAULT_INJECTION_ENABLED=true.
+      FAULT_INJECTION_ENABLED: ${FAULT_INJECTION_ENABLED:-false}
+      FAULT_LATENCY_MS: ${FAULT_LATENCY_MS:-0}
+      FAULT_LATENCY_EVERY_N: ${FAULT_LATENCY_EVERY_N:-1}
+      FAULT_ERROR_EVERY_N: ${FAULT_ERROR_EVERY_N:-0}
+      FAULT_PATH_PREFIX: ${FAULT_PATH_PREFIX:-}
+    ports:
+      - "8000:8000"
+    # Bounds the log on disk. Without this the json-file driver grows without
+    # limit and a long experiment can fill the host disk — the failure mode
+    # where the monitoring takes down the thing it monitors.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      # Read by Filebeat's autodiscover rules (observability/filebeat/filebeat.yml).
+      co.elastic.logs/enabled: "true"
+    networks: [gym-net]
+
+  # ------------------------------------------------------------------------
+  # Metrics: Prometheus scrapes, Grafana draws
+  # ------------------------------------------------------------------------
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: gym-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # How long metrics survive. Prometheus is not an archive: it keeps recent
+      # data at full resolution and drops it wholesale after this window.
+      - --storage.tsdb.retention.time=15d
+      # Needed by scripts/experiment_anomaly.sh, which reloads the config
+      # between experiment stages rather than restarting the container.
+      - --web.enable-lifecycle
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    # node-exporter runs in the host's network namespace, so from inside this
+    # bridge network it is reachable only via the host gateway. Docker Desktop
+    # provides this name already; `host-gateway` is what makes it resolve on
+    # Linux too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [gym-net]
+
+  # Machine-level metrics: CPU, memory, disk and network for the Docker host.
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: gym-node-exporter
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/host/root
+      # Without this, every container's overlay and tmpfs mount is reported as
+      # a separate filesystem and the disk panels become unreadable.
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs/var/lib/docker)($$|/)
+    volumes:
+      # Read-only views of the host's own kernel interfaces. This is how a
+      # container measures the machine rather than itself.
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro,rslave
+    # The host's network namespace, so the network counters are the host's real
+    # NICs rather than this container's veth pair — the machine is what we are
+    # measuring. It also means `ports:` would be meaningless here: the exporter
+    # is already listening on the host's own :9100. Prometheus reaches it via
+    # host.docker.internal, mapped below.
+    network_mode: host
+    pid: host
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: gym-grafana
+    depends_on: [prometheus]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      # Local lab: nobody should be creating accounts on it.
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: ""
+    volumes:
+      # Datasources and dashboards are provisioned from files in the repo, not
+      # clicked together in the UI. A dashboard that only exists in Grafana's
+      # database is lost with the volume and cannot be reviewed in a diff.
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks: [gym-net]
+
+  # ------------------------------------------------------------------------
+  # Logs: app stdout -> Docker -> Filebeat -> Elasticsearch -> Kibana
+  # ------------------------------------------------------------------------
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: gym-elasticsearch
+    environment:
+      discovery.type: single-node
+      # LAB ONLY. Disabling security removes TLS and authentication; on any
+      # shared network this must be on.
+      xpack.security.enabled: "false"
+      xpack.security.http.ssl.enabled: "false"
+      # Elasticsearch defaults to half of host RAM. Pinned small so the whole
+      # stack fits on a laptop; Xms and Xmx are equal so the heap never resizes.
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+      ingest.geoip.downloader.enabled: "false"
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      # "yellow" is success for a single node: every index has an unassigned
+      # replica because there is no second node to put it on, and waiting for
+      # green would wait forever.
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+    networks: [gym-net]
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.0
+    container_name: gym-kibana
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5601/api/status || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    networks: [gym-net]
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.15.0
+    container_name: gym-filebeat
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    # Filebeat refuses a config file that is group- or world-writable, and a
+    # bind-mounted file usually is. Root here is about reading the Docker
+    # socket and the container log directory, both of which are root-owned.
+    user: root
+    command: ["filebeat", "-e", "--strict.perms=false"]
+    volumes:
+      - ./observability/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      # The retention policy, loaded into Elasticsearch by Filebeat at startup
+      # (setup.ilm.policy_file).
+      - ./observability/elasticsearch/ilm-policy.json:/usr/share/filebeat/ilm-policy.json:ro
+      # The actual log files: one directory per container, written by the
+      # json-file driver.
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      # Read-only access to the Docker API, so autodiscover can tell which
+      # container a log file belongs to and attach its name and labels.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Filebeat's own state: how far into each file it has read. On a volume so
+      # a restart resumes instead of re-indexing every line from the beginning.
+      - filebeat-data:/usr/share/filebeat/data
+    networks: [gym-net]
+
+  # ------------------------------------------------------------------------
+  # Part E2. Started only with: docker compose --profile experiment up -d
+  # ------------------------------------------------------------------------
+
+  cardinality-demo:
+    build: .
+    container_name: gym-cardinality-demo
+    profiles: ["experiment"]
+    command: ["python", "observability/cardinality_demo.py", "--port", "8001"]
+    environment:
+      CARDINALITY_SAFE_ONLY: ${CARDINALITY_SAFE_ONLY:-false}
+    ports:
+      - "8001:8001"
+    networks: [gym-net]
+
+volumes:
+  postgres-data:
+  prometheus-data:
+  grafana-data:
+  elasticsearch-data:
+  filebeat-data:
+
+networks:
+  gym-net:
+    driver: bridge

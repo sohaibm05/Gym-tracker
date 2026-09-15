@@ -1,0 +1,78 @@
+# Prometheus scrape configuration for the gym tracker stack.
+#
+# Prometheus PULLS. Nothing here pushes metrics anywhere: each target exposes a
+# /metrics endpoint and Prometheus fetches it on a timer. That is why a target
+# going down is itself visible — the `up` series drops to 0 — where a
+# push-based system simply stops receiving and cannot tell silence from health.
+
+global:
+  # Every 15s. This is the resolution of every chart downstream: a spike shorter
+  # than one scrape interval is not in the data at all, however it is queried.
+  # It also sets the floor for any rate() window — see the note on 1m below.
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  # How often recording and alerting rules are re-run.
+  evaluation_interval: 15s
+  # Attached to every series this server collects. Distinguishes these metrics
+  # from another environment's if they are ever queried side by side.
+  external_labels:
+    monitor: gym-tracker-local
+    environment: development
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+
+  # ------------------------------------------------------------------------
+  # The application itself
+  # ------------------------------------------------------------------------
+  - job_name: gym-tracker
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["app:8000"]
+        labels:
+          # The machine being measured, named as the brief asks. On this bridge
+          # network "app" is the container's DNS name.
+          service: gym-tracker
+    # If METRICS_TOKEN is set on the app, uncomment this to match it. The app
+    # compares it with hmac.compare_digest.
+    # authorization:
+    #   type: Bearer
+    #   credentials: "the-same-value-as-METRICS_TOKEN"
+
+  # ------------------------------------------------------------------------
+  # Machine metrics: CPU, memory, disk, network
+  # ------------------------------------------------------------------------
+  - job_name: node-exporter
+    static_configs:
+      # node-exporter runs in the host network namespace, so it is on the
+      # Docker host's own :9100 rather than on this bridge network.
+      - targets: ["host.docker.internal:9100"]
+        labels:
+          # THE MACHINE BEING MEASURED. This is the Docker host — the laptop or
+          # VM running the stack — not any one container. Every container's CPU
+          # and memory use is included in these totals because they are all
+          # processes on this one kernel.
+          service: node-exporter
+          machine: docker-host
+
+  # ------------------------------------------------------------------------
+  # Prometheus scraping itself. Free, and the first thing to check when a
+  # dashboard looks wrong: if Prometheus is struggling, everything looks wrong.
+  # ------------------------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          service: prometheus
+
+  # ------------------------------------------------------------------------
+  # Part E2 cardinality demo. Only running under the "experiment" profile, so
+  # this target is DOWN in normal operation — which is correct and expected.
+  # ------------------------------------------------------------------------
+  - job_name: cardinality-demo
+    static_configs:
+      - targets: ["cardinality-demo:8001"]
+        labels:
+          service: cardinality-demo

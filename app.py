@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
+import hmac
 import html
 import logging
 import re
@@ -75,11 +77,38 @@ except Exception:  # noqa: BLE001 - report anything that stops the app booting
     _STARTUP_ERROR = traceback.format_exc()
     auth = charts = insights = pipeline = review = None  # type: ignore[assignment]
 
-logging.basicConfig(
-    level=pipeline.env("LOG_LEVEL", "INFO").upper() if pipeline else "INFO",
-    format='%(asctime)s level=%(levelname)s logger=%(name)s %(message)s',
-)
+# Observability. Imported separately from the block above because the app is
+# still worth serving without them: a missing metrics library is a reason to run
+# unobserved, not a reason nobody can log a workout. Both modules are written to
+# degrade to no-ops, and this guard covers the case where they are absent
+# entirely from a trimmed serverless bundle.
+try:
+    import faults  # noqa: E402
+    import logging_setup  # noqa: E402
+    import metrics as app_metrics  # noqa: E402
+except Exception:  # noqa: BLE001 - observability must never block startup
+    faults = logging_setup = app_metrics = None  # type: ignore[assignment]
+
+if logging_setup is not None:
+    # JSON on stdout by default: that is what the Docker json-file driver
+    # captures and Filebeat tails. LOG_FORMAT=text switches to a readable line
+    # for local development.
+    logging_setup.configure_logging(
+        level=pipeline.env("LOG_LEVEL", "INFO") if pipeline else "INFO"
+    )
+else:  # pragma: no cover - only without logging_setup
+    logging.basicConfig(
+        level=pipeline.env("LOG_LEVEL", "INFO").upper() if pipeline else "INFO",
+        format='%(asctime)s level=%(levelname)s logger=%(name)s %(message)s',
+    )
 logger = logging.getLogger("gym_tracker.app")
+
+METRICS = app_metrics.METRICS if app_metrics is not None else None
+DRAFTS = app_metrics.DRAFTS if app_metrics is not None else None
+FAULTS = faults.FaultInjector(metrics=METRICS) if faults is not None else None
+
+if app_metrics is not None:
+    app_metrics.set_build_info()
 
 app = FastAPI(title="Gym Tracker", docs_url=None, redoc_url=None)
 
@@ -198,7 +227,10 @@ def _basic_auth_user(request: Request) -> Optional[auth.User]:
         return None
 
     if _LOGIN_LIMITER is not None and not _LOGIN_LIMITER.check(f"basic:{_client_key(request)}"):
-        logger.warning("event=auth_rate_limited scheme=basic")
+        logger.warning(
+            "basic auth rate limited",
+            extra={"event.action": "auth_rate_limited", "auth.scheme": "basic"},
+        )
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many attempts. Wait a few minutes.",
@@ -241,28 +273,69 @@ def require_user(request: Request) -> auth.User:
         return user
 
     if request.headers.get("authorization", "").lower().startswith("basic "):
-        logger.warning("event=auth_failed scheme=basic path=%s", request.url.path)
+        logger.warning(
+            "basic auth failed",
+            extra={
+                "event.action": "auth_failed",
+                "auth.scheme": "basic",
+                "url.path": request.url.path,
+            },
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials",
             headers={"WWW-Authenticate": "Basic"},
         )
 
-    logger.info("event=login_required path=%s", request.url.path)
+    logger.info(
+        "login required",
+        extra={"event.action": "login_required", "url.path": request.url.path},
+    )
     raise LoginRequired(request.url.path)
 
 
 # --------------------------------------------------------------------------
-# Structured request logging
+# Structured request logging and metrics
 # --------------------------------------------------------------------------
+
+# Header a load balancer or upstream proxy may already have set. Reusing an
+# inbound id means one identifier follows a request across process boundaries
+# instead of each hop inventing its own.
+REQUEST_ID_HEADER = "x-request-id"
+
+# Length cap on an inbound id. It is attacker-controlled — it arrives in a
+# header — and it ends up in every log line for the request, so an unbounded
+# one would let a caller write arbitrarily large records into Elasticsearch.
+MAX_INBOUND_REQUEST_ID = 64
+
+
+def _inbound_request_id(request: Request) -> Optional[str]:
+    """A usable id from the incoming headers, or None to mint a fresh one.
+
+    Restricted to characters that are safe in a log field and in a Kibana query.
+    Anything else is discarded rather than sanitised: a caller sending a
+    malformed id gets a generated one, which is still correlated end to end
+    because the response carries it back.
+    """
+    raw = (request.headers.get(REQUEST_ID_HEADER) or "").strip()
+    if not raw or len(raw) > MAX_INBOUND_REQUEST_ID:
+        return None
+    return raw if re.fullmatch(r"[A-Za-z0-9._:-]+", raw) else None
 
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
+    """One request in, one JSON log line and one set of metric observations out.
+
+    This is the single place HTTP-level telemetry is produced. Routes below emit
+    *business* events only; none of them time themselves or count their own
+    responses, so there is no way for a route to disagree with the request log
+    about what happened.
+    """
     if _STARTUP_ERROR is not None:
         # Every route depends on the modules that failed to import, so serve the
         # reason rather than a stack-less 500 from the platform.
-        logger.error("event=startup_failed path=%s", request.url.path)
+        logger.error("application failed to start", extra={"url.path": request.url.path})
         return PlainTextResponse(
             "The application failed to start.\n\n"
             "This is an import error, not a configuration one - no secrets are "
@@ -270,26 +343,107 @@ async def log_requests(request: Request, call_next):
             status_code=500,
         )
 
+    request_id = (
+        logging_setup.set_request_id(_inbound_request_id(request))
+        if logging_setup is not None
+        else ""
+    )
+
+    if METRICS is not None:
+        METRICS.http_requests_in_flight.inc()
+
+    # The timer starts HERE, before fault injection, and this ordering matters.
+    #
+    # An injected delay has to fall inside the timed region, because the point of
+    # the Part E experiment is that the latency histogram moves. Timing the
+    # request after the delay would measure only the handler, so Prometheus would
+    # report a perfectly healthy service while every client sat waiting half a
+    # second — the exact blind spot the assignment is about. The server's
+    # measurement must cover everything the client waits for.
     started = time.perf_counter()
+    # Set when the injector short-circuits the request, so the route label can
+    # say so rather than reporting "unmatched" (true — routing never ran — but
+    # indistinguishable from a 404 from a scanner).
+    injected_route: Optional[str] = None
     try:
-        response = await call_next(request)
-    except Exception:
+        # Inert unless deliberately armed; see faults.py.
+        if FAULTS is not None:
+            injected_status = await FAULTS.before_request(request.url.path)
+            if injected_status is not None:
+                injected_route = "injected"
+                response = PlainTextResponse(
+                    "Injected fault (Part E experiment). Unset "
+                    "FAULT_INJECTION_ENABLED and restart to clear.",
+                    status_code=injected_status,
+                )
+            else:
+                response = await call_next(request)
+        else:
+            response = await call_next(request)
+    except Exception as exc:
         duration_ms = (time.perf_counter() - started) * 1000
+        # The route template is only in the scope once routing has matched, which
+        # it has by the time a handler raised.
+        route = (
+            injected_route
+            or (app_metrics.route_label(request) if app_metrics is not None else "unknown")
+        )
+        if METRICS is not None:
+            METRICS.http_requests_in_flight.dec()
+            METRICS.http_request_duration.labels(
+                method=request.method, route=route
+            ).observe(duration_ms / 1000.0)
+            METRICS.http_requests_total.labels(
+                method=request.method, route=route, status="500"
+            ).inc()
+            METRICS.http_exceptions_total.labels(
+                route=route, exception=type(exc).__name__
+            ).inc()
         logger.exception(
-            "event=request method=%s path=%s status=500 duration_ms=%.1f",
-            request.method,
-            request.url.path,
-            duration_ms,
+            "request failed",
+            extra={
+                "http.request.method": request.method,
+                "url.path": request.url.path,
+                "http.route": route,
+                "http.response.status_code": 500,
+                "event.duration_ms": round(duration_ms, 1),
+            },
         )
         raise
+
     duration_ms = (time.perf_counter() - started) * 1000
-    logger.info(
-        "event=request method=%s path=%s status=%d duration_ms=%.1f",
-        request.method,
-        request.url.path,
-        response.status_code,
-        duration_ms,
+    route = (
+        injected_route
+        or (app_metrics.route_label(request) if app_metrics is not None else "unknown")
     )
+
+    if METRICS is not None:
+        METRICS.http_requests_in_flight.dec()
+        METRICS.http_request_duration.labels(
+            method=request.method, route=route
+        ).observe(duration_ms / 1000.0)
+        METRICS.http_requests_total.labels(
+            method=request.method, route=route, status=str(response.status_code)
+        ).inc()
+
+    logger.info(
+        "request served",
+        extra={
+            "http.request.method": request.method,
+            # The raw path is logged, the route *template* is what labels the
+            # metric. Logs are indexed for search and can hold the specific
+            # value; a metric label cannot, without minting a series per path.
+            "url.path": request.url.path,
+            "http.route": route,
+            "http.response.status_code": response.status_code,
+            "event.duration_ms": round(duration_ms, 1),
+        },
+    )
+
+    # Hand the id back so a person reporting a problem has the exact token to
+    # search Kibana for.
+    if request_id:
+        response.headers[REQUEST_ID_HEADER] = request_id
     return response
 
 
@@ -571,7 +725,12 @@ async def login_submit(
     target = _safe_next(next)
 
     if _LOGIN_LIMITER is not None and not _LOGIN_LIMITER.check(f"login:{_client_key(request)}"):
-        logger.warning("event=auth_rate_limited scheme=form")
+        if METRICS is not None:
+            METRICS.logins_total.labels(result="rate_limited").inc()
+        # No username and no client key in the log line. Which account was
+        # targeted and from where are both inferable personal data; that this
+        # deployment is being hammered is the operational fact worth keeping.
+        logger.warning("login rate limited", extra={"event.action": "auth_rate_limited"})
         return _page(
             "Log in",
             _auth_form(
@@ -589,7 +748,9 @@ async def login_submit(
         token = auth.create_session(conn, user.user_id) if user else None
 
     if user is None:
-        logger.warning("event=auth_failed scheme=form")
+        if METRICS is not None:
+            METRICS.logins_total.labels(result="failure").inc()
+        logger.warning("login failed", extra={"event.action": "auth_failed"})
         return _page(
             "Log in",
             _auth_form(
@@ -602,7 +763,12 @@ async def login_submit(
             ),
         )
 
-    logger.info("event=login user_id=%d", user.user_id)
+    if METRICS is not None:
+        METRICS.logins_total.labels(result="success").inc()
+    logger.info(
+        "login succeeded",
+        extra={"event.action": "login", "user.id": user.user_id},
+    )
     # A successful login clears the bucket, so someone who mistypes twice and
     # then gets it right is not left one attempt from being locked out.
     if _LOGIN_LIMITER is not None:
@@ -645,7 +811,9 @@ async def signup_submit(
         return _page("Create account", _signup_body(message, username, timezone))
 
     if _SIGNUP_LIMITER is not None and not _SIGNUP_LIMITER.check(f"signup:{_client_key(request)}"):
-        logger.warning("event=signup_rate_limited")
+        logger.warning(
+            "signup rate limited", extra={"event.action": "signup_rate_limited"}
+        )
         return failed("Too many accounts created from here. Try again later.")
 
     try:
@@ -653,10 +821,18 @@ async def signup_submit(
             user = auth.create_user(conn, username, password, timezone)
             token = auth.create_session(conn, user.user_id)
     except auth.AuthError as exc:
-        logger.info("event=signup_rejected reason=%s", exc)
+        # The reason, not the username: which names were attempted is both
+        # personal data and a way to probe for existing accounts.
+        logger.info(
+            "signup rejected",
+            extra={"event.action": "signup_rejected", "signup.reason": str(exc)},
+        )
         return failed(str(exc))
 
-    logger.info("event=signup user_id=%d", user.user_id)
+    logger.info(
+        "account created",
+        extra={"event.action": "signup", "user.id": user.user_id},
+    )
     response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
     _set_session_cookie(response, token, secure=_is_https(request))
     return response
@@ -734,7 +910,14 @@ async def account_update(
                 zone = auth.set_timezone(conn, user.user_id, timezone)
         except auth.AuthError as exc:
             return _page("Account", _account_body(user, error=str(exc)), user=user)
-        logger.info("event=timezone_changed user_id=%d timezone=%s", user.user_id, zone)
+        logger.info(
+            "timezone changed",
+            extra={
+                "event.action": "timezone_changed",
+                "user.id": user.user_id,
+                "user.timezone": zone,
+            },
+        )
         refreshed = auth.User(user.user_id, user.username, user.display_name, zone,
                               user.is_active)
         return _page(
@@ -760,7 +943,10 @@ async def account_update(
             except auth.AuthError as exc:
                 return _page("Account", _account_body(user, error=str(exc)), user=user)
 
-        logger.info("event=password_changed user_id=%d", user.user_id)
+        logger.info(
+            "password changed",
+            extra={"event.action": "password_changed", "user.id": user.user_id},
+        )
         # set_password revoked every session including this one, so the cookie
         # in the browser is already dead; clear it and ask for the new password.
         response = RedirectResponse("/login", status_code=status.HTTP_303_SEE_OTHER)
@@ -777,7 +963,59 @@ async def account_update(
 
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
-    return JSONResponse({"status": "ok"})
+    """Unauthenticated liveness probe.
+
+    Also reports whether fault injection is armed. A degraded process that looks
+    healthy is the worst outcome of an experiment left half-finished, so the
+    probe says so out loud.
+    """
+    body: dict[str, Any] = {"status": "ok"}
+    if FAULTS is not None and FAULTS.armed:
+        body["status"] = "degraded"
+        body["fault_injection"] = FAULTS.describe()
+    return JSONResponse(body)
+
+
+# Guards /metrics when set. Prometheus sends it via `authorization` in the
+# scrape config. Unset means no check, which is right for the local compose
+# stack where nothing outside the Docker network can reach the port — and wrong
+# for a public deployment, where the endpoint would otherwise publish login
+# failure counts and business volumes to anyone who asked.
+METRICS_TOKEN = pipeline.env("METRICS_TOKEN", "") if pipeline else ""
+METRICS_ENABLED = (
+    pipeline.env("METRICS_ENABLED", "true").lower() not in {"0", "false", "no", "off"}
+    if pipeline
+    else True
+)
+
+
+@app.get("/metrics")
+async def prometheus_metrics(request: Request) -> Response:
+    """Prometheus scrape endpoint, in the text exposition format.
+
+    Deliberately not behind the session cookie: Prometheus is not a browser and
+    has no session. It is protected by the network boundary, and optionally by a
+    bearer token (METRICS_TOKEN).
+    """
+    if not METRICS_ENABLED or app_metrics is None:
+        return PlainTextResponse("metrics are disabled\n", status_code=404)
+
+    if METRICS_TOKEN:
+        offered = (request.headers.get("authorization") or "").strip()
+        expected = f"Bearer {METRICS_TOKEN}"
+        # compare_digest: a plain == leaks the length of the shared prefix
+        # through its timing, and this endpoint is reachable unauthenticated.
+        if not hmac.compare_digest(offered, expected):
+            logger.warning(
+                "metrics scrape rejected",
+                extra={"http.response.status_code": 401, "url.path": "/metrics"},
+            )
+            return PlainTextResponse("unauthorized\n", status_code=401)
+
+    return Response(
+        content=app_metrics.render_latest(),
+        media_type=app_metrics.CONTENT_TYPE_LATEST,
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -836,7 +1074,11 @@ def _known_groups(user: "auth.User") -> Optional[dict[str, Optional[str]]]:
         with get_engine().connect() as conn:
             return pipeline.load_exercise_groups(conn, user.user_id)
     except Exception:  # noqa: BLE001 - the save step will surface a real outage
-        logger.warning("event=known_groups_failed user_id=%d", user.user_id, exc_info=True)
+        logger.warning(
+            "could not load known exercise groups",
+            extra={"event.action": "known_groups_failed", "user.id": user.user_id},
+            exc_info=True,
+        )
         return None
 
 
@@ -851,8 +1093,15 @@ def _existing_counts(session_date: date, user: "auth.User") -> Optional[dict[str
             get_engine(), session_date, user.user_id, user.timezone
         )
     except Exception:  # noqa: BLE001 - the save step will surface a real outage
-        logger.warning("event=existing_counts_failed date=%s user_id=%d",
-                       session_date, user.user_id, exc_info=True)
+        logger.warning(
+            "could not count existing entries for the date",
+            extra={
+                "event.action": "existing_counts_failed",
+                "session.date": str(session_date),
+                "user.id": user.user_id,
+            },
+            exc_info=True,
+        )
         return None
 
 
@@ -886,19 +1135,34 @@ async def log_entry(
     if parsed_date is None:
         return _invalid_date_page(user)
 
+    # The Summary observes the entry's SIZE, never its text. Journal entries are
+    # health data; how many bytes someone pasted is an operational fact, what
+    # they pasted is not, and the Groq token budget is spent on the former.
+    if METRICS is not None:
+        METRICS.entry_text_bytes.observe(len(raw_text.encode("utf-8")))
+
     draft = pipeline.build_draft(raw_text, parsed_date, known_groups=_known_groups(user))
     draft.replace_existing = mode == "replace"
+
+    # A parsed entry now sits on the review screen unconfirmed. The gauge rises
+    # here and falls at /save; an abandoned draft ages out (see DraftTracker).
+    if DRAFTS is not None and not draft.error:
+        DRAFTS.opened(user.user_id, parsed_date)
+
     logger.info(
-        "event=entry_drafted user_id=%d date=%s mode=%s sets=%d bodyweight=%s "
-        "flagged=%d blocked=%d error=%s",
-        user.user_id,
-        parsed_date,
-        mode,
-        len(draft.sets),
-        draft.bodyweight is not None,
-        draft.flagged_count,
-        draft.blocked_count,
-        bool(draft.error),
+        "journal entry drafted",
+        extra={
+            "event.action": "entry_drafted",
+            "user.id": user.user_id,
+            "session.date": str(parsed_date),
+            "entry.mode": mode,
+            "entry.sets": len(draft.sets),
+            "entry.text_bytes": len(raw_text.encode("utf-8")),
+            "entry.has_bodyweight": draft.bodyweight is not None,
+            "entry.flagged": draft.flagged_count,
+            "entry.blocked": draft.blocked_count,
+            "entry.failed": bool(draft.error),
+        },
     )
 
     if draft.error:
@@ -942,34 +1206,60 @@ async def save_reviewed(
         return _review_page(draft, user)
 
     if not draft.ready:
-        logger.info("event=save_blocked user_id=%d date=%s blocked=%d",
-                    user.user_id, draft.session_date, draft.blocked_count)
+        if METRICS is not None:
+            METRICS.entries_total.labels(outcome="blocked").inc()
+        logger.info(
+            "save blocked by the review form",
+            extra={
+                "event.action": "save_blocked",
+                "user.id": user.user_id,
+                "session.date": str(draft.session_date),
+                "entry.blocked": draft.blocked_count,
+            },
+        )
         return _review_page(draft, user)
 
     # Set only by the duplicate decision page below, so a first save always
     # passes through the guard.
     override = bool(str(form.get("override_duplicate", "")).strip())
+    if override and METRICS is not None:
+        # The person was shown the duplicate prompt and chose to save anyway.
+        METRICS.duplicate_decisions_total.labels(decision="overridden").inc()
+
     # The owning user comes from the session, not from the form that was just
     # posted back — the draft's hidden fields are whatever the browser sent.
-    result = pipeline.commit_draft(
-        draft,
-        user.user_id,
-        engine=get_engine(),
-        check_duplicates=True,
-        timezone_name=user.timezone,
-        override_duplicate=override,
+    # Timed as the database leg specifically, so a slow save can be attributed
+    # to Postgres rather than to the request as a whole.
+    commit_timer = (
+        app_metrics.observe_duration(METRICS.db_commit_duration)
+        if METRICS is not None
+        else contextlib.nullcontext()
     )
+    with commit_timer:
+        result = pipeline.commit_draft(
+            draft,
+            user.user_id,
+            engine=get_engine(),
+            check_duplicates=True,
+            timezone_name=user.timezone,
+            override_duplicate=override,
+        )
 
     if result.duplicate_of_recent:
         # Nothing was written. Hand the draft straight back with the two ways
         # forward rather than dead-ending on a refusal the user cannot answer.
+        if METRICS is not None:
+            METRICS.entries_total.labels(outcome="duplicate_held").inc()
+            METRICS.duplicate_decisions_total.labels(decision="held").inc()
         logger.info(
-            "event=duplicate_decision_offered user_id=%d date=%s prior_sets=%d "
-            "prior_bodyweight=%d",
-            user.user_id,
-            draft.session_date,
-            result.inserted_sets,
-            result.inserted_bodyweight,
+            "duplicate submission held for a decision",
+            extra={
+                "event.action": "duplicate_decision_offered",
+                "user.id": user.user_id,
+                "session.date": str(draft.session_date),
+                "duplicate.prior_sets": result.inserted_sets,
+                "duplicate.prior_bodyweight": result.inserted_bodyweight,
+            },
         )
         return _review_page(
             draft,
@@ -981,18 +1271,31 @@ async def save_reviewed(
             },
         )
 
+    if METRICS is not None:
+        METRICS.entries_total.labels(outcome="saved").inc()
+        # inc(0) is a no-op on a Counter, so an entry that wrote only a
+        # bodyweight reading does not disturb the sets total.
+        METRICS.sets_written_total.inc(result.inserted_sets)
+        METRICS.bodyweight_written_total.inc(result.inserted_bodyweight)
+        METRICS.sets_per_entry.observe(result.inserted_sets)
+
+    # The review screen is resolved, so the open-drafts gauge comes back down.
+    if DRAFTS is not None:
+        DRAFTS.closed(user.user_id, draft.session_date)
+
     logger.info(
-        "event=entry_saved user_id=%d date=%s replace=%s inserted_sets=%d "
-        "inserted_bodyweight=%d skipped=%d review=%d duplicate=%s replaced=%s",
-        user.user_id,
-        draft.session_date,
-        draft.replace_existing,
-        result.inserted_sets,
-        result.inserted_bodyweight,
-        result.skipped_sets + result.skipped_bodyweight,
-        len(result.review_items),
-        result.duplicate_of_recent,
-        result.replaced,
+        "journal entry saved",
+        extra={
+            "event.action": "entry_saved",
+            "user.id": user.user_id,
+            "session.date": str(draft.session_date),
+            "entry.replace": draft.replace_existing,
+            "entry.inserted_sets": result.inserted_sets,
+            "entry.inserted_bodyweight": result.inserted_bodyweight,
+            "entry.skipped": result.skipped_sets + result.skipped_bodyweight,
+            "entry.review_items": len(result.review_items),
+            "entry.replaced": result.replaced,
+        },
     )
     return _page(
         "Saved",
@@ -1010,8 +1313,15 @@ async def progress(user: "auth.User" = Depends(require_user)) -> HTMLResponse:
     data = insights.build_dashboard(
         get_engine(), user.user_id, weeks=weeks, timezone_name=user.timezone
     )
-    logger.info("event=progress_rendered user_id=%d weeks=%d has_data=%s",
-                user.user_id, weeks, data["has_data"])
+    logger.info(
+        "progress page rendered",
+        extra={
+            "event.action": "progress_rendered",
+            "user.id": user.user_id,
+            "progress.weeks": weeks,
+            "progress.has_data": data["has_data"],
+        },
+    )
     return _page(
         "Progress",
         charts.render_progress_body(data),
@@ -1062,12 +1372,24 @@ async def weekly_report_generate(
     report = insights.generate_weekly_report(
         get_engine(), user.user_id, week_start=parsed_week, timezone_name=user.timezone
     )
+    # A failed narration is not a failed report: every figure is computed in
+    # code and only the prose around them comes from the model. The label
+    # separates "the report is wrong" (it never is) from "the report reads
+    # plainly today", which is a quality signal rather than an error rate.
+    if METRICS is not None:
+        METRICS.weekly_reports_total.labels(
+            narration="failed" if report["narration_error"] else "ok"
+        ).inc()
+
     logger.info(
-        "event=report_generated user_id=%d week_start=%s records=%d narration_error=%s",
-        user.user_id,
-        report["week_start_date"],
-        report["record_count"],
-        bool(report["narration_error"]),
+        "weekly report generated",
+        extra={
+            "event.action": "report_generated",
+            "user.id": user.user_id,
+            "report.week_start": str(report["week_start_date"]),
+            "report.record_count": report["record_count"],
+            "report.narration_failed": bool(report["narration_error"]),
+        },
     )
 
     banner = ""
