@@ -18,6 +18,63 @@ Nothing reaches the database until you have looked at it and pressed save.
 Power BI connects straight to the Postgres tables. That side is out of scope
 here; the schema is just shaped for it.
 
+## Observability
+
+This project carries a full metrics and logging stack: Prometheus and Grafana
+for metrics (including node-exporter for the host), and Filebeat, Elasticsearch
+and Kibana for logs.
+
+```bash
+./scripts/stack.sh up      # everything, then wait for health
+./scripts/stack.sh urls    # where to find it
+./scripts/stack.sh down    # stop, keeping the data
+```
+
+| | |
+|---|---|
+| App | <http://localhost:8000> |
+| Metrics | <http://localhost:8000/metrics> |
+| Prometheus | <http://localhost:9090> |
+| Grafana | <http://localhost:3000> (`admin`/`admin`) |
+| Kibana | <http://localhost:5601> |
+
+The full write-up — metric list, architecture, log pipeline, and the two
+experiments — is in **[docs/REPORT.md](docs/REPORT.md)**.
+
+Note that the compose stack is a **local lab**: Elasticsearch runs without
+authentication and Grafana with a default password, both of which would be wrong
+on a shared network. See the security note in the report.
+
+## Two ways to log
+
+The app takes training two ways, and both write the same `workout_logs` table,
+so the charts and the weekly report see every set regardless of how it arrived.
+
+**Paste a journal** (`/`) — write the session however you like, afterwards, and
+let the model extract the rows. You review every row before anything is saved.
+Best for a session you have already finished, and for the messy reality of
+`70x6, 70x5 (last one was a grind)`.
+
+**Log it live** (`/workout`) — an installable app for logging set by set while
+you train: routines, a set table with what you did last time, a rest timer,
+and a personal record announced the moment you beat one.
+
+```bash
+./scripts/stack.sh up     # or: uvicorn app:app
+# then open /workout on your phone and "Add to Home Screen"
+```
+
+| | Paste a journal | Log it live |
+|---|---|---|
+| When | After the session | During it |
+| Needs a Groq key | Yes | No |
+| Needs signal | Yes | No — sets queue on the phone and sync later |
+| Best at | Messy real notes, catching up on a week | Progressive overload, rest timing, PRs |
+
+Neither is the "real" one. The live logger is faster and more accurate while
+you are in the gym; the journal is the only thing that can absorb a paragraph
+of prose written on the bus home.
+
 ## How it works
 
 ```
@@ -61,6 +118,42 @@ below the confidence threshold is reported rather than saved
 | `tests/` | Unit tests for the Stage A rules, the confidence / fuzzy-match logic, passwords and sessions, and per-account isolation |
 | `sample_entry.txt` | A messy journal entry in the real style, for trying the CLI |
 
+### Live workout logging
+
+| File | What it is |
+|---|---|
+| `catalog.py` | The built-in exercise catalog: 180 lifts with equipment and muscle group, searchable. Code, not rows — see below |
+| `routines.py` | Routines: reusable templates and their ordered contents, with per-exercise targets |
+| `sessions.py` | A live workout: start, log a set, the Previous column, finish or discard |
+| `records.py` | Personal records — heaviest weight, best estimated 1RM, best session volume — detected as a set is logged |
+| `measurements.py` | Body circumferences over time, alongside bodyweight |
+| `api.py` | The JSON API the workout app calls. Same process, same session cookie, no token |
+| `static/` | The installable workout app: shell, client JS, service worker, manifest, icons |
+| `migrations/003_routines_sessions_measurements.sql` | Adds all of the above to an existing database |
+
+### Observability (Assignment 1)
+
+| File | What it is |
+|---|---|
+| `metrics.py` | Every Prometheus metric the app exports, declared in one place. Counter, Gauge, Histogram and Summary; application and business |
+| `logging_setup.py` | Structured JSON logging in ECS field names, request-id correlation, and redaction of secrets and health data |
+| `faults.py` | Deliberate, reversible fault injection for the Part E experiment. Inert unless explicitly armed; refuses to arm in production |
+| `Dockerfile` | The application image. One worker, logs to stdout |
+| `docker-compose.yml` | The whole stack: app, Postgres, Prometheus, Grafana, node-exporter, Elasticsearch, Kibana, Filebeat |
+| `observability/prometheus/` | Scrape config and alerting rules |
+| `observability/grafana/` | Provisioned datasources and three dashboards, as version-controlled JSON |
+| `observability/filebeat/` | Log shipping and parsing config |
+| `observability/elasticsearch/` | ILM retention policy |
+| `observability/kibana/` | Data view and eight saved searches |
+| `observability/cardinality_demo.py` | The Part E2 cardinality explosion demo, capped at 100 series |
+| `observability/results/` | Recorded output of the experiments |
+| `scripts/stack.sh` | Start, check, load, and safely tear down the stack |
+| `scripts/load_generator.py` | Deterministic, repeatable load for the experiments |
+| `scripts/experiment_anomaly.sh` | Part E1: baseline, fault, recovery |
+| `scripts/experiment_cardinality.sh` | Part E2 |
+| `scripts/setup_kibana.sh` | Imports the Kibana data view and saved searches |
+| `docs/REPORT.md` | **The assignment report — Parts A to E** |
+
 ## Setup
 
 ```bash
@@ -88,6 +181,25 @@ setup. They are additive and re-runnable:
 
 ```bash
 psql "$DATABASE_URL" -f migrations/001_add_cheat_reps.sql
+psql "$DATABASE_URL" -f migrations/003_routines_sessions_measurements.sql
+```
+
+`003` adds routines, live workout sessions, measurements and personal records.
+It is additive: every new column is nullable or defaulted, and nothing already
+stored is rewritten. A fresh `schema.sql` and a migrated database produce a
+byte-identical schema under `pg_dump --schema-only`, which means you can diff a
+live database against `schema.sql` to detect drift.
+
+It deliberately does **not** backfill personal records — recomputing every
+account's history inside the migration transaction would hold locks for as long
+as the largest account takes, and an absent record simply means the next set of
+that lift sets one. Fill them in afterwards, per account, from the Records
+screen's "Recalculate" button or:
+
+```python
+import records, pipeline
+with pipeline.get_engine().begin() as conn:
+    records.rebuild(conn, user_id)
 ```
 
 **Upgrading a database that predates accounts** — do *not* run `schema.sql` over
@@ -237,6 +349,125 @@ option. Unscoped, one person correcting Tuesday's entry would clear Tuesday for
 every account on the deployment. `tests/test_multi_user.py` asserts that every
 statement touching an owned table names `user_id` in both the SQL and the bound
 parameters.
+
+### The catalog is code; `exercises` stays "lifts you actually do"
+
+The obvious way to give everyone a catalog is to copy a few hundred rows into
+`exercises` when they sign up. It is the wrong way. `exercises` is read by the
+progress charts, the weekly report and the fuzzy name matcher, and all three
+mean by it "the lifts this person trains". Seeding it fills that list with 180
+lifts nobody has ever done, and every one of those screens then has to filter
+out the rows with no history.
+
+So the catalog lives in `catalog.py`, as data in the codebase, and a row is
+written to `exercises` only when somebody actually logs that lift — which
+`pipeline.get_or_create_exercise` already did lazily for pasted journals. The
+catalog is a search index laid over your exercises, not a source of them.
+
+A lift picked from the catalog arrives with its equipment and muscle group
+already filled in (`is_custom = false`); one you typed yourself is marked
+custom and left for you to file.
+
+### Equipment is a column, not a suffix on the name
+
+"Bench Press (Barbell)" and "Bench Press (Dumbbell)" are different lifts with
+different loads and different histories, and they must never share a
+progression chart — a dumbbell bench at 30kg is not a barbell bench getting
+weaker. They are separate rows, and the equipment is its own column rather than
+something to be parsed back out of the name.
+
+That is also what lets the catalog be filtered the way people think ("show me
+barbell chest movements") instead of by substring-matching `(Barbell)`.
+
+And because the search box is used standing in a gym, `db incline`, `bb row`
+and `dumbell curl` all resolve. A search that fails on the most common
+abbreviation in the room is one nobody uses twice.
+
+### Only one workout can be live at a time, and the database enforces it
+
+`workout_sessions` with a NULL `finished_at` *is* the live workout. Not a
+draft in the browser — the server holds it, so a phone that locks, loses
+signal, or gets reloaded finds the same session waiting.
+
+Exactly one per person, enforced by a partial unique index:
+
+```sql
+CREATE UNIQUE INDEX idx_workout_sessions_one_active_per_user
+    ON workout_sessions (user_id) WHERE finished_at IS NULL;
+```
+
+Not by checking first. "Start workout" tapped twice with cold hands is a real
+thing, and check-then-insert races: both checks pass, both insert, and half the
+workout lands in each session. With the index, the loser of the race simply
+gets handed the winner's session — which is what the person wanted both times.
+
+Finishing a session frees the slot. Finishing an *empty* one deletes it
+instead: somebody opened the app and left, and keeping it would put a phantom
+workout on the heatmap and in the weekly count.
+
+### Three kinds of personal record, and a cache that can be rebuilt
+
+"Personal record" means three different things and a single number hides two
+of them:
+
+| | What it catches |
+|---|---|
+| Heaviest weight | The colloquial one. Insensitive to reps, so a hard single beats an easy ten |
+| Best estimated 1RM | What heaviest weight misses: 100×8 is a better set than 100×5 at the same "weight PR" |
+| Best session volume | The hypertrophy-facing one — more total work, at any load |
+
+They are all derivable from `workout_logs` and are cached in
+`personal_records` anyway, because of the interaction: telling somebody they
+just hit a PR has to happen as they tap the checkmark, and aggregating their
+whole history per set is the wrong thing to do on gym wifi. One indexed row per
+(person, lift, type) makes it a single-row read and a single-row upsert.
+
+A cache that cannot be rebuilt is a liability, so `records.rebuild()` recomputes
+the lot from `workout_logs` in three set-based statements. That is also the
+answer for the one thing the incremental path cannot do: it can only ever
+*raise* a record, so correcting or deleting the set that held one leaves it
+stale until a rebuild. There is a button for it.
+
+Warm-ups set no records — a heavy warm-up single would poison the cache with a
+number no later real set could beat. A set of entirely cheated reps sets no
+weight or 1RM record either, but still counts toward volume: the work happened,
+it just does not demonstrate strength at that load. Every figure comes from
+`insights` (`epley_1rm`, `clean_rep_count`), so a PR announced mid-workout
+cannot disagree with the report generated on Sunday.
+
+### The rest timer is a timestamp, not a countdown
+
+It stores "ends at 1789451340123" in `localStorage` and renders the difference
+from now on every tick. A timer that decrements a counter is wrong the moment
+the screen locks, the tab is backgrounded, or the browser throttles its timers
+— all of which happen constantly on a phone sitting on a bench. It also counts
+*up* past zero rather than vanishing, because knowing you are forty seconds
+over is more useful than the timer disappearing at the moment it matters.
+
+### A set logged without signal is queued, not lost
+
+Gym wifi drops mid-set. A failed `POST` goes into an outbox in `localStorage`
+and is retried on the `online` event and at next launch; you keep logging and
+the app reconciles when the signal comes back. The outbox drains oldest-first
+and stops at the first network failure, because sets belong to a session in
+order — draining past a failure would reorder them.
+
+The service worker caches the app shell so it opens at all on a dead
+connection, and never caches `/api`: a cached workout is a wrong workout, and
+showing yesterday's sets as if they were today's is worse than an honest
+failure.
+
+### The Previous column is one earlier session, not the last few sets
+
+The most useful thing on the logging screen is what you did last time — it is
+what turns logging into progressive overload. It is scoped to the most recent
+*earlier session* containing that lift, not to the last N sets of it: repeating
+a workout would otherwise splice two different days together and show a
+"previous" that never happened as a single session.
+
+Sets entered through the journal-paste flow have no session, so those are
+grouped by calendar day instead. Both are searched and the most recent wins, so
+the column works whichever way your last workout was recorded.
 
 ### Exercises are per-user, not a shared catalogue
 
@@ -809,7 +1040,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-866 tests, no network and no database required — they cover the Stage A
+1010 tests, no network and no database required — they cover the Stage A
 rule branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold), `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
@@ -822,6 +1053,33 @@ forward, and the review screen's draft/edit/save round trip. These are pure
 functions, so they are cheap to cover, and they are exactly the code where a
 silent bug produces a wrong training recommendation, or a saved row that does
 not match what was on screen, and nobody notices.
+
+63 of those cover the observability layer (`tests/test_observability.py`):
+that all four Prometheus metric types are present and behave like their type,
+that no metric carries an unbounded label — a test that fails if anyone adds a
+user id or request id as a label — that the open-drafts gauge can come back
+down, that the JSON log carries the fields Kibana needs, that request ids
+propagate and that malformed inbound ones are replaced rather than sanitised,
+that secrets and journal text are redacted by key and by shape, that fault
+injection is off by default and refuses to arm in production, and that the
+cardinality demo's 100-series cap holds.
+
+91 more cover the live workout half (`tests/test_workout_app.py`): catalog
+search and the gym abbreviations it has to handle, routine and set validation,
+the three personal-record rules and their agreement with `insights`, and — the
+important ones — that every statement touching an owned table names `user_id`
+and binds it, including `routine_exercises`, which has no `user_id` of its own
+and must be scoped through a join to its parent routine.
+
+Ten of those need Postgres, for the parts whose behaviour is the database's
+rather than Python's: the partial unique index that allows only one live
+session, the agreement between incremental record detection and a full rebuild,
+and cross-account isolation end to end. They skip by default so `pytest -q`
+still needs nothing installed:
+
+```bash
+TEST_DATABASE_URL=postgresql+psycopg2://... python -m pytest
+```
 
 Two files cover accounts. `tests/test_auth.py` takes the password and session
 machinery — salting, the stored cost factor, malformed hashes never

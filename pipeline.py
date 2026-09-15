@@ -22,6 +22,9 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
+# Aliased on import: `time` above is datetime.time, so the stdlib module cannot
+# be referred to by its own name anywhere in this file.
+from time import perf_counter as _perf_counter
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -814,9 +817,12 @@ def resolve_logged_at(
             if parsed.date() == session_date:
                 return local_to_utc(parsed, timezone_name)
             logger.warning(
-                "Discarding extracted timestamp %s: not on session date %s",
-                logged_at_local,
-                session_date,
+                "discarding an extracted timestamp that is not on the session date",
+                extra={
+                    "event.action": "timestamp_discarded",
+                    "timestamp.extracted": str(logged_at_local),
+                    "session.date": str(session_date),
+                },
             )
 
     return local_to_utc(datetime.combine(session_date, time(hour=default_hour)), timezone_name)
@@ -881,9 +887,15 @@ def completion_budget(raw_text: str, prompt_tokens: int) -> int:
         # say plainly that the request is too large. entry_fits_in_window() is
         # what stops extract_entities getting this far in the first place.
         logger.warning(
-            "A ~%d-token prompt leaves only %d of the %d TPM limit for the answer, "
-            "under the %d floor; sending the floor anyway.",
-            prompt_tokens, max(0, ceiling), GROQ_TPM_LIMIT, GROQ_MIN_COMPLETION_TOKENS,
+            "prompt leaves less than the completion floor under the TPM limit; "
+            "sending the floor anyway",
+            extra={
+                "event.action": "completion_budget_underfloor",
+                "llm.prompt_tokens": prompt_tokens,
+                "llm.remaining_tokens": max(0, ceiling),
+                "llm.tpm_limit": GROQ_TPM_LIMIT,
+                "llm.min_completion_tokens": GROQ_MIN_COMPLETION_TOKENS,
+            },
         )
         return GROQ_MIN_COMPLETION_TOKENS
 
@@ -1005,6 +1017,32 @@ def _sleep(seconds: float) -> None:
     clock.sleep(seconds)
 
 
+# --------------------------------------------------------------------------
+# Extraction telemetry
+# --------------------------------------------------------------------------
+
+# Optional on purpose. This module is imported by the CLI scripts and by the
+# test suite, neither of which wants a metrics registry as a condition of
+# running, and by the serverless bundles where the library may be absent.
+try:
+    from metrics import METRICS as _METRICS
+except Exception:  # noqa: BLE001 - extraction must work without instrumentation
+    _METRICS = None  # type: ignore[assignment]
+
+
+def _record_extraction(outcome: str, seconds: float) -> None:
+    """One extraction finished: count the outcome and bucket the duration.
+
+    Both are recorded on every path — success, rate limit and hard failure —
+    because a histogram that only observes successes reports a system getting
+    *faster* as it starts failing, which is precisely backwards.
+    """
+    if _METRICS is None:
+        return
+    _METRICS.llm_extractions_total.labels(outcome=outcome).inc()
+    _METRICS.llm_extraction_duration.observe(seconds)
+
+
 def _status_code(exc: Exception) -> Optional[int]:
     """HTTP status off a Groq SDK exception, wherever that version keeps it."""
     for attribute in ("status_code", "code"):
@@ -1080,7 +1118,10 @@ def _wait_out_rate_limit(exc: Exception) -> float:
     advised = retry_after_seconds(exc)
     wait = _DEFAULT_RETRY_WAIT_SECONDS if advised is None else advised
     wait = max(0.0, min(wait, GROQ_MAX_RETRY_WAIT_SECONDS))
-    logger.warning("Rate limited by Groq; waiting %.1fs before the retry.", wait)
+    logger.warning(
+        "rate limited by Groq; waiting before the retry",
+        extra={"event.action": "llm_rate_limited", "llm.wait_seconds": round(wait, 1)},
+    )
     _sleep(wait)
     return wait
 
@@ -1113,35 +1154,69 @@ def extract_entities(
 
     budget = completion_budget(raw_text, prompt_tokens)
     logger.debug(
-        "Extraction request: ~%d prompt tokens + %d reserved = ~%d against a %d TPM limit.",
-        prompt_tokens, budget, prompt_tokens + budget, GROQ_TPM_LIMIT,
+        "extraction request sized against the TPM limit",
+        extra={
+            "event.action": "extraction_budget",
+            "llm.prompt_tokens": prompt_tokens,
+            "llm.completion_budget": budget,
+            "llm.reserved_total": prompt_tokens + budget,
+            "llm.tpm_limit": GROQ_TPM_LIMIT,
+        },
     )
 
     last_error: Optional[Exception] = None
     attempts = _extraction_attempts(model, budget)
-    for number, options in enumerate(attempts, start=1):
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=_build_messages(raw_text, session_date),
-                temperature=0,
-                **options,
-            )
-            return extract_json_object(response.choices[0].message.content)
-        except Exception as exc:  # noqa: BLE001 - fall through to the next attempt
-            last_error = exc
-            logger.warning(
-                "Extraction attempt %d/%d failed (json_mode=%s): %s",
-                number, len(attempts), "response_format" in options, exc,
-            )
-            if number < len(attempts) and is_rate_limit_error(exc):
-                # A token ceiling is a condition of the clock, so an instant
-                # retry reproduces it exactly. Wait the window out, and ask for
-                # less as well: a 413 means this one reservation was itself over
-                # the limit, and no amount of waiting shrinks it.
-                _wait_out_rate_limit(exc)
-                budget = max(GROQ_MIN_COMPLETION_TOKENS, budget // 2)
-                attempts[number]["extra_body"]["max_completion_tokens"] = budget
+
+    # Timed around the whole call including retries and any rate-limit wait,
+    # because that total is what the person staring at the review screen
+    # actually experiences. The per-attempt breakdown is in the logs.
+    started = _perf_counter()
+    if _METRICS is not None:
+        _METRICS.llm_extractions_in_flight.inc()
+    try:
+        for number, options in enumerate(attempts, start=1):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=_build_messages(raw_text, session_date),
+                    temperature=0,
+                    **options,
+                )
+                parsed = extract_json_object(response.choices[0].message.content)
+                _record_extraction("success", _perf_counter() - started)
+                return parsed
+            except Exception as exc:  # noqa: BLE001 - fall through to the next attempt
+                last_error = exc
+                logger.warning(
+                    "extraction attempt failed",
+                    extra={
+                        "event.action": "llm_attempt_failed",
+                        "llm.attempt": number,
+                        "llm.attempts_total": len(attempts),
+                        "llm.json_mode": "response_format" in options,
+                        "error.message": str(exc),
+                    },
+                )
+                if number < len(attempts) and is_rate_limit_error(exc):
+                    # A token ceiling is a condition of the clock, so an instant
+                    # retry reproduces it exactly. Wait the window out, and ask
+                    # for less as well: a 413 means this one reservation was
+                    # itself over the limit, and no waiting shrinks it.
+                    _wait_out_rate_limit(exc)
+                    budget = max(GROQ_MIN_COMPLETION_TOKENS, budget // 2)
+                    attempts[number]["extra_body"]["max_completion_tokens"] = budget
+    finally:
+        # In a `finally` so the gauge cannot be left high by an exception
+        # escaping the loop — a gauge that only ever rises is worse than none.
+        if _METRICS is not None:
+            _METRICS.llm_extractions_in_flight.dec()
+
+    # Every attempt failed. Record the outcome once, classified, before the
+    # error is turned into the message the user sees.
+    _record_extraction(
+        "rate_limited" if last_error is not None and is_rate_limit_error(last_error) else "error",
+        _perf_counter() - started,
+    )
 
     if last_error is not None and is_rate_limit_error(last_error):
         served = reported_tpm_limit(last_error)
@@ -1653,7 +1728,10 @@ def build_draft(
     try:
         payload = extract_entities(raw_text, session_date, client=client)
     except ExtractionError as exc:
-        logger.error("Extraction failed: %s", exc)
+        logger.error(
+            "extraction failed, routing the entry to manual review",
+            extra={"event.action": "extraction_failed", "error.message": str(exc)},
+        )
         return EntryDraft(
             raw_text=raw_text,
             session_date=session_date,
@@ -2027,7 +2105,15 @@ def commit_draft(
             timezone_name=timezone_name,
         )
         if prior is not None:
-            logger.info("Duplicate submission held for a decision (%s)", prior)
+            logger.info(
+                "duplicate submission held for a decision",
+                extra={
+                    "event.action": "duplicate_held",
+                    "session.date": str(draft.session_date),
+                    "duplicate.prior_sets": prior["inserted_sets"],
+                    "duplicate.prior_bodyweight": prior["inserted_bodyweight"],
+                },
+            )
             return PipelineResult(
                 inserted_sets=prior["inserted_sets"],
                 inserted_bodyweight=prior["inserted_bodyweight"],
@@ -2105,7 +2191,14 @@ def commit_draft(
             result.replaced = delete_entries_for_date(
                 conn, draft.session_date, user_id, timezone_name
             )
-            logger.info("Replaced %s on %s", result.replaced, draft.session_date)
+            logger.info(
+                "replaced the entries already logged on that date",
+                extra={
+                    "event.action": "entries_replaced",
+                    "session.date": str(draft.session_date),
+                    "entry.replaced": result.replaced,
+                },
+            )
         known = load_exercise_names(conn, user_id)
         for workout_set, confidence, chosen_group, name_typed in accepted_sets:
             exercise_id, matched_name, created = get_or_create_exercise(
@@ -2137,8 +2230,12 @@ def commit_draft(
                 if flag is not None:
                     result.name_flags.append(flag)
                     logger.info(
-                        "event=name_flagged exercise=%r reason=%s",
-                        workout_set.exercise_name, flag.reason,
+                        "exercise name flagged for review",
+                        extra={
+                            "event.action": "name_flagged",
+                            "exercise.name": workout_set.exercise_name,
+                            "flag.reason": flag.reason,
+                        },
                     )
             elif matched_name and matched_name != workout_set.exercise_name:
                 result.exercises_matched.append((workout_set.exercise_name, matched_name))
@@ -2221,7 +2318,14 @@ def process_entry(
             timezone_name=timezone_name,
         )
         if prior is not None:
-            logger.info("Duplicate submission suppressed (%s)", prior)
+            logger.info(
+                "duplicate submission suppressed",
+                extra={
+                    "event.action": "duplicate_suppressed",
+                    "duplicate.prior_sets": prior["inserted_sets"],
+                    "duplicate.prior_bodyweight": prior["inserted_bodyweight"],
+                },
+            )
             return PipelineResult(
                 inserted_sets=prior["inserted_sets"],
                 inserted_bodyweight=prior["inserted_bodyweight"],

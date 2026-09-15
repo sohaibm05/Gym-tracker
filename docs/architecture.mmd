@@ -1,0 +1,41 @@
+flowchart TB
+    user(["Person with a<br/>phone and a<br/>journal entry"])
+
+    subgraph app_tier["Application"]
+        app["<b>gym-tracker</b><br/>FastAPI / uvicorn :8000<br/>───────────────<br/>/metrics exposition<br/>JSON logs to stdout"]
+        pg[("<b>Postgres 16</b><br/>:5432<br/>workouts, users,<br/>reports")]
+    end
+
+    groq{{"<b>Groq API</b><br/>external<br/>LLM extraction"}}
+
+    subgraph metrics_pipeline["Metrics — pull"]
+        prom["<b>Prometheus</b> :9090<br/>scrapes every 15s<br/>TSDB, 15d retention"]
+        node["<b>node-exporter</b> :9100<br/>host CPU/mem/disk/net"]
+        graf["<b>Grafana</b> :3000<br/>3 provisioned dashboards"]
+    end
+
+    subgraph logs_pipeline["Logs — push"]
+        docker[/"<b>Docker json-file driver</b><br/>/var/lib/docker/containers/<br/>10MB x 3 per container"/]
+        fb["<b>Filebeat</b><br/>tails, strips envelope,<br/>decode_json_fields"]
+        es[("<b>Elasticsearch</b> :9200<br/>indexed documents<br/>ILM: delete after 7d")]
+        kib["<b>Kibana</b> :5601<br/>Discover + saved searches"]
+    end
+
+    user -->|HTTPS| app
+    app -->|"SQL<br/>(SQLAlchemy)"| pg
+    app -->|"HTTPS<br/>extraction"| groq
+
+    app -.->|"HTTP GET /metrics<br/><b>Prometheus pulls</b>"| prom
+    node -.->|"HTTP GET /metrics"| prom
+    prom -->|PromQL| graf
+
+    app ==>|stdout| docker
+    docker ==>|"reads file"| fb
+    fb ==>|"bulk index"| es
+    es -->|queries| kib
+    es -.->|"log panels"| graf
+
+    classDef store fill:#e8f0fe,stroke:#3367d6,stroke-width:2px
+    classDef ext fill:#fff4e5,stroke:#e8830c,stroke-width:2px,stroke-dasharray:4 3
+    class pg,es store
+    class groq ext

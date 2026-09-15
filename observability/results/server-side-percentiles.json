@@ -1,0 +1,27 @@
+{
+  "01-baseline": {
+    "observations": 282.0,
+    "p50_ms": 2.5,
+    "p95_ms": 4.8,
+    "p99_ms": 5.0,
+    "mean_ms": 0.8,
+    "faults_injected": 0
+  },
+  "02-fault": {
+    "observations": 199.0,
+    "p50_ms": 3.1,
+    "p95_ms": 686.2,
+    "p99_ms": 737.2,
+    "mean_ms": 98.9,
+    "faults_injected": 40
+  },
+  "03-recovery": {
+    "observations": 282.0,
+    "p50_ms": 2.5,
+    "p95_ms": 4.8,
+    "p99_ms": 5.0,
+    "mean_ms": 0.9,
+    "faults_injected": 0
+  },
+  "_note": "Computed from the app's own Prometheus histogram buckets by replicating histogram_quantile's linear in-bucket interpolation. See docs/REPORT.md, 'What is verified, and what is not'."
+}

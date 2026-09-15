@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<!-- viewport-fit=cover so the safe-area insets in app.css actually have values
+     to work with on a notched phone; without it the app stops short of the
+     screen edges and the bottom bar floats above the home indicator. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d10">
+<meta name="description" content="Log your workouts set by set, with rest timers, personal records and progress tracking.">
+<!-- Tells iOS to run the installed app without Safari's chrome. -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Gym Tracker">
+<title>Workout — Gym Tracker</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<!-- Browsers request /favicon.ico on their own whatever the SVG says; naming a
+     real PNG here stops that turning into a 404 in the access log. -->
+<link rel="icon" href="/static/icon-192.png" sizes="192x192" type="image/png">
+<link rel="apple-touch-icon" href="/static/icon-180.png">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+<div class="offline" id="offline" hidden>Offline — sets are saved on this phone and will sync</div>
+
+<header class="appbar">
+  <button class="iconbtn" id="back" hidden aria-label="Back">‹</button>
+  <h1 id="title">Workout<span class="sub" id="subtitle"></span></h1>
+  <button class="iconbtn" id="refresh" aria-label="Refresh">⟳</button>
+</header>
+
+<main>
+
+  <!-- ============================ HOME ============================ -->
+  <section class="view" id="view-home">
+    <div class="card" id="resume" hidden>
+      <div class="row between">
+        <div class="grow">
+          <h2 id="resume-name">Workout in progress</h2>
+          <p class="muted" id="resume-meta"></p>
+        </div>
+        <button class="primary" id="resume-go">Resume</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row between">
+        <h2>Routines</h2>
+        <button class="small" id="new-routine">+ New</button>
+      </div>
+      <p class="muted">Tap one to start, or Edit to change it.</p>
+    </div>
+
+    <div id="routine-list" class="stack"></div>
+
+    <div class="card">
+      <h2>Training days</h2>
+      <p class="muted" id="heatmap-caption">Loading…</p>
+      <div class="heatmap" id="heatmap" role="img" aria-label="Training days"></div>
+    </div>
+
+    <div class="row" style="gap:.6rem">
+      <button class="grow" id="go-records">🏆 Records</button>
+      <button class="grow" id="go-measure">📏 Measurements</button>
+    </div>
+    <button class="ghost wide" id="go-history">Recent workouts</button>
+    <p class="faint" style="text-align:center">
+      <a href="/" style="color:inherit">Paste a journal entry instead</a> ·
+      <a href="/progress" style="color:inherit">Charts</a>
+    </p>
+  </section>
+
+  <!-- ========================== WORKOUT =========================== -->
+  <section class="view" id="view-workout" hidden>
+    <div class="row between">
+      <div>
+        <div class="muted" id="w-elapsed">0:00</div>
+        <div class="faint" id="w-totals">no sets yet</div>
+      </div>
+      <button class="small" id="add-exercise">+ Exercise</button>
+    </div>
+    <div id="exercise-list" class="stack"></div>
+  </section>
+
+  <!-- ====================== EXERCISE PICKER ======================= -->
+  <section class="view" id="view-picker" hidden>
+    <input type="search" id="picker-q" placeholder="Search exercises…"
+           autocomplete="off" autocapitalize="off" spellcheck="false">
+    <div class="chiprow" id="picker-equipment"></div>
+    <div class="card" style="padding:0" id="picker-results"></div>
+  </section>
+
+  <!-- ====================== ROUTINE EDITOR ======================== -->
+  <section class="view" id="view-routine" hidden>
+    <div class="card">
+      <label for="r-name">Name</label>
+      <input id="r-name" placeholder="Push Day" maxlength="80">
+      <label for="r-notes" style="margin-top:.6rem">Notes</label>
+      <input id="r-notes" placeholder="optional" maxlength="200">
+    </div>
+    <div id="r-exercises" class="stack"></div>
+    <button class="wide" id="r-add">+ Add exercise</button>
+    <button class="ghost wide danger" id="r-delete" hidden>Delete routine</button>
+  </section>
+
+  <!-- ========================== RECORDS =========================== -->
+  <section class="view" id="view-records" hidden>
+    <div id="records-list" class="stack"></div>
+    <button class="ghost wide" id="records-rebuild">Recalculate from all logged sets</button>
+    <p class="faint">
+      Records update as you log. Recalculating is only needed after correcting
+      or deleting a set that held one.
+    </p>
+  </section>
+
+  <!-- ======================== MEASUREMENTS ======================== -->
+  <section class="view" id="view-measure" hidden>
+    <div class="tiles" id="measure-tiles"></div>
+    <div class="card">
+      <h2>Add measurements</h2>
+      <p class="muted">Leave blank what you did not measure. Centimetres.</p>
+      <div class="stack" id="measure-form"></div>
+      <button class="primary wide" id="measure-save" style="margin-top:.7rem">Save</button>
+    </div>
+    <div class="card" id="measure-chart-card" hidden>
+      <h2>Trend</h2>
+      <div id="measure-chart"></div>
+    </div>
+  </section>
+
+  <!-- ========================== HISTORY =========================== -->
+  <section class="view" id="view-history" hidden>
+    <div id="history-list" class="stack"></div>
+  </section>
+
+</main>
+
+<!-- Rest timer floats above the action bar and is visible from any screen. -->
+<div class="resttimer" id="rest" hidden>
+  <div class="inner">
+    <span class="clock" id="rest-clock">0:00</span>
+    <span class="grow" id="rest-label">Rest</span>
+    <button id="rest-add">+30s</button>
+    <button id="rest-skip">Skip</button>
+  </div>
+</div>
+
+<div class="actionbar" id="actionbar"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

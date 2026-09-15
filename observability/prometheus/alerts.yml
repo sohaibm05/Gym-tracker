@@ -1,0 +1,137 @@
+# Alerting rules.
+#
+# No Alertmanager is wired into this stack, so these do not page anyone — they
+# surface in Prometheus at /alerts and as annotations on the Grafana panels.
+# They are here because writing the alert is what forces a number onto the word
+# "slow", and because each one names a failure the Part E experiment can
+# actually produce.
+#
+# Every rule uses `for:`, so a condition has to persist before it fires. Without
+# it a single slow scrape raises an alert, people learn the alerts are noise,
+# and the next real one is ignored.
+
+groups:
+
+  - name: gym-tracker-availability
+    rules:
+
+      # The most valuable alert in any Prometheus setup. `up` is synthesised by
+      # Prometheus itself for every target, so this fires when a service stops
+      # answering — including when the app crashes outright and can no longer
+      # report anything about itself.
+      - alert: TargetDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} target is down"
+          description: "Prometheus cannot scrape {{ $labels.instance }} ({{ $labels.job }})."
+
+      - alert: HighErrorRate
+        # 5xx as a share of all responses over 5 minutes.
+        expr: |
+          sum(rate(gym_http_requests_total{status=~"5.."}[5m]))
+            /
+          sum(rate(gym_http_requests_total[5m]))
+            > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "More than 5% of requests are failing"
+          description: "5xx rate is {{ $value | humanizePercentage }} over the last 5 minutes."
+
+  - name: gym-tracker-latency
+    rules:
+
+      # p95 over a 5-minute window. This is the rule the Part E latency
+      # experiment is designed to trip.
+      - alert: SlowRequests
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, route) (rate(gym_http_request_duration_seconds_bucket[5m]))
+          ) > 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 latency above 1s on {{ $labels.route }}"
+          description: "95th percentile is {{ $value }}s over 5 minutes."
+
+      # The LLM is the slowest dependency and the one most likely to degrade
+      # without failing outright, so it gets its own threshold.
+      - alert: SlowExtraction
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(gym_llm_extraction_duration_seconds_bucket[5m]))
+          ) > 15
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Groq extraction p95 above 15s"
+          description: "Parsing an entry is taking {{ $value }}s at p95."
+
+  - name: gym-tracker-business
+    rules:
+
+      # A business alert, not a technical one: nothing is down, but the product
+      # has stopped doing its job. Extraction quietly returning empty results
+      # looks perfectly healthy on every application metric.
+      - alert: SavesFailingReview
+        expr: |
+          sum(rate(gym_workout_entries_total{outcome="blocked"}[15m]))
+            /
+          sum(rate(gym_workout_entries_total[15m]))
+            > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Most save attempts are being blocked by the review form"
+          description: >-
+            {{ $value | humanizePercentage }} of entries are failing validation.
+            Extraction quality may have regressed.
+
+      # Fires whenever the Part E fault injector is armed. A deliberately
+      # degraded process that nobody remembered to reset is a real hazard, so
+      # the stack refuses to be quiet about it.
+      - alert: FaultInjectionActive
+        expr: increase(gym_faults_injected_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fault injection is ACTIVE ({{ $labels.kind }})"
+          description: >-
+            This process is deliberately degraded. Unset FAULT_INJECTION_ENABLED
+            and restart the app to clear it.
+
+  - name: host
+    rules:
+
+      - alert: HostLowDisk
+        expr: |
+          node_filesystem_avail_bytes{mountpoint="/"}
+            / node_filesystem_size_bytes{mountpoint="/"}
+            < 0.10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Less than 10% disk free on {{ $labels.instance }}"
+          description: >-
+            Elasticsearch stops accepting writes at its own flood-stage
+            watermark, so a full disk silently ends log ingestion.
+
+      - alert: HostHighCpu
+        # 1 minus the share of time spent idle, averaged across cores.
+        expr: 1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) > 0.90
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Host CPU above 90% for 10 minutes"

@@ -1,0 +1,1 @@
+{"status":"degraded","fault_injection":{"armed":true,"enabled":true,"app_env":"development","latency_ms":500.0,"latency_every_n":5,"error_every_n":0,"error_status":503,"path_prefix":null}}

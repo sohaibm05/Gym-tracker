@@ -1,0 +1,20 @@
+# Tells Grafana to load every dashboard JSON file in the mounted directory.
+# The dashboards themselves are in observability/grafana/dashboards/ and are
+# version-controlled like any other source file.
+
+apiVersion: 1
+
+providers:
+  - name: gym-tracker
+    orgId: 1
+    folder: Gym Tracker
+    type: file
+    # Editing a provisioned dashboard in the UI is allowed, but the change is
+    # overwritten on the next restart. The file is the source of truth; export
+    # the JSON back into the repo to keep a change.
+    disableDeletion: false
+    allowUiUpdates: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

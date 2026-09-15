@@ -1,2 +1,4 @@
 -r requirements.txt
 pytest>=8.0
+# The async fault-injection tests use anyio's pytest plugin.
+anyio>=4.0
