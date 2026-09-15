@@ -795,3 +795,326 @@ class TestAgainstPostgres:
             written = measurements_module.record_many(
                 conn, 1, {"chest": "104", "waist": "", "hips": None})
         assert [m.site for m in written] == ["chest"]
+
+
+# ==========================================================================
+# Regressions
+#
+# One test per bug found in review. Each names the failure it prevents, because
+# a regression test whose purpose is not written down gets deleted by the next
+# person who finds it inconvenient.
+# ==========================================================================
+
+
+class TestValidationRegressions:
+    def test_zero_reps_is_rejected_in_python_not_by_the_database(self):
+        """reps=0 passed every Python check and then violated
+        `workout_logs_reps_positive`, so a typo surfaced as an opaque 500
+        instead of the message the validator exists to produce."""
+        with pytest.raises(sessions_module.SessionError, match="Reps"):
+            sessions_module._validate_set(50, 0, 0, None, None)
+
+    def test_zero_weight_is_still_allowed(self):
+        """The bound moved for reps only. A bodyweight set carries no load, and
+        rejecting weight=0 would make a dip unloggable."""
+        cleaned = sessions_module._validate_set(0, 10, 0, None, None)
+        assert cleaned["weight_kg"] == 0 and cleaned["reps"] == 10
+
+
+class TestPartialUpdateRegression:
+    """PUT /sets/{id} is a partial update. It used to replace every column."""
+
+    def _stored(self):
+        return {
+            "weight_kg": 100.0, "reps": 5, "cheat_reps": 0,
+            "rpe": 8.0, "rir": None,
+        }
+
+    def test_omitted_fields_keep_their_stored_values(self):
+        engine = RecordingEngine(
+            responses={
+                "FROM workout_logs wl JOIN exercises": _Result([(
+                    3, "Squat", 9, 2, True, 100.0, 5, 0, 8.0, None, False, False, None,
+                    datetime.now().astimezone(),
+                )]),
+            }
+        )
+        with engine.begin() as conn:
+            updated = sessions_module.update_set(conn, USER_ID, 42, reps=9)
+
+        update = next(
+            params for sql, params in engine.calls if sql.startswith("UPDATE workout_logs")
+        )
+        # Only the rep count moved. Nulling the rest is what destroyed the
+        # recorded load and effort of a set somebody was fixing a typo in.
+        assert update["reps"] == 9
+        assert update["weight_kg"] == 100.0
+        assert update["rpe"] == 8.0
+        assert updated.weight_kg == 100.0
+
+    def test_an_omitted_warmup_flag_is_not_cleared(self):
+        """`fields.get("is_warmup", stored)` never fired its default, because
+        the key was present with value None. A warm-up silently became a
+        working set, and then competed for records."""
+        engine = RecordingEngine(
+            responses={
+                "FROM workout_logs wl JOIN exercises": _Result([(
+                    3, "Squat", 9, 2, True, 100.0, 5, 0, None, None, False, False, None,
+                    datetime.now().astimezone(),
+                )]),
+            }
+        )
+        with engine.begin() as conn:
+            updated = sessions_module.update_set(conn, USER_ID, 42, reps=6)
+        assert updated.is_warmup is True
+
+    def test_an_explicit_null_still_clears_a_field(self):
+        """Passing rpe=None means "clear it" and must be distinguishable from
+        not mentioning rpe at all."""
+        engine = RecordingEngine(
+            responses={
+                "FROM workout_logs wl JOIN exercises": _Result([(
+                    3, "Squat", 9, 2, False, 100.0, 5, 0, 8.0, None, False, False, None,
+                    datetime.now().astimezone(),
+                )]),
+            }
+        )
+        with engine.begin() as conn:
+            sessions_module.update_set(conn, USER_ID, 42, rpe=None)
+        update = next(
+            params for sql, params in engine.calls if sql.startswith("UPDATE workout_logs")
+        )
+        assert update["rpe"] is None
+        assert update["weight_kg"] == 100.0  # untouched
+
+
+class TestSearchKeyAgreement:
+    def test_the_migration_backfill_matches_catalog_search_key(self):
+        """The backfilled key has to equal what the application computes, or the
+        indexed lookup misses every migrated row and the picker offers to create
+        lifts the person already has.
+
+        The SQL is read out of the migration rather than restated, so the two
+        cannot drift apart without this failing.
+        """
+        migration = (
+            Path(__file__).resolve().parents[1]
+            / "migrations"
+            / "003_routines_sessions_measurements.sql"
+        ).read_text()
+        assert "btrim(" in migration, "the backfill must trim, or trailing punctuation lingers"
+        assert "translate(" in migration, "the backfill must fold accents"
+        # And the Python side is the definition both agree on.
+        assert catalog.search_key("Bench Press (Barbell)") == "bench press barbell"
+        assert catalog.search_key("Café Press") == "cafe press"
+
+    def test_the_journal_flow_writes_a_search_key(self):
+        """A row created by pipeline.get_or_create_exercise with a NULL
+        search_key is invisible to the picker's indexed search, which is how one
+        lift became two rows with two separate histories."""
+        import pipeline
+
+        source = Path(pipeline.__file__).read_text()
+        insert = source[source.index("INSERT INTO exercises"):]
+        insert = insert[: insert.index("RETURNING")]
+        assert "search_key" in insert
+
+
+class TestPackaging:
+    def test_dockerignore_excludes_secrets_and_the_virtualenv(self):
+        """`COPY . .` with no .dockerignore bakes .env into an image layer,
+        where docker history exposes it to anyone who can pull."""
+        patterns = {
+            line.strip()
+            for line in (Path(__file__).resolve().parents[1] / ".dockerignore").read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        }
+        for required in (".env", ".venv/", ".git/"):
+            assert required in patterns, f"{required} must not reach the image"
+
+    def test_the_cardinality_demo_still_reaches_the_image(self):
+        """docker-compose runs it from the app image, so excluding
+        observability/ wholesale would break the Part E2 service."""
+        ignore = (Path(__file__).resolve().parents[1] / ".dockerignore").read_text()
+        assert "observability/\n" not in ignore
+        assert "observability/cardinality_demo.py" not in ignore
+
+
+@needs_db
+class TestPostgresRegressions:
+    """Bugs that only reproduce against a real database."""
+
+    @pytest.fixture
+    def engine(self):
+        import sqlalchemy as sa
+
+        eng = sa.create_engine(os.environ["TEST_DATABASE_URL"], future=True)
+        with eng.begin() as conn:
+            conn.execute(sa.text(
+                "TRUNCATE personal_records, measurements, workout_logs, "
+                "workout_sessions, routine_exercises, routines, exercises, "
+                "users RESTART IDENTITY CASCADE"))
+            conn.execute(sa.text(
+                "INSERT INTO users (username, display_name, password_hash) "
+                "VALUES ('a','A','x'), ('b','B','x')"))
+        return eng
+
+    def test_a_second_start_returns_the_live_session_not_an_error(self, engine):
+        """The double-tap recovery read used to run on a transaction the failed
+        INSERT had already aborted, so Postgres refused it and the race this
+        code exists to absorb surfaced as a 500. A SAVEPOINT scopes the failure
+        so the recovery is legal.
+        """
+        import sqlalchemy as sa
+
+        with engine.begin() as conn:
+            first = sessions_module.start_session(conn, 1, name="A")
+            # Simulate the loser of the race: the row is already there, so the
+            # INSERT inside start_session violates the partial unique index.
+            second = sessions_module.start_session(conn, 1, name="B")
+            assert second.session_id == first.session_id
+            # The transaction must still be usable afterwards.
+            assert conn.execute(sa.text("SELECT 1")).scalar() == 1
+
+    def test_zero_reps_never_reaches_the_check_constraint(self, engine):
+        with engine.begin() as conn:
+            exercise_id = sessions_module.resolve_exercise(conn, 1, "Squat (Barbell)")
+            session = sessions_module.start_session(conn, 1, name="A")
+            with pytest.raises(sessions_module.SessionError):
+                sessions_module.log_set(
+                    conn, 1, session.session_id, exercise_id=exercise_id,
+                    weight_kg=50, reps=0)
+
+    def test_resolving_a_catalog_name_finds_a_row_created_by_the_journal(self, engine):
+        """The journal flow files "Bench Press (Barbell)"; the picker then
+        resolved "bench press barbell" and inserted the SAME canonical name
+        again, violating the unique constraint. Both now land on one row.
+        """
+        import sqlalchemy as sa
+
+        with engine.begin() as conn:
+            conn.execute(sa.text(
+                "INSERT INTO exercises (user_id, name, muscle_group) "
+                "VALUES (1, 'Bench Press (Barbell)', 'Chest')"))
+            resolved = sessions_module.resolve_exercise(conn, 1, "bench press barbell")
+            rows = conn.execute(sa.text(
+                "SELECT exercise_id FROM exercises WHERE user_id = 1")).fetchall()
+        assert len(rows) == 1, "one lift must not become two rows"
+        assert resolved == rows[0][0]
+
+    def test_the_stored_search_key_describes_its_own_row(self, engine):
+        """It used to be computed from what was typed while the CATALOG name was
+        stored, so the key did not describe the row it was on."""
+        import sqlalchemy as sa
+
+        with engine.begin() as conn:
+            exercise_id = sessions_module.resolve_exercise(conn, 1, "bench press barbell")
+            name, key = conn.execute(sa.text(
+                "SELECT name, search_key FROM exercises WHERE exercise_id = :i"),
+                {"i": exercise_id}).fetchone()
+        assert name == "Bench Press (Barbell)"
+        assert key == catalog.search_key(name)
+
+    def test_session_volume_is_announced_once_per_session(self, engine):
+        """It is a running total compared against the record the same session
+        just stored, so every later set beat it and fired another toast."""
+        with engine.begin() as conn:
+            exercise_id = sessions_module.resolve_exercise(conn, 1, "Squat (Barbell)")
+            session = sessions_module.start_session(conn, 1, name="A")
+            announced = []
+            for _ in range(4):
+                _, breaks = sessions_module.log_set(
+                    conn, 1, session.session_id, exercise_id=exercise_id,
+                    weight_kg=100, reps=5)
+                announced.append([b.record_type for b in breaks])
+
+        volume_toasts = sum(
+            1 for kinds in announced if records.BEST_SESSION_VOLUME in kinds
+        )
+        assert volume_toasts == 1, announced
+        # The record itself still tracks the full session total.
+        with engine.begin() as conn:
+            stored = records.current(conn, 1, exercise_id)[records.BEST_SESSION_VOLUME]
+        assert stored.value == pytest.approx(2000)
+
+    def test_a_later_session_that_beats_it_is_announced(self, engine):
+        """Suppressing the repeat must not suppress a genuine improvement."""
+        with engine.begin() as conn:
+            exercise_id = sessions_module.resolve_exercise(conn, 1, "Squat (Barbell)")
+            first = sessions_module.start_session(conn, 1, name="A")
+            for _ in range(3):
+                sessions_module.log_set(conn, 1, first.session_id,
+                                        exercise_id=exercise_id, weight_kg=100, reps=5)
+            sessions_module.finish_session(conn, 1, first.session_id)
+
+            second = sessions_module.start_session(conn, 1, name="B")
+            announced = []
+            for _ in range(4):
+                _, breaks = sessions_module.log_set(
+                    conn, 1, second.session_id, exercise_id=exercise_id,
+                    weight_kg=100, reps=5)
+                announced.append([b.record_type for b in breaks])
+
+        assert any(records.BEST_SESSION_VOLUME in kinds for kinds in announced), announced
+
+    def test_loading_a_session_costs_a_fixed_number_of_queries(self, engine):
+        """previous_performance ran once per exercise, and the API reloaded the
+        whole session after every logged set — so one tap cost a query per lift
+        in the routine, on gym wifi.
+        """
+        import sqlalchemy as sa
+        from sqlalchemy import event
+
+        counter = {"n": 0}
+
+        @event.listens_for(engine, "before_cursor_execute")
+        def _count(conn, cursor, statement, params, context, executemany):
+            counter["n"] += 1
+
+        try:
+            with engine.begin() as conn:
+                ids = [
+                    sessions_module.resolve_exercise(conn, 1, name)
+                    for name in (
+                        "Bench Press (Barbell)", "Squat (Barbell)",
+                        "Lat Pulldown (Cable)", "Bicep Curl (Dumbbell)",
+                        "Lateral Raise (Dumbbell)", "Leg Press (Machine)",
+                    )
+                ]
+                routine = routines_module.create_routine(
+                    conn, 1, "Full",
+                    exercises=[{"exercise_id": i, "target_sets": 3} for i in ids])
+                session = sessions_module.start_session(
+                    conn, 1, routine_id=routine.routine_id)
+
+            with engine.begin() as conn:
+                counter["n"] = 0
+                loaded = sessions_module.load_session(conn, 1, session.session_id)
+        finally:
+            event.remove(engine, "before_cursor_execute", _count)
+
+        assert len(loaded.exercises) == 6
+        # Flat in the number of exercises. The old shape was ~1 + 1 + 1 + N.
+        assert counter["n"] <= 6, f"{counter['n']} queries for a 6-lift routine"
+
+    def test_previous_performance_in_bulk_matches_one_at_a_time(self, engine):
+        """The bulk query replaced N single queries, so it has to agree with
+        them exactly."""
+        with engine.begin() as conn:
+            ids = [
+                sessions_module.resolve_exercise(conn, 1, name)
+                for name in ("Bench Press (Barbell)", "Squat (Barbell)")
+            ]
+            old = sessions_module.start_session(conn, 1, name="old")
+            for exercise_id, weight in zip(ids, (80, 120)):
+                sessions_module.log_set(conn, 1, old.session_id,
+                                        exercise_id=exercise_id, weight_kg=weight, reps=5)
+                sessions_module.log_set(conn, 1, old.session_id,
+                                        exercise_id=exercise_id, weight_kg=weight, reps=4)
+            sessions_module.finish_session(conn, 1, old.session_id)
+
+            bulk = sessions_module.previous_performance_bulk(conn, 1, ids)
+            for exercise_id in ids:
+                one = sessions_module.previous_performance(conn, 1, exercise_id)
+                assert [s.display for s in bulk[exercise_id][0]] == [s.display for s in one[0]]
+                assert bulk[exercise_id][1] == one[1]

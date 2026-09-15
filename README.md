@@ -449,8 +449,17 @@ over is more useful than the timer disappearing at the moment it matters.
 Gym wifi drops mid-set. A failed `POST` goes into an outbox in `localStorage`
 and is retried on the `online` event and at next launch; you keep logging and
 the app reconciles when the signal comes back. The outbox drains oldest-first
-and stops at the first network failure, because sets belong to a session in
-order — draining past a failure would reorder them.
+and stops at the first transient failure, because sets belong to a session in
+order — draining past one would reorder them.
+
+What counts as transient is decided by the HTTP status, not by
+`navigator.onLine` and not by matching the error text. The common gym failure is
+an access point you are associated to whose uplink is dead, or a captive portal:
+the browser still reports itself online, the request fails, and gating the
+outbox on `navigator.onLine` meant the set was dropped in exactly the situation
+the outbox exists for. A 4xx is a permanent refusal and is discarded with a
+message; anything else — a 5xx, a timeout, a rejected fetch with no status at
+all — is kept.
 
 The service worker caches the app shell so it opens at all on a dead
 connection, and never caches `/api`: a cached workout is a wrong workout, and
@@ -1040,7 +1049,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-1010 tests, no network and no database required — they cover the Stage A
+1019 tests, no network and no database required — they cover the Stage A
 rule branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold), `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
@@ -1064,21 +1073,42 @@ that secrets and journal text are redacted by key and by shape, that fault
 injection is off by default and refuses to arm in production, and that the
 cardinality demo's 100-series cap holds.
 
-91 more cover the live workout half (`tests/test_workout_app.py`): catalog
+108 more cover the live workout half (`tests/test_workout_app.py`): catalog
 search and the gym abbreviations it has to handle, routine and set validation,
 the three personal-record rules and their agreement with `insights`, and — the
 important ones — that every statement touching an owned table names `user_id`
 and binds it, including `routine_exercises`, which has no `user_id` of its own
 and must be scoped through a join to its parent routine.
 
-Ten of those need Postgres, for the parts whose behaviour is the database's
-rather than Python's: the partial unique index that allows only one live
-session, the agreement between incremental record detection and a full rebuild,
-and cross-account isolation end to end. They skip by default so `pytest -q`
-still needs nothing installed:
+A block of those are regressions, one per bug found in code review, each naming
+the failure it prevents: reps of zero reaching a CHECK constraint as a 500, a
+partial set edit nulling the fields it did not mention, the cumulative volume
+record announcing itself on every set, one lift becoming two rows because the
+stored search key did not describe its own row, and `.dockerignore` letting
+`.env` into an image layer.
+
+Eighteen need Postgres, for the parts whose behaviour is the database's rather
+than Python's: the partial unique index that allows only one live session, the
+savepoint that makes the double-tap recovery legal on an aborted transaction,
+the agreement between incremental record detection and a full rebuild, and
+cross-account isolation end to end. They skip by default so `pytest -q` still
+needs nothing installed:
 
 ```bash
 TEST_DATABASE_URL=postgresql+psycopg2://... python -m pytest
+```
+
+The suite is order-independent. It was not: two tests called
+`importlib.reload(pipeline)` to check configuration read at import time, which
+rebinds every class in the module — so any test already holding
+`from pipeline import WorkoutSet` was left with a class `isinstance` no longer
+recognised, and the suite failed on roughly a third of orderings for reasons
+nowhere near the test that did the reloading. Those tests now do the fresh
+import in a subprocess, which cannot reach back into the interpreter running
+the suite. Worth checking occasionally:
+
+```bash
+pip install pytest-randomly && python -m pytest -p randomly
 ```
 
 Two files cover accounts. `tests/test_auth.py` takes the password and session

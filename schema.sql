@@ -254,7 +254,7 @@ CREATE INDEX IF NOT EXISTS idx_measurements_user_site_measured
 -- someone they just hit a PR has to happen as they tap the checkmark, and
 -- aggregating their whole history per set is the wrong thing to do on gym wifi.
 -- One indexed row per (person, exercise, type) makes it a single-row read and a
--- single-row upsert. Rebuildable from workout_logs by records.rebuild_records().
+-- single-row upsert. Rebuildable from workout_logs by records.rebuild().
 CREATE TABLE IF NOT EXISTS personal_records (
     record_id    BIGSERIAL PRIMARY KEY,
     user_id      INTEGER NOT NULL REFERENCES users (user_id) ON DELETE CASCADE,

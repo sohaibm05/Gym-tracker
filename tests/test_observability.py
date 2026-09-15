@@ -81,6 +81,32 @@ def isolated():
     return IsolatedMetrics()
 
 
+@pytest.fixture(autouse=True)
+def restore_logging_state():
+    """Put the root logger and the request id back after every test.
+
+    `configure_logging()` removes every existing root handler and installs its
+    own — that is what it is for, and it makes a test that calls it destructive
+    to everything after it in the session: pytest's own capture handler is gone,
+    and the next test's log output goes to a StringIO some earlier test owns.
+    `set_request_id()` leaks the same way, stamping one test's id onto every
+    later record.
+
+    Autouse, so it covers tests that call these indirectly through `import app`
+    as well as the ones that call them on purpose.
+    """
+    root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    saved_level = root.level
+    saved_request_id = logging_setup.request_id_var.get()
+    try:
+        yield
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
+        logging_setup.request_id_var.set(saved_request_id)
+
+
 # --------------------------------------------------------------------------
 
 

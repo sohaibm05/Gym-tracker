@@ -53,13 +53,21 @@ router = APIRouter(prefix="/api", tags=["api"])
 # import: app.py imports this module, so this module cannot import app.py.
 _get_engine: Optional[Callable[[], Any]] = None
 _require_user: Optional[Callable[..., Any]] = None
+# app.LoginRequired. Needed to tell "not signed in" from "the database is
+# briefly unreachable", which must not produce the same answer.
+_LOGIN_REQUIRED: Optional[type] = None
 
 
-def configure(get_engine: Callable[[], Any], require_user: Callable[..., Any]) -> None:
+def configure(
+    get_engine: Callable[[], Any],
+    require_user: Callable[..., Any],
+    login_required: Optional[type] = None,
+) -> None:
     """Wire the router to the app's engine and auth dependency."""
-    global _get_engine, _require_user
+    global _get_engine, _require_user, _LOGIN_REQUIRED
     _get_engine = get_engine
     _require_user = require_user
+    _LOGIN_REQUIRED = login_required
 
 
 def current_user(request: Request) -> Any:
@@ -74,8 +82,27 @@ def current_user(request: Request) -> Any:
         raise HTTPException(status_code=500, detail="API is not configured")
     try:
         return _require_user(request)
-    except Exception:
-        raise HTTPException(status_code=401, detail="Sign in to continue.") from None
+    except HTTPException:
+        # Already an HTTP answer with a considered status — the rate limiter's
+        # 429, for instance. Re-raising it unchanged matters: rewriting a 429 to
+        # a 401 tells somebody being rate-limited to go and log in, at the
+        # endpoint that is rate-limiting them.
+        raise
+    except Exception as exc:
+        # Only "no usable session" becomes a 401. Anything else — a dropped
+        # database connection, a pool timeout — is a server fault, and reporting
+        # it as "sign in to continue" makes the PWA redirect to the login page
+        # and throws somebody out of a workout in progress over a blip that
+        # would have resolved itself.
+        if _LOGIN_REQUIRED is not None and isinstance(exc, _LOGIN_REQUIRED):
+            raise HTTPException(status_code=401, detail="Sign in to continue.") from None
+        logger.exception(
+            "could not resolve the session for an API request",
+            extra={"event.action": "api_auth_failed", "url.path": request.url.path},
+        )
+        raise HTTPException(
+            status_code=503, detail="Something went wrong. Try that again."
+        ) from exc
 
 
 def engine() -> Any:
@@ -93,15 +120,16 @@ _USER_FACING = (
 )
 
 
-class _Handled(Exception):
-    """Internal: a user-facing error already turned into a response."""
+def _fail(exc: _USER_FACING) -> HTTPException:  # type: ignore[valid-type]
+    """Turn a data-layer error into a 400 carrying its message.
 
-
-def _fail(exc: Exception) -> HTTPException:
-    """Map a data-layer exception to an HTTP error."""
-    if isinstance(exc, _USER_FACING):
-        return HTTPException(status_code=400, detail=str(exc))
-    raise exc
+    Only ever called from inside `except _USER_FACING`, so the exception is by
+    construction one whose message was written for a person to read. There is
+    no fallback branch for other exception types, because reaching this with one
+    is impossible — an unexpected exception propagates and FastAPI answers 500
+    with no detail, which is the right outcome for text meant for the logs.
+    """
+    return HTTPException(status_code=400, detail=str(exc))
 
 
 def _parse_date(raw: Optional[str], label: str) -> Optional[date]:
@@ -396,19 +424,17 @@ async def log_set(
     except _USER_FACING as exc:
         raise _fail(exc) from None
 
-    block = next(
-        (e for e in (session.exercises if session else []) if e.exercise_id == written.exercise_id),
-        None,
-    )
+    # The whole refreshed session comes back, not just the one block.
+    #
+    # The client used to follow every POST with a GET to re-read the session,
+    # which meant two round trips and two load_session() calls per logged set —
+    # on the connection the module docstring says this has to be cheap on.
+    # Returning the session the write already built makes it one.
     return JSONResponse(
         {
             "set": written.to_dict(),
             "records": [b.to_dict() for b in breaks],
-            "exercise": block.to_dict() if block else None,
-            "session_totals": {
-                "total_sets": session.total_sets if session else 0,
-                "total_volume_kg": session.total_volume_kg if session else 0.0,
-            },
+            "session": session.to_dict() if session else None,
         },
         status_code=201,
     )
@@ -418,19 +444,21 @@ async def log_set(
 async def update_set(
     log_id: int, payload: dict[str, Any] = Body(...), user: Any = Depends(current_user)
 ) -> JSONResponse:
+    # Forward only the keys the client actually sent.
+    #
+    # `payload.get(key)` would pass every field on every call, with None for the
+    # ones that were omitted — and `update_set` cannot tell "clear the RPE" from
+    # "I did not mention the RPE", so a request correcting a rep count would null
+    # the weight and the effort of the set it was fixing. Filtering by presence
+    # keeps the two intentions distinct all the way down.
+    editable = ("weight_kg", "reps", "cheat_reps", "rpe", "rir", "is_warmup")
+    changes = {key: payload[key] for key in editable if key in payload}
+    if not changes:
+        raise HTTPException(status_code=400, detail="Send at least one field to change.")
+
     try:
         with engine().begin() as conn:
-            updated = sessions_module.update_set(
-                conn,
-                user.user_id,
-                log_id,
-                weight_kg=payload.get("weight_kg"),
-                reps=payload.get("reps"),
-                cheat_reps=payload.get("cheat_reps") or 0,
-                rpe=payload.get("rpe"),
-                rir=payload.get("rir"),
-                is_warmup=payload.get("is_warmup"),
-            )
+            updated = sessions_module.update_set(conn, user.user_id, log_id, **changes)
     except _USER_FACING as exc:
         raise _fail(exc) from None
     return JSONResponse({"set": updated.to_dict()})

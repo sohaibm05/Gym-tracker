@@ -216,7 +216,7 @@ CREATE INDEX IF NOT EXISTS idx_measurements_user_site_measured
 -- (person, exercise, record type) makes it a single-row read and a single-row
 -- write.
 --
--- Being a cache, it is rebuildable: records.rebuild_records() recomputes the
+-- Being a cache, it is rebuildable: records.rebuild() recomputes the
 -- whole table from workout_logs, which is the answer to it ever drifting.
 CREATE TABLE IF NOT EXISTS personal_records (
     record_id    BIGSERIAL PRIMARY KEY,
@@ -253,8 +253,30 @@ CREATE INDEX IF NOT EXISTS idx_personal_records_user_achieved
 
 -- Every exercise that predates this migration was typed by a person, so the
 -- is_custom default of TRUE is already right. Only the search key is missing.
+--
+-- This has to produce the same string as catalog.search_key(), or the indexed
+-- lookup in sessions.resolve_exercise() misses every backfilled row and the
+-- picker offers to create lifts the person already has. Three things matter:
+--   * btrim, because a name ending in punctuation ("Bench Press (Barbell)")
+--     otherwise leaves a trailing space that never compares equal;
+--   * accent folding, so "Café Press" and "Cafe Press" agree;
+--   * collapsing runs of punctuation to a single space, not one space each.
+--
+-- unaccent() lives in a contrib extension that a managed Postgres may not
+-- allow, so the common Latin-1 accents are folded with translate() instead.
+-- Anything it misses is caught by the lower(name) comparison the application
+-- also does — the key is an index, not the only way to find a row.
 UPDATE exercises
-   SET search_key = lower(regexp_replace(name, '[^a-zA-Z0-9]+', ' ', 'g'))
+   SET search_key = btrim(
+           regexp_replace(
+               lower(translate(
+                   name,
+                   'àáâãäåāăąèéêëēĕėęěìíîïĩīĭįıòóôõöøōŏőùúûüũūŭůűųçćĉċčñńņňýÿŷšśŝž',
+                   'aaaaaaaaaeeeeeeeeeiiiiiiiiiooooooooouuuuuuuuuucccccnnnnyyyssss'
+               )),
+               '[^a-z0-9]+', ' ', 'g'
+           )
+       )
  WHERE search_key IS NULL;
 
 COMMIT;
@@ -262,7 +284,16 @@ COMMIT;
 -- Personal records are NOT backfilled here. Recomputing every person's history
 -- inside the migration transaction would hold locks for as long as the largest
 -- account takes, and it is not needed for correctness — an absent record simply
--- means the next set of that lift sets one. Run this afterwards, per account or
--- for everybody, outside the migration:
+-- means the next set of that lift sets one.
 --
---     python manage_records.py rebuild --all
+-- Fill them in afterwards, outside the migration. Per account, from the app:
+-- the Records screen's "Recalculate" button (POST /api/records/rebuild). For
+-- every account at once:
+--
+--     python -c "
+--     import pipeline, records
+--     from sqlalchemy import text
+--     with pipeline.get_engine().begin() as conn:
+--         for (user_id,) in conn.execute(text('SELECT user_id FROM users')):
+--             print(user_id, records.rebuild(conn, user_id))
+--     "

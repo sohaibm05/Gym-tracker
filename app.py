@@ -400,7 +400,6 @@ async def log_requests(request: Request, call_next):
             or (app_metrics.route_label(request) if app_metrics is not None else "unknown")
         )
         if METRICS is not None:
-            METRICS.http_requests_in_flight.dec()
             METRICS.http_request_duration.labels(
                 method=request.method, route=route
             ).observe(duration_ms / 1000.0)
@@ -421,6 +420,18 @@ async def log_requests(request: Request, call_next):
             },
         )
         raise
+    finally:
+        # In a `finally`, and deliberately not in the two branches above.
+        #
+        # A client that disconnects mid-request — a phone locking, or walking
+        # out of wifi range — makes Starlette raise asyncio.CancelledError,
+        # which derives from BaseException and so is caught by NEITHER the
+        # `except Exception` above nor the success path below. Decrementing
+        # only there meant every dropped connection raised this gauge by one
+        # permanently, until it read a large phantom concurrency on a perfectly
+        # healthy process. A gauge that only ever rises is worse than no gauge.
+        if METRICS is not None:
+            METRICS.http_requests_in_flight.dec()
 
     duration_ms = (time.perf_counter() - started) * 1000
     route = (
@@ -429,7 +440,6 @@ async def log_requests(request: Request, call_next):
     )
 
     if METRICS is not None:
-        METRICS.http_requests_in_flight.dec()
         METRICS.http_request_duration.labels(
             method=request.method, route=route
         ).observe(duration_ms / 1000.0)
@@ -1443,7 +1453,11 @@ async def weekly_report_generate(
 # app.py imports api.py and the reverse import would be a cycle.
 
 if api is not None:
-    api.configure(get_engine=get_engine, require_user=require_user)
+    api.configure(
+        get_engine=get_engine,
+        require_user=require_user,
+        login_required=LoginRequired,
+    )
     app.include_router(api.router)
 
     _PWA_DIR = Path(__file__).resolve().parent / "static"

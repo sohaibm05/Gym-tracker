@@ -32,8 +32,13 @@
 // cannot leave a half-updated mix of old and new assets.
 const CACHE = 'gym-shell-v1';
 
+// /workout is deliberately NOT pre-cached at install time.
+//
+// addAll() follows redirects like any other fetch, so installing while signed
+// out — or with an expired session — would cache the login page under the
+// /workout key before the app had ever run. It is cached on first successful
+// load instead, by the fetch handler below, which checks what it actually got.
 const SHELL = [
-  '/workout',
   '/static/app.css',
   '/static/app.js',
   '/static/icon.svg',
@@ -62,6 +67,32 @@ self.addEventListener('activate', (event) => {
   );
 });
 
+/**
+ * Whether a response may be written into the shell cache.
+ *
+ * `response.ok` alone is not enough for /workout. That route is behind the
+ * session cookie, so once a session expires the server answers it with a 303 to
+ * /login; fetch follows the redirect and hands back a perfectly valid 200 —
+ * containing the login form. Caching that under the /workout key poisons the
+ * installed app: it opens on a login page served from disk, and keeps doing so
+ * after the person has signed back in, because the cache entry only changes on
+ * a later successful revalidation.
+ *
+ * `response.redirected` is how a followed redirect is distinguished from a real
+ * answer. A cross-origin `opaque` response has status 0 and is excluded too.
+ */
+function isCacheable(request, response) {
+  if (!response || !response.ok || response.type === 'opaque') return false;
+  if (response.redirected) return false;
+  // Belt and braces for the same case: whatever the redirect flag says, a
+  // response that did not come back from the URL we asked for is not that URL's
+  // content.
+  if (response.url && new URL(response.url).pathname !== new URL(request.url).pathname) {
+    return false;
+  }
+  return true;
+}
+
 self.addEventListener('fetch', (event) => {
   const { request } = event;
   if (request.method !== 'GET') return;
@@ -81,7 +112,7 @@ self.addEventListener('fetch', (event) => {
         // launch without ever making this one wait for the network.
         const network = fetch(request)
           .then((response) => {
-            if (response.ok) {
+            if (isCacheable(request, response)) {
               const copy = response.clone();
               caches.open(CACHE).then((cache) => cache.put(request, copy));
             }
