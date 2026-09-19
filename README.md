@@ -130,6 +130,7 @@ below the confidence threshold is reported rather than saved
 | `api.py` | The JSON API the workout app calls. Same process, same session cookie, no token |
 | `static/` | The installable workout app: shell, client JS, service worker, manifest, icons |
 | `migrations/003_routines_sessions_measurements.sql` | Adds all of the above to an existing database |
+| `migrations/verify.sql` | Read-only check that a database matches the code, RLS included |
 
 ### Observability (Assignment 1)
 
@@ -183,6 +184,46 @@ setup. They are additive and re-runnable:
 psql "$DATABASE_URL" -f migrations/001_add_cheat_reps.sql
 psql "$DATABASE_URL" -f migrations/003_routines_sessions_measurements.sql
 ```
+
+Afterwards — or any time you want to know whether a database matches the code —
+run the checker. It reads only catalogs, so it is safe against production, and
+it covers what a schema diagram cannot show you: the constraints and indexes
+that enforce the rules, and whether RLS is on. Seven `PASS` rows is the answer
+you want:
+
+```bash
+psql "$DATABASE_URL" -f migrations/verify.sql
+```
+
+To find out instead which migrations a given database still needs, ask it rather
+than trying to remember. Each migration leaves a fingerprint, so one query
+answers it — and it runs fine in a hosted SQL console:
+
+```sql
+SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM information_schema.columns
+                             WHERE table_name = 'workout_logs'
+                               AND column_name = 'cheat_reps')
+            THEN 'run 001' ELSE 'ok' END AS "001_cheat_reps",
+       CASE WHEN to_regclass('public.users')            IS NULL
+            THEN 'run 002' ELSE 'ok' END AS "002_multi_user",
+       CASE WHEN to_regclass('public.workout_sessions') IS NULL
+            THEN 'run 003' ELSE 'ok' END AS "003_routines";
+```
+
+**Migrate before you deploy, not after.** The two steps are not
+interchangeable, because the compatibility only runs one way: the migration is
+additive, so the *old* code keeps working against the *new* schema, but the new
+code writes `exercises.search_key` on every parsed journal entry and fails with
+`column "search_key" of relation "exercises" does not exist` against the old
+one. Migrate first and the worst case is a few minutes of old code on a schema
+with unused columns; deploy first and journal parsing is broken until the
+migration lands.
+
+One wrinkle in that window: exercises created by the old code arrive with a
+`NULL` `search_key`, so the new catalog search will not match them until
+something fills it in. The new code fills it the next time that exercise is
+logged, and re-running `003` fills them all at once — its backfill is
+`WHERE search_key IS NULL`, so it is cheap and safe to run again.
 
 `003` adds routines, live workout sessions, measurements and personal records.
 It is additive: every new column is nullable or defaulted, and nothing already
@@ -255,12 +296,29 @@ tokens, so `users` and `user_sessions` matter most of all. No policies are neede
 — RLS on with zero policies denies the API entirely:
 
 ```sql
-ALTER TABLE users           ENABLE ROW LEVEL SECURITY;
-ALTER TABLE user_sessions   ENABLE ROW LEVEL SECURITY;
-ALTER TABLE exercises       ENABLE ROW LEVEL SECURITY;
-ALTER TABLE workout_logs    ENABLE ROW LEVEL SECURITY;
-ALTER TABLE bodyweight_logs ENABLE ROW LEVEL SECURITY;
-ALTER TABLE weekly_reports  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE users             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_sessions     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE exercises         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE workout_logs      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bodyweight_logs   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE weekly_reports    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE routines          ENABLE ROW LEVEL SECURITY;   -- added by 003
+ALTER TABLE routine_exercises ENABLE ROW LEVEL SECURITY;   -- added by 003
+ALTER TABLE workout_sessions  ENABLE ROW LEVEL SECURITY;   -- added by 003
+ALTER TABLE measurements      ENABLE ROW LEVEL SECURITY;   -- added by 003
+ALTER TABLE personal_records  ENABLE ROW LEVEL SECURITY;   -- added by 003
+```
+
+Every migration that adds a table adds one more thing the anon key can reach, so
+re-run this after each one. Rather than trusting a list in a README to stay in
+step with the schema, ask the database which tables are still uncovered — an
+empty result is the answer you want:
+
+```sql
+SELECT c.relname AS unprotected_table
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'public' AND c.relkind = 'r' AND NOT c.relrowsecurity
+ ORDER BY 1;
 ```
 
 ### Try it

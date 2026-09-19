@@ -29,6 +29,7 @@ import hmac
 import os
 import re
 import secrets
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -156,6 +157,59 @@ def _unb64(encoded: str) -> bytes:
 # --------------------------------------------------------------------------
 
 
+def _suggest_username(raw: str) -> str:
+    """A usable username built from whatever somebody typed, or "" if none survives.
+
+    Accents are folded rather than dropped so "Renée" suggests "renee" and not
+    "ren". Runs of rejected characters collapse to a single underscore, which is
+    what makes "Sohaib  Muhammad" come back as "sohaib_muhammad" instead of
+    carrying the double space through as two.
+    """
+    folded = (
+        unicodedata.normalize("NFKD", raw or "")
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
+    cleaned = re.sub(r"[^a-z0-9._-]+", "_", folded.strip().lower())
+    cleaned = re.sub(r"_{2,}", "_", cleaned).strip("._-")
+    if not USERNAME_MIN <= len(cleaned) <= USERNAME_MAX:
+        return ""
+    return cleaned
+
+
+def _explain_username(candidate: str) -> str:
+    """Say what is wrong with this username, not merely what a good one looks like.
+
+    A message that only recites the rules leaves the reader to diff their own
+    input against them, and they get it wrong. Somebody who typed a full name
+    reads "must start and end with a letter or number", sees that theirs does,
+    concludes the username is fine and starts suspecting the password field —
+    which signup never even reached, because the username is validated first.
+
+    So: name the violation, and offer a name that would be accepted. The
+    suggestion is the part that actually ends the loop; a rule the reader has
+    already misread twice does not get clearer on the third telling.
+    """
+    if " " in candidate:
+        problem = "A username cannot contain spaces."
+    else:
+        rejected = sorted({c for c in candidate if not re.fullmatch(r"[a-z0-9._-]", c)})
+        if rejected:
+            shown = ", ".join(repr(c) for c in rejected[:3])
+            more = " and others" if len(rejected) > 3 else ""
+            problem = (
+                f"A username cannot contain {shown}{more} — only letters, "
+                "numbers, dots, dashes and underscores."
+            )
+        else:
+            problem = "A username must start and end with a letter or number."
+
+    suggestion = _suggest_username(candidate)
+    if suggestion and suggestion != candidate:
+        return f"{problem} Try {suggestion!r}."
+    return problem
+
+
 def normalize_username(raw: str) -> str:
     """Fold a typed username to its stored form, or explain why it cannot be one."""
     candidate = (raw or "").strip().lower()
@@ -166,10 +220,7 @@ def normalize_username(raw: str) -> str:
             f"Username must be {USERNAME_MIN}-{USERNAME_MAX} characters."
         )
     if not _USERNAME_RE.match(candidate):
-        raise AuthError(
-            "Username can use letters, numbers, dots, dashes and underscores, "
-            "and must start and end with a letter or number."
-        )
+        raise AuthError(_explain_username(candidate))
     if candidate in _RESERVED_USERNAMES:
         raise AuthError("That username is reserved. Pick another.")
     return candidate
@@ -224,9 +275,27 @@ def create_user(
 ) -> User:
     """Register an account. Raises AuthError if the name is taken or invalid."""
     display_name = (username or "").strip()
-    normalized = normalize_username(display_name)
-    validate_password(password)
-    zone = validate_timezone(timezone_name)
+
+    # Every problem at once, not the first one. Validating in sequence and
+    # raising on the first means a form with a bad username AND a short password
+    # reports only the username; the person fixes it, resubmits, and is told
+    # about the password they typed two minutes ago. Worse, the report is silent
+    # about which field it concerns, so a username error reads as the password
+    # being rejected — which is exactly how this was first reported.
+    problems: list[str] = []
+
+    def _collect(check):
+        try:
+            return check()
+        except AuthError as exc:
+            problems.append(str(exc))
+            return None
+
+    normalized = _collect(lambda: normalize_username(display_name))
+    _collect(lambda: validate_password(password))
+    zone = _collect(lambda: validate_timezone(timezone_name))
+    if problems:
+        raise AuthError(" ".join(problems))
 
     try:
         row = conn.execute(
