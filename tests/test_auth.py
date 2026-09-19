@@ -114,6 +114,76 @@ class TestUsernames:
         rejects the second - the impersonation this is really guarding against."""
         assert auth.normalize_username("Alice") == auth.normalize_username("alice")
 
+    @pytest.mark.parametrize(
+        "raw,must_mention,suggestion",
+        [
+            ("Sohaib Muhammad", "space", "sohaib_muhammad"),
+            ("Sohaib  Muhammad", "space", "sohaib_muhammad"),
+            ("sohaib@gym", "@", "sohaib_gym"),
+            ("Renee\u0301", "\u0301", "renee"),
+            ("_sohaib", "start and end", "sohaib"),
+            ("trailing-", "start and end", "trailing"),
+        ],
+    )
+    def test_the_message_names_the_violation_and_offers_a_way_out(
+        self, raw, must_mention, suggestion
+    ):
+        """The old message recited the rules without saying which one was broken.
+
+        Somebody who typed a full name read "must start and end with a letter or
+        number", saw that theirs did, and concluded the *password* was being
+        rejected - which signup had not even validated yet. A rejection has to
+        name the violation, and offering a name that would work is what actually
+        ends the loop.
+        """
+        with pytest.raises(auth.AuthError) as caught:
+            auth.normalize_username(raw)
+        message = str(caught.value)
+        assert must_mention in message, message
+        assert suggestion in message, message
+
+    def test_a_suggestion_is_omitted_rather_than_invented(self):
+        """Nothing usable survives "!!!", so the message offers no name at all
+        rather than suggesting something the person never typed."""
+        with pytest.raises(auth.AuthError) as caught:
+            auth.normalize_username("!!!")
+        assert "Try" not in str(caught.value)
+
+
+class TestSignupReportsEveryProblemAtOnce:
+    """create_user validates all three fields before refusing, not just the first.
+
+    Failing fast on the username hid the password rule completely: the form came
+    back with a username complaint, and the password - never examined - looked
+    like the thing being rejected. Fixing one field at a time also means a round
+    trip per mistake.
+
+    No connection is needed: validation runs before any SQL, so passing None is
+    enough, and a test that reached the database would be testing the database.
+    """
+
+    def test_a_bad_username_and_a_short_password_are_both_reported(self):
+        with pytest.raises(auth.AuthError) as caught:
+            auth.create_user(None, "Sohaib Muhammad", "hunter2")
+        message = str(caught.value)
+        assert "space" in message, message
+        assert "8 characters" in message, message
+
+    def test_a_bad_timezone_is_reported_alongside_the_rest(self):
+        with pytest.raises(auth.AuthError) as caught:
+            auth.create_user(None, "Sohaib Muhammad", "hunter2", "Mars/Olympus")
+        message = str(caught.value)
+        assert "space" in message, message
+        assert "8 characters" in message, message
+        assert "Mars/Olympus" in message, message
+
+    def test_only_the_field_that_is_wrong_is_mentioned(self):
+        with pytest.raises(auth.AuthError) as caught:
+            auth.create_user(None, "sohaib_muhammad", "short")
+        message = str(caught.value)
+        assert "8 characters" in message, message
+        assert "username" not in message.lower(), message
+
 
 class TestPasswordRules:
     def test_a_long_enough_password_is_returned_unchanged(self):
