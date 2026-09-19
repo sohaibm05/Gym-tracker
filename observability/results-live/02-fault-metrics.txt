@@ -1,0 +1,232 @@
+# HELP python_gc_objects_collected_total Objects collected during gc
+# TYPE python_gc_objects_collected_total counter
+python_gc_objects_collected_total{generation="0"} 19345.0
+python_gc_objects_collected_total{generation="1"} 1895.0
+python_gc_objects_collected_total{generation="2"} 0.0
+# HELP python_gc_objects_uncollectable_total Uncollectable objects found during GC
+# TYPE python_gc_objects_uncollectable_total counter
+python_gc_objects_uncollectable_total{generation="0"} 0.0
+python_gc_objects_uncollectable_total{generation="1"} 0.0
+python_gc_objects_uncollectable_total{generation="2"} 0.0
+# HELP python_gc_collections_total Number of times this generation was collected
+# TYPE python_gc_collections_total counter
+python_gc_collections_total{generation="0"} 240.0
+python_gc_collections_total{generation="1"} 21.0
+python_gc_collections_total{generation="2"} 1.0
+# HELP python_info Python platform information
+# TYPE python_info gauge
+python_info{implementation="CPython",major="3",minor="11",patchlevel="16",version="3.11.16"} 1.0
+# HELP process_virtual_memory_bytes Virtual memory size in bytes.
+# TYPE process_virtual_memory_bytes gauge
+process_virtual_memory_bytes 2.65945088e+08
+# HELP process_resident_memory_bytes Resident memory size in bytes.
+# TYPE process_resident_memory_bytes gauge
+process_resident_memory_bytes 7.3711616e+07
+# HELP process_start_time_seconds Start time of the process since unix epoch in seconds.
+# TYPE process_start_time_seconds gauge
+process_start_time_seconds 1.78983353499e+09
+# HELP process_cpu_seconds_total Total user and system CPU time spent in seconds.
+# TYPE process_cpu_seconds_total counter
+process_cpu_seconds_total 1.61
+# HELP process_open_fds Number of open file descriptors.
+# TYPE process_open_fds gauge
+process_open_fds 15.0
+# HELP process_max_fds Maximum number of open file descriptors.
+# TYPE process_max_fds gauge
+process_max_fds 1.048576e+06
+# HELP gym_http_requests_total HTTP requests served, by method, matched route template and status code.
+# TYPE gym_http_requests_total counter
+gym_http_requests_total{method="GET",route="/healthz",status="200"} 142.0
+gym_http_requests_total{method="GET",route="/metrics",status="200"} 50.0
+gym_http_requests_total{method="GET",route="/",status="303"} 125.0
+gym_http_requests_total{method="GET",route="/login",status="200"} 248.0
+gym_http_requests_total{method="GET",route="/progress",status="303"} 41.0
+# HELP gym_http_requests_created HTTP requests served, by method, matched route template and status code.
+# TYPE gym_http_requests_created gauge
+gym_http_requests_created{method="GET",route="/healthz",status="200"} 1.7898335363470974e+09
+gym_http_requests_created{method="GET",route="/metrics",status="200"} 1.7898335485786257e+09
+gym_http_requests_created{method="GET",route="/",status="303"} 1.7898335574438772e+09
+gym_http_requests_created{method="GET",route="/login",status="200"} 1.789833557947559e+09
+gym_http_requests_created{method="GET",route="/progress",status="303"} 1.7898335590720778e+09
+# HELP gym_http_exceptions_total Requests that raised an unhandled exception, by route and exception class.
+# TYPE gym_http_exceptions_total counter
+# HELP gym_workout_entries_total Journal entries that reached a terminal state at save time, by outcome.
+# TYPE gym_workout_entries_total counter
+# HELP gym_sets_written_total Individual workout sets inserted into the database.
+# TYPE gym_sets_written_total counter
+gym_sets_written_total 0.0
+# HELP gym_sets_written_created Individual workout sets inserted into the database.
+# TYPE gym_sets_written_created gauge
+gym_sets_written_created 1.7898335357743123e+09
+# HELP gym_bodyweight_entries_written_total Bodyweight readings inserted into the database.
+# TYPE gym_bodyweight_entries_written_total counter
+gym_bodyweight_entries_written_total 0.0
+# HELP gym_bodyweight_entries_written_created Bodyweight readings inserted into the database.
+# TYPE gym_bodyweight_entries_written_created gauge
+gym_bodyweight_entries_written_created 1.7898335357743168e+09
+# HELP gym_duplicate_decisions_total Answers to the duplicate-submission prompt, by decision.
+# TYPE gym_duplicate_decisions_total counter
+# HELP gym_llm_extractions_total Groq extraction calls, by outcome (success, rate_limited, error).
+# TYPE gym_llm_extractions_total counter
+# HELP gym_weekly_reports_total Weekly reports generated, by whether LLM narration succeeded.
+# TYPE gym_weekly_reports_total counter
+# HELP gym_logins_total Login attempts, by result (success, failure, rate_limited).
+# TYPE gym_logins_total counter
+# HELP gym_faults_injected_total Deliberately injected faults, by kind. Always 0 in normal operation.
+# TYPE gym_faults_injected_total counter
+gym_faults_injected_total{kind="latency"} 121.0
+# HELP gym_faults_injected_created Deliberately injected faults, by kind. Always 0 in normal operation.
+# TYPE gym_faults_injected_created gauge
+gym_faults_injected_created{kind="latency"} 1.7898335503866756e+09
+# HELP gym_http_requests_in_flight HTTP requests currently being served.
+# TYPE gym_http_requests_in_flight gauge
+gym_http_requests_in_flight 1.0
+# HELP gym_llm_extractions_in_flight Groq extraction calls currently in progress.
+# TYPE gym_llm_extractions_in_flight gauge
+gym_llm_extractions_in_flight 0.0
+# HELP gym_review_drafts_open Parsed entries shown for review and not yet saved or abandoned.
+# TYPE gym_review_drafts_open gauge
+gym_review_drafts_open 0.0
+# HELP gym_build_info Always 1. Labels carry the build identity of the running process.
+# TYPE gym_build_info gauge
+gym_build_info{commit="unknown",version="1.0.0"} 1.0
+# HELP gym_http_request_duration_seconds Wall-clock time to serve an HTTP request, by method and route template.
+# TYPE gym_http_request_duration_seconds histogram
+gym_http_request_duration_seconds_bucket{le="0.005",method="GET",route="/healthz"} 117.0
+gym_http_request_duration_seconds_bucket{le="0.01",method="GET",route="/healthz"} 117.0
+gym_http_request_duration_seconds_bucket{le="0.025",method="GET",route="/healthz"} 117.0
+gym_http_request_duration_seconds_bucket{le="0.05",method="GET",route="/healthz"} 117.0
+gym_http_request_duration_seconds_bucket{le="0.075",method="GET",route="/healthz"} 117.0
+gym_http_request_duration_seconds_bucket{le="0.1",method="GET",route="/healthz"} 117.0
+gym_http_request_duration_seconds_bucket{le="0.25",method="GET",route="/healthz"} 117.0
+gym_http_request_duration_seconds_bucket{le="0.5",method="GET",route="/healthz"} 117.0
+gym_http_request_duration_seconds_bucket{le="0.75",method="GET",route="/healthz"} 142.0
+gym_http_request_duration_seconds_bucket{le="1.0",method="GET",route="/healthz"} 142.0
+gym_http_request_duration_seconds_bucket{le="2.5",method="GET",route="/healthz"} 142.0
+gym_http_request_duration_seconds_bucket{le="5.0",method="GET",route="/healthz"} 142.0
+gym_http_request_duration_seconds_bucket{le="10.0",method="GET",route="/healthz"} 142.0
+gym_http_request_duration_seconds_bucket{le="+Inf",method="GET",route="/healthz"} 142.0
+gym_http_request_duration_seconds_count{method="GET",route="/healthz"} 142.0
+gym_http_request_duration_seconds_sum{method="GET",route="/healthz"} 12.55208804299673
+gym_http_request_duration_seconds_bucket{le="0.005",method="GET",route="/metrics"} 39.0
+gym_http_request_duration_seconds_bucket{le="0.01",method="GET",route="/metrics"} 39.0
+gym_http_request_duration_seconds_bucket{le="0.025",method="GET",route="/metrics"} 39.0
+gym_http_request_duration_seconds_bucket{le="0.05",method="GET",route="/metrics"} 39.0
+gym_http_request_duration_seconds_bucket{le="0.075",method="GET",route="/metrics"} 39.0
+gym_http_request_duration_seconds_bucket{le="0.1",method="GET",route="/metrics"} 39.0
+gym_http_request_duration_seconds_bucket{le="0.25",method="GET",route="/metrics"} 39.0
+gym_http_request_duration_seconds_bucket{le="0.5",method="GET",route="/metrics"} 39.0
+gym_http_request_duration_seconds_bucket{le="0.75",method="GET",route="/metrics"} 50.0
+gym_http_request_duration_seconds_bucket{le="1.0",method="GET",route="/metrics"} 50.0
+gym_http_request_duration_seconds_bucket{le="2.5",method="GET",route="/metrics"} 50.0
+gym_http_request_duration_seconds_bucket{le="5.0",method="GET",route="/metrics"} 50.0
+gym_http_request_duration_seconds_bucket{le="10.0",method="GET",route="/metrics"} 50.0
+gym_http_request_duration_seconds_bucket{le="+Inf",method="GET",route="/metrics"} 50.0
+gym_http_request_duration_seconds_count{method="GET",route="/metrics"} 50.0
+gym_http_request_duration_seconds_sum{method="GET",route="/metrics"} 5.573504550000507
+gym_http_request_duration_seconds_bucket{le="0.005",method="GET",route="/"} 97.0
+gym_http_request_duration_seconds_bucket{le="0.01",method="GET",route="/"} 97.0
+gym_http_request_duration_seconds_bucket{le="0.025",method="GET",route="/"} 97.0
+gym_http_request_duration_seconds_bucket{le="0.05",method="GET",route="/"} 97.0
+gym_http_request_duration_seconds_bucket{le="0.075",method="GET",route="/"} 97.0
+gym_http_request_duration_seconds_bucket{le="0.1",method="GET",route="/"} 97.0
+gym_http_request_duration_seconds_bucket{le="0.25",method="GET",route="/"} 97.0
+gym_http_request_duration_seconds_bucket{le="0.5",method="GET",route="/"} 97.0
+gym_http_request_duration_seconds_bucket{le="0.75",method="GET",route="/"} 125.0
+gym_http_request_duration_seconds_bucket{le="1.0",method="GET",route="/"} 125.0
+gym_http_request_duration_seconds_bucket{le="2.5",method="GET",route="/"} 125.0
+gym_http_request_duration_seconds_bucket{le="5.0",method="GET",route="/"} 125.0
+gym_http_request_duration_seconds_bucket{le="10.0",method="GET",route="/"} 125.0
+gym_http_request_duration_seconds_bucket{le="+Inf",method="GET",route="/"} 125.0
+gym_http_request_duration_seconds_count{method="GET",route="/"} 125.0
+gym_http_request_duration_seconds_sum{method="GET",route="/"} 14.09646993299657
+gym_http_request_duration_seconds_bucket{le="0.005",method="GET",route="/login"} 197.0
+gym_http_request_duration_seconds_bucket{le="0.01",method="GET",route="/login"} 197.0
+gym_http_request_duration_seconds_bucket{le="0.025",method="GET",route="/login"} 197.0
+gym_http_request_duration_seconds_bucket{le="0.05",method="GET",route="/login"} 197.0
+gym_http_request_duration_seconds_bucket{le="0.075",method="GET",route="/login"} 197.0
+gym_http_request_duration_seconds_bucket{le="0.1",method="GET",route="/login"} 197.0
+gym_http_request_duration_seconds_bucket{le="0.25",method="GET",route="/login"} 197.0
+gym_http_request_duration_seconds_bucket{le="0.5",method="GET",route="/login"} 197.0
+gym_http_request_duration_seconds_bucket{le="0.75",method="GET",route="/login"} 248.0
+gym_http_request_duration_seconds_bucket{le="1.0",method="GET",route="/login"} 248.0
+gym_http_request_duration_seconds_bucket{le="2.5",method="GET",route="/login"} 248.0
+gym_http_request_duration_seconds_bucket{le="5.0",method="GET",route="/login"} 248.0
+gym_http_request_duration_seconds_bucket{le="10.0",method="GET",route="/login"} 248.0
+gym_http_request_duration_seconds_bucket{le="+Inf",method="GET",route="/login"} 248.0
+gym_http_request_duration_seconds_count{method="GET",route="/login"} 248.0
+gym_http_request_duration_seconds_sum{method="GET",route="/login"} 25.591137887002787
+gym_http_request_duration_seconds_bucket{le="0.005",method="GET",route="/progress"} 35.0
+gym_http_request_duration_seconds_bucket{le="0.01",method="GET",route="/progress"} 35.0
+gym_http_request_duration_seconds_bucket{le="0.025",method="GET",route="/progress"} 35.0
+gym_http_request_duration_seconds_bucket{le="0.05",method="GET",route="/progress"} 35.0
+gym_http_request_duration_seconds_bucket{le="0.075",method="GET",route="/progress"} 35.0
+gym_http_request_duration_seconds_bucket{le="0.1",method="GET",route="/progress"} 35.0
+gym_http_request_duration_seconds_bucket{le="0.25",method="GET",route="/progress"} 35.0
+gym_http_request_duration_seconds_bucket{le="0.5",method="GET",route="/progress"} 35.0
+gym_http_request_duration_seconds_bucket{le="0.75",method="GET",route="/progress"} 41.0
+gym_http_request_duration_seconds_bucket{le="1.0",method="GET",route="/progress"} 41.0
+gym_http_request_duration_seconds_bucket{le="2.5",method="GET",route="/progress"} 41.0
+gym_http_request_duration_seconds_bucket{le="5.0",method="GET",route="/progress"} 41.0
+gym_http_request_duration_seconds_bucket{le="10.0",method="GET",route="/progress"} 41.0
+gym_http_request_duration_seconds_bucket{le="+Inf",method="GET",route="/progress"} 41.0
+gym_http_request_duration_seconds_count{method="GET",route="/progress"} 41.0
+gym_http_request_duration_seconds_sum{method="GET",route="/progress"} 3.0291509169987876
+# HELP gym_http_request_duration_seconds_created Wall-clock time to serve an HTTP request, by method and route template.
+# TYPE gym_http_request_duration_seconds_created gauge
+gym_http_request_duration_seconds_created{method="GET",route="/healthz"} 1.7898335363470695e+09
+gym_http_request_duration_seconds_created{method="GET",route="/metrics"} 1.7898335485785995e+09
+gym_http_request_duration_seconds_created{method="GET",route="/"} 1.7898335574438448e+09
+gym_http_request_duration_seconds_created{method="GET",route="/login"} 1.7898335579475281e+09
+gym_http_request_duration_seconds_created{method="GET",route="/progress"} 1.78983355907204e+09
+# HELP gym_llm_extraction_duration_seconds Wall-clock time for one Groq extraction, including retries.
+# TYPE gym_llm_extraction_duration_seconds histogram
+gym_llm_extraction_duration_seconds_bucket{le="0.25"} 0.0
+gym_llm_extraction_duration_seconds_bucket{le="0.5"} 0.0
+gym_llm_extraction_duration_seconds_bucket{le="1.0"} 0.0
+gym_llm_extraction_duration_seconds_bucket{le="2.0"} 0.0
+gym_llm_extraction_duration_seconds_bucket{le="3.0"} 0.0
+gym_llm_extraction_duration_seconds_bucket{le="5.0"} 0.0
+gym_llm_extraction_duration_seconds_bucket{le="8.0"} 0.0
+gym_llm_extraction_duration_seconds_bucket{le="13.0"} 0.0
+gym_llm_extraction_duration_seconds_bucket{le="21.0"} 0.0
+gym_llm_extraction_duration_seconds_bucket{le="34.0"} 0.0
+gym_llm_extraction_duration_seconds_bucket{le="60.0"} 0.0
+gym_llm_extraction_duration_seconds_bucket{le="+Inf"} 0.0
+gym_llm_extraction_duration_seconds_count 0.0
+gym_llm_extraction_duration_seconds_sum 0.0
+# HELP gym_llm_extraction_duration_seconds_created Wall-clock time for one Groq extraction, including retries.
+# TYPE gym_llm_extraction_duration_seconds_created gauge
+gym_llm_extraction_duration_seconds_created 1.789833535774376e+09
+# HELP gym_db_commit_duration_seconds Wall-clock time to commit a reviewed draft to the database.
+# TYPE gym_db_commit_duration_seconds histogram
+gym_db_commit_duration_seconds_bucket{le="0.005"} 0.0
+gym_db_commit_duration_seconds_bucket{le="0.01"} 0.0
+gym_db_commit_duration_seconds_bucket{le="0.025"} 0.0
+gym_db_commit_duration_seconds_bucket{le="0.05"} 0.0
+gym_db_commit_duration_seconds_bucket{le="0.1"} 0.0
+gym_db_commit_duration_seconds_bucket{le="0.25"} 0.0
+gym_db_commit_duration_seconds_bucket{le="0.5"} 0.0
+gym_db_commit_duration_seconds_bucket{le="1.0"} 0.0
+gym_db_commit_duration_seconds_bucket{le="2.5"} 0.0
+gym_db_commit_duration_seconds_bucket{le="5.0"} 0.0
+gym_db_commit_duration_seconds_bucket{le="+Inf"} 0.0
+gym_db_commit_duration_seconds_count 0.0
+gym_db_commit_duration_seconds_sum 0.0
+# HELP gym_db_commit_duration_seconds_created Wall-clock time to commit a reviewed draft to the database.
+# TYPE gym_db_commit_duration_seconds_created gauge
+gym_db_commit_duration_seconds_created 1.7898335357743986e+09
+# HELP gym_entry_text_bytes Size in bytes of a pasted journal entry submitted for parsing.
+# TYPE gym_entry_text_bytes summary
+gym_entry_text_bytes_count 0.0
+gym_entry_text_bytes_sum 0.0
+# HELP gym_entry_text_bytes_created Size in bytes of a pasted journal entry submitted for parsing.
+# TYPE gym_entry_text_bytes_created gauge
+gym_entry_text_bytes_created 1.7898335357744143e+09
+# HELP gym_sets_per_entry Number of sets written per saved journal entry.
+# TYPE gym_sets_per_entry summary
+gym_sets_per_entry_count 0.0
+gym_sets_per_entry_sum 0.0
+# HELP gym_sets_per_entry_created Number of sets written per saved journal entry.
+# TYPE gym_sets_per_entry_created gauge
+gym_sets_per_entry_created 1.78983353577442e+09

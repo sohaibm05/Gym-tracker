@@ -134,7 +134,7 @@ services:
       # container measures the machine rather than itself.
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
-      - /:/host/root:ro,rslave
+      - /:/host/root:ro
     # The host's network namespace, so the network counters are the host's real
     # NICs rather than this container's veth pair — the machine is what we are
     # measuring. It also means `ports:` would be meaningless here: the exporter
@@ -268,3 +268,11 @@ volumes:
 networks:
   gym-net:
     driver: bridge
+    # Pinned so the gateway address is known. node-exporter runs in the host
+    # network namespace, and on Docker Desktop `host.docker.internal` points at
+    # Windows rather than at the VM node-exporter is in. The bridge gateway is
+    # the VM itself, so prometheus.yml scrapes it at 172.28.77.1:9100.
+    ipam:
+      config:
+        - subnet: 172.28.77.0/24
+          gateway: 172.28.77.1

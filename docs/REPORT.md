@@ -295,16 +295,45 @@ Every container in this stack is a process on this one kernel, so their CPU and
 memory use is included in these totals.
 
 Because it is in the host network namespace, Prometheus — on a bridge network —
-reaches it at `host.docker.internal:9100`, which `extra_hosts:
-host.docker.internal:host-gateway` makes resolve on Linux as well as Docker
-Desktop.
+has to reach it across that boundary. The target is the **bridge gateway
+address**, `172.28.77.1:9100`, pinned by an explicit `ipam` subnet on `gym-net`
+in `docker-compose.yml` so the address is stable and can be written into
+`prometheus.yml`.
+
+The obvious choice, `host.docker.internal:9100`, does **not** work on Docker
+Desktop for Windows, and finding out why is the most useful thing this part of
+the setup taught me. On Docker Desktop the containers do not run on Windows;
+they run inside a WSL2 Linux VM. `host.docker.internal` resolves to the
+*Windows* host, while `node-exporter` — being in the "host" network namespace —
+is listening inside the *Linux VM*. The name and the process are on opposite
+sides of the VM boundary, so the scrape fails with `connection refused` even
+though the exporter is running perfectly. The bridge gateway is the VM itself,
+which is the machine the containers actually live on, so that is the correct
+address.
+
+**The machine being measured**, read from `node_uname_info`:
+
+```
+nodename: docker-desktop
+release:  6.18.33.2-microsoft-standard-WSL2
+instance: 172.28.77.1:9100
+machine:  docker-host      (the label set in prometheus.yml)
+```
+
+So on this setup `machine="docker-host"` is **the WSL2 Linux VM**, not the
+Windows laptop. Every container in the stack is a process on that VM's kernel,
+so these totals cover all of them — but Windows' own CPU and memory use is *not*
+in these numbers. On a Linux host the same config measures the host directly and
+the distinction disappears. Measuring the Windows machine itself would need
+`windows_exporter` running natively, which is a different target, not a fix to
+this one.
 
 | Panel | Query | Note |
 |---|---|---|
 | CPU busy | `1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m]))` | There is no "CPU %" metric. It is derived from a counter of seconds spent idle. |
 | CPU by mode | `avg by (mode) (rate(node_cpu_seconds_total[5m]))` | A high `iowait` band means the disk is the bottleneck, which a single CPU% number cannot tell you. |
 | Memory used | `1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)` | `MemAvailable`, not `MemFree` — `MemFree` excludes the page cache and makes a healthy machine look nearly full. |
-| Disk used | `1 - (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"})` | Elasticsearch stops accepting writes at its flood-stage watermark, so a full disk silently ends log ingestion. |
+| Disk used | `1 - (node_filesystem_avail_bytes{mountpoint=~"/\|/var/lib"} / node_filesystem_size_bytes{mountpoint=~"/\|/var/lib"})` | Elasticsearch stops accepting writes at its flood-stage watermark, so a full disk silently ends log ingestion. The matcher is not just `/`: on the Docker Desktop VM the data disk is mounted at `/var/lib`, and `mountpoint="/"` alone returned **no data at all**. A panel that silently shows nothing is worse than one that is obviously broken — this one was found by checking that every panel's query actually returns series, not by looking at the dashboard. |
 | Disk I/O time | `sum by (device) (rate(node_disk_io_time_seconds_total[5m]))` | Seconds of I/O per second. Approaching 1 = saturated, which throughput alone does not reveal. |
 | Network | `sum by (device) (rate(node_network_receive_bytes_total{device!="lo"}[5m]))` | Loopback excluded. |
 
@@ -757,19 +786,25 @@ the raw value would show the total dropping to zero on every deploy.
 
 **Step 5 — it is drawn.** A stat panel, last value, 0 decimal places.
 
-**Observed values**, from `observability/results/02-fault-metrics.txt` — the
-scrape taken at the end of the fault stage:
+**Observed values**, from `observability/results-live/02-fault-metrics.txt` — the
+scrape taken at the end of the fault stage of the live run:
 
 ```
-gym_http_requests_total{method="GET",route="/healthz",status="200"} 45.0
-gym_http_request_duration_seconds_count{method="GET",route="/healthz"} 45.0
-gym_http_request_duration_seconds_sum{method="GET",route="/healthz"} 4.029808496002261
-gym_faults_injected_total{kind="latency"} 40.0
+gym_http_requests_total{method="GET",route="/healthz",status="200"} 142.0
+gym_http_request_duration_seconds_count{method="GET",route="/healthz"}  142.0
+gym_http_request_duration_seconds_sum{method="GET",route="/healthz"}    12.55208804299673
+gym_faults_injected_total{kind="latency"} 121.0
 ```
 
-45 requests to `/healthz` taking 4.03 seconds in total — a mean of 89.6ms, from a
-route whose real cost is under 4ms, because 8 of those 45 were delayed by half a
-second each.
+142 requests to `/healthz` taking 12.55 seconds in total — a mean of 88.4ms, from
+a route whose real cost is under 3ms, because 25 of those 142 were delayed by half
+a second each. The same arithmetic in PromQL, which is what the panel actually
+runs:
+
+```promql
+rate(gym_http_request_duration_seconds_sum{route="/healthz"}[2m])
+  / rate(gym_http_request_duration_seconds_count{route="/healthz"}[2m])
+```
 
 #### A log: one `POST /save`
 
@@ -880,66 +915,102 @@ Fault: 500ms on every 5th request, i.e. 20% of requests.
 
 #### Results
 
-Three stages, 40s each at 5 rps. Full data in `observability/results/`.
+Three stages, **120s each at 5 rps**, run against the full containerised stack
+with Prometheus scraping throughout. 120s at a 15s scrape interval gives 8
+scrapes per stage, so a `rate()` over `[2m]` is computed from real samples
+rather than interpolated from two points. Full data in
+`observability/results-live/`.
 
 **Client-side** (measured by the load generator, `*.json`):
 
 | Stage | Requests | Achieved rps | p50 | **p95** | p99 | Mean | Errors |
 |---|---|---|---|---|---|---|---|
-| 01-baseline | 200 | 4.99 | 3.7ms | **5.3ms** | 6.5ms | 3.5ms | 0% |
-| 02-fault | 141 | 3.51 | 3.7ms | **506.1ms** | 506.9ms | 141.8ms | 0% |
-| 03-recovery | 200 | 4.99 | 3.8ms | **5.2ms** | 5.8ms | 3.5ms | 0% |
+| 01-baseline | 599 | 4.99 | 6.3ms | **29.1ms** | 38.9ms | 12.2ms | 0% |
+| 02-fault | 415 | 3.45 | 20.2ms | **524.3ms** | 531.2ms | 156.1ms | 0% |
+| 03-recovery | 599 | 4.99 | 6.2ms | **31.8ms** | 41.0ms | 12.9ms | 0% |
 
-**Server-side** (computed from the Prometheus histogram buckets exactly as
-`histogram_quantile` does, `server-side-percentiles.json`):
+**Server-side**, queried from Prometheus with `histogram_quantile` at the end of
+each stage window (`observability/results-live/prometheus-percentiles.json`):
 
-| Stage | Observations | p50 | **p95** | p99 | Mean | `gym_faults_injected_total` |
+```promql
+histogram_quantile(0.95, sum by (le) (rate(gym_http_request_duration_seconds_bucket{job="gym-tracker"}[2m])))
+sum(increase(gym_faults_injected_total{kind="latency"}[2m]))
+```
+
+| Stage | p50 | **p95** | p99 | Mean | rps | `gym_faults_injected_total{kind="latency"}` |
 |---|---|---|---|---|---|---|
-| 01-baseline | 282 | 2.5ms | **4.8ms** | 5.0ms | 0.8ms | **0** |
-| 02-fault | 199 | 3.1ms | **686.2ms** | 737.2ms | 98.9ms | **40** |
-| 03-recovery | 282 | 2.5ms | **4.8ms** | 5.0ms | 0.9ms | **0** |
+| 01-baseline | 2.5ms | **4.8ms** | 5.0ms | 0.5ms | 7.13 | *(absent)* |
+| 02-fault | 3.1ms | **687.1ms** | 737.4ms | 98.7ms | 5.02 | **120** |
+| 03-recovery | 2.5ms | **4.8ms** | 5.0ms | 0.5ms | 7.12 | *(absent)* |
+
+The fault counter is *absent*, not zero, in the healthy stages: a labelled
+counter that has never been incremented exports no sample at all. `01-baseline-metrics.txt`
+contains no `gym_faults_injected_total` line; `02-fault-metrics.txt` has
+`gym_faults_injected_total{kind="latency"} 121.0`. (121 rather than 120 because
+the script's own pre-stage `/healthz` probes triggered one before the measured
+window opened — which is itself a small demonstration that the counter is
+recording real events and not the stage boundaries.)
+
+The server-side `rps` is higher than the client's 5 rps because it counts
+Prometheus's own `/metrics` scrapes as well as the load generator's traffic.
 
 Time windows for the Grafana/Kibana pickers:
 
 ```
-01-baseline   2026-09-15T06:20:43Z .. 2026-09-15T06:21:23Z
-02-fault      2026-09-15T06:21:26Z .. 2026-09-15T06:22:06Z
-03-recovery   2026-09-15T06:22:10Z .. 2026-09-15T06:22:50Z
+01-baseline   2026-09-19T15:56:52Z .. 2026-09-19T15:58:53Z
+02-fault      2026-09-19T15:59:16Z .. 2026-09-19T16:01:17Z
+03-recovery   2026-09-19T16:01:40Z .. 2026-09-19T16:03:40Z
 ```
 
 The raw histogram for `/healthz` during the fault stage shows the distribution
 directly:
 
 ```
-gym_http_request_duration_seconds_bucket{le="0.5", route="/healthz"}   37.0
-gym_http_request_duration_seconds_bucket{le="0.75",route="/healthz"}   45.0
-gym_http_request_duration_seconds_count{route="/healthz"}              45.0
-gym_http_request_duration_seconds_sum{route="/healthz"}                4.031
+gym_http_request_duration_seconds_bucket{le="0.25",route="/healthz"}   117.0
+gym_http_request_duration_seconds_bucket{le="0.5", route="/healthz"}   117.0
+gym_http_request_duration_seconds_bucket{le="0.75",route="/healthz"}   142.0
+gym_http_request_duration_seconds_count{route="/healthz"}              142.0
+gym_http_request_duration_seconds_sum{route="/healthz"}                12.552
 ```
 
-37 requests under half a second, 8 more between 0.5s and 0.75s. Bimodal — two
-populations, not one slow average. The baseline for the same route has all 62
-observations in the smallest bucket.
+117 requests under a quarter of a second, **nothing at all** between 0.25s and
+0.5s, then 25 more between 0.5s and 0.75s. Bimodal — two populations, not one
+slow average. The baseline for the same route has all 225 observations in the
+smallest bucket (`le="0.005"`).
+
+**The logs agree with the metrics independently.** Counted in Elasticsearch over
+the same three windows:
+
+| Query | baseline | fault | recovery |
+|---|---|---|---|
+| `fault.kind: "latency"` | 0 | **120** | 0 |
+| `event.duration_ms > 500` | 0 | **120** | 0 |
+| `log.level: "error"` | 0 | **0** | 0 |
+
+120 fault warnings, 120 slow requests, zero errors — matching the 120 counted by
+Prometheus over the same window, from a completely separate pipeline. Two
+independent systems, one number.
 
 #### What changed, and what it means
 
 **The prediction held.** Every one:
 
-- **p95 rose by 95×** (5.3ms → 506.1ms) while **p50 did not move at all** (3.7ms →
-  3.7ms). This is the entire argument for percentiles. A dashboard showing only
-  the median would have reported a perfectly healthy service while one request in
-  five took half a second.
-- **The mean is the worst of both** — 141.8ms describes no actual request. No
-  request took 142ms; they took either ~4ms or ~506ms. An average over a bimodal
+- **p95 rose by 18×** (29.1ms → 524.3ms) while **p50 stayed in single-digit
+  milliseconds** on the server side (2.5ms → 3.1ms). This is the entire argument
+  for percentiles. A dashboard showing only the median would have reported a
+  perfectly healthy service while one request in five took half a second.
+- **The mean is the worst of both** — 156.1ms describes no actual request. No
+  request took 156ms; they took either ~6ms or ~520ms. An average over a bimodal
   distribution is a number with no referent.
-- **Throughput fell 30%** (4.99 → 3.51 rps) with the offered load unchanged. The
+- **Throughput fell 31%** (4.99 → 3.45 rps) with the offered load unchanged. The
   client is closed-loop: it waits for each response, so latency converts directly
   into lost throughput. On a real service this is how a latency problem becomes a
   capacity problem.
 - **The error rate stayed at 0%.** Every request returned 200. A monitoring setup
   watching only errors and uptime would have seen nothing at all.
-- **`gym_faults_injected_total` went 0 → 40 → 0**, which is what makes this
-  evidence rather than an assertion that a variable was set.
+- **`gym_faults_injected_total{kind="latency"}` went absent → 120 → absent**,
+  which is what makes this evidence rather than an assertion that a variable was
+  set.
 
 **Cause.** `faults.py` delays every 5th request by 500ms inside the timed
 region. `fault.sequence` in the logs confirms the sampling was exactly
@@ -950,8 +1021,10 @@ load involves several requests, so in practice *most page loads feel slow* rathe
 than one in five — which is why p95 predicts how an app feels far better than an
 average does.
 
-**Recovery.** Stage 3 returns to baseline within measurement noise (p95 5.2ms vs
-5.3ms), and `/healthz` goes back to `{"status": "ok"}`. Verified, not assumed.
+**Recovery.** Stage 3 returns to baseline within measurement noise — server-side
+p95 is **4.8ms in both** the baseline and recovery stages, identical to three
+significant figures — and `/healthz` goes back to `{"status": "ok"}`. Verified,
+not assumed.
 
 #### Two things this experiment taught me that I did not plan
 
@@ -971,15 +1044,29 @@ lesson: instrumentation that does not span the whole path is worse than none,
 because it produces confident wrong answers.** I only found it because I compared
 two independent measurements.
 
-**2. Server-side p95 (686.2ms) and client-side p95 (506.1ms) disagree by 180ms.**
+**2. Server-side p95 (687.1ms) and client-side p95 (524.3ms) disagree by 163ms.**
 
-Not an error — a property of histograms. The real observations cluster just above
-0.5s, but the surrounding buckets are `le="0.5"` and `le="0.75"`, so
-`histogram_quantile` interpolates linearly across that 250ms gap and lands at
-686ms. **A histogram's percentile is only as precise as its bucket boundaries.**
-The client, holding every raw sample, can report the true value; Prometheus
-trades that precision for the ability to aggregate across instances and any time
-window. Knowing which number is which matters before anyone sets an SLO on it.
+Not an error — a property of histograms, and the effect reproduced almost exactly
+when the experiment was re-run against the live stack (686.2ms vs 506.1ms on the
+first run, 687.1ms vs 524.3ms on this one). The real observations cluster just
+above 0.5s, but the surrounding buckets are `le="0.5"` and `le="0.75"`, so
+`histogram_quantile` interpolates linearly across that 250ms gap and lands near
+687ms. The raw buckets above show why the interpolation has nothing better to go
+on: 117 observations at `le="0.25"`, still 117 at `le="0.5"`, then 142 at
+`le="0.75"`. Every delayed request is somewhere in that one 250ms-wide bucket and
+the histogram cannot say where.
+
+**A histogram's percentile is only as precise as its bucket boundaries.** The
+client, holding every raw sample, can report the true value; Prometheus trades
+that precision for the ability to aggregate across instances and any time window.
+Knowing which number is which matters before anyone sets an SLO on it — an SLO of
+"p95 under 600ms" would be reported as breached by Prometheus and as met by the
+client, on the same requests.
+
+That this reproduced to within 1ms across two runs on different days, on
+different infrastructure (direct uvicorn the first time, the full container stack
+the second), is the strongest evidence that it is a systematic property of the
+bucket layout rather than noise.
 
 ### 2. Cardinality explosion
 
@@ -1034,12 +1121,61 @@ is flat at 1.
 
 100 requests, one series.
 
-Through Prometheus (`--stack`), the same comparison runs as:
+**Through Prometheus (`--stack`)** — the same comparison, measured end to end
+against the running server rather than by counting lines of exposition text:
 
-```promql
-count(demo_requests_total)        # 100
-count(demo_requests_safe_total)   # 1
-```
+| Stage | `count(demo_requests_total)` | `count(demo_requests_safe_total)` |
+|---|---|---|
+| With `request_id` label | **100** | 1 |
+| Label removed, app restarted | *no data* | 1 |
+
+#### What I expected here, and what actually happened
+
+I expected the second row to still read 100 — that removing a label stops new
+series being created but leaves the existing ones in place until retention
+expires. That is the usual way this is explained, and it is what an earlier draft
+of this report asserted. **The measurement contradicted it**, and the reason is
+worth more than the original point.
+
+`count(demo_requests_total)` as an *instant query* returns **no data** once the
+label is removed. But the same query evaluated at a past timestamp still returns
+100. Running it at a series of `time=` values maps the boundary exactly:
+
+| Query time (UTC) | `count(demo_requests_total)` |
+|---|---|
+| 16:04:30 | *no data* (demo not yet scraped) |
+| **16:04:59** | **100** |
+| **16:05:10** | **100** |
+| 16:05:30 | *no data* (label removed, app restarted) |
+| 16:09:00 | *no data* |
+
+Both results are true and they are not in conflict. The history is intact —
+every one of those 100 series is still on disk and still queryable at any
+timestamp where it was live, until the 15-day retention window drops it. What
+changed is only what a query evaluated *now* can see.
+
+The cutoff is also **sharper than I expected**. An instant query normally carries
+the last sample forward for up to 5 minutes, so I predicted the series would
+linger until ~16:10. It does not: it disappears between 16:05:10 and 16:05:30,
+at the first scrape after the restart. When a target stops exporting a series
+Prometheus writes an explicit **stale marker**, and that marker terminates the
+series immediately rather than letting the lookback window carry it. The 5-minute
+lookback applies when a target goes missing *unexpectedly*, not when it is
+scraped successfully and simply no longer reports that series.
+
+So the correct statement is narrower than the one I started with:
+
+- **What disappears quickly:** the series from *current* dashboards and alerts.
+- **What does not:** the stored samples, the index entries, and the disk they
+  occupy — for the full retention period.
+- **What never un-happens:** the memory pressure while those series were active.
+  If a cardinality explosion kills a Prometheus server, removing the label brings
+  the *next* one back up; it does not recover the data lost while it was down.
+
+The practical lesson is unchanged and arguably stronger: you cannot verify a
+cardinality fix by watching `count()` go down, because it goes down either way —
+whether you fixed the label or merely stopped the app. Cardinality is a
+code-review question, not an incident-response one.
 
 #### The cost at scale
 
@@ -1149,9 +1285,23 @@ python scripts/load_generator.py --duration 120 --rps 5 --username you --passwor
 ### Run the experiments
 
 ```bash
-./scripts/experiment_anomaly.sh          # Part E1 — writes observability/results/
-./scripts/experiment_cardinality.sh      # Part E2
+./scripts/experiment_anomaly.sh              # Part E1 — writes observability/results/
+./scripts/experiment_cardinality.sh          # Part E2, in-process
+./scripts/experiment_cardinality.sh --stack  # Part E2, through Prometheus
 ```
+
+Both scripts honour `RESULTS_DIR`, and on Windows `PYTHON` needs to be `python`
+rather than the default `python3`. The results quoted in this report were
+produced with:
+
+```bash
+PYTHON=python RESULTS_DIR=observability/results-live ./scripts/experiment_anomaly.sh
+PYTHON=python RESULTS_DIR=observability/results-live ./scripts/experiment_cardinality.sh --stack
+```
+
+The `--stack` form of the cardinality experiment starts the `cardinality-demo`
+container under the `experiment` compose profile and removes it again at the end,
+so it leaves nothing running.
 
 ### Test
 
@@ -1222,33 +1372,81 @@ happened is worse than one that draws the line.
   its nested query JSON parse.
 - **All shell scripts pass `bash -n`.**
 
-### Not verified by running it
+### The full stack, verified on 19 September 2026
 
-**The containerised stack has not been started end to end.** The environment this
-was developed in blocks Docker registry pulls at the network policy level
-(`production.cloudfront.docker.com` returns 403), so no image could be
-downloaded. That means the following are *written and validated as
-configuration* but have not been observed running:
+An earlier version of this report said the containerised stack had never been
+started, because the development environment blocked Docker registry pulls. **It
+has now been run end to end on Docker Desktop for Windows (WSL2 backend)**, and
+this section records what that changed. The original prediction — that the
+version-sensitive parts, "the Kibana saved-object schema and the Filebeat ILM
+setup", were the most likely to need fixing — turned out to be half right. Kibana
+imported all nine saved objects unchanged on the first attempt. The log pipeline
+needed three separate fixes, one of them in exactly the predicted place (the ILM
+setup) and two that were not predicted at all.
 
-- Prometheus actually scraping the app and node-exporter.
-- Grafana rendering the three dashboards from the provisioned files.
-- Filebeat tailing Docker logs, and `decode_json_fields` parsing them.
-- Elasticsearch indexing, and the ILM policy rolling over and deleting.
-- Kibana importing the saved objects.
+Now observed running:
 
-**What this means in practice.** The Part E1 experiment was run against the app
-directly, so the latency numbers are real and the server-side percentiles are
-computed from the app's genuine histogram buckets — but they were computed by
-replicating `histogram_quantile`'s interpolation in Python
-(`observability/results/server-side-percentiles.json`) rather than by querying
-Prometheus. Likewise the cardinality numbers come from counting series in the
-real exposition output rather than from `count(demo_requests_total)` against a
-running server. The arithmetic is the same; the path it took is not.
+- **Prometheus scraping** the app and node-exporter. All targets `up`.
+- **Grafana** rendering all three provisioned dashboards; both datasources report
+  healthy.
+- **Filebeat** tailing Docker logs, with `decode_json_fields` producing real
+  queryable fields.
+- **Elasticsearch** indexing, with the ILM policy attached to the write index.
+- **Kibana** importing all nine saved objects (`"successCount":9`).
+- **Part E1** re-run against the live stack, with server-side percentiles
+  **queried from Prometheus** via `histogram_quantile` rather than replicated in
+  Python.
+- **Part E2** re-run through Prometheus with `count(demo_requests_total)` against
+  a running server — which is what disproved this report's own earlier claim
+  about what happens after a label is removed.
+- **63 observability tests** pass inside the container image.
 
-The most likely places for a first run to need a fix are the version-sensitive
-ones: the Kibana saved-object schema (8.15 format — `setup_kibana.sh` says what
-to do by hand if the import is rejected) and the Filebeat ILM setup. Everything
-Python-side is exercised by the test suite.
+#### What had to be fixed to get there
+
+Five configuration defects, none of which any amount of file-level validation
+would have caught, because every one of these files was syntactically valid:
+
+| # | Symptom | Cause | Fix |
+|---|---|---|---|
+| 1 | `docker compose up` aborts: *path / is mounted on / but it is not a shared or slave mount* | The `rslave` mount propagation flag on node-exporter's `/:/host/root` mount is not supported on Docker Desktop's VM | Dropped the flag |
+| 2 | Filebeat starts, finds the container, harvests **nothing** | Autodiscover condition written as `docker.container.labels.co_elastic_logs/enabled`. Filebeat's *event* fields de-dot label names, but the autodiscover *condition* matches the original dotted form | `docker.container.labels.co.elastic.logs/enabled` |
+| 3 | `lifecycle policy gym-tracker-logs creation failed: unknown field [_comment]` | A JSON file cannot hold comments, and Elasticsearch rejects unknown top-level fields | Removed the `_comment` key; the explanation now lives in this report |
+| 4 | `no matching index template found for data stream [filebeat-gym-tracker]` | Filebeat 8.x writes to a **data stream**, and the template name, the `index:` target and the ILM rollover alias must all agree. They did not | All three renamed to `filebeat-gym-tracker-logs` |
+| 5 | Host dashboard's root-disk panel silently empty | `mountpoint="/"` does not exist on the Docker Desktop VM; the data disk is `/var/lib` | Matcher widened to `mountpoint=~"/\|/var/lib"` |
+
+Plus one environment-specific change that is not a defect in the original
+config: the node-exporter scrape target moved from `host.docker.internal:9100` to
+the pinned bridge gateway `172.28.77.1:9100`, for the WSL2 reason explained in
+Part B.
+
+**What I take from this.** Every one of these files parsed. `docker compose
+config` validated the compose file. The JSON was well-formed and the YAML was
+well-formed. Four of the five defects were *semantic agreements between two
+different systems* — a label spelling shared between Docker and Filebeat, three
+names that Filebeat and Elasticsearch both have to agree on, a mountpoint that
+exists on one kernel and not another. Validation checks a file against a grammar;
+only running the thing checks it against reality. The single most misleading
+failure was #2, because Filebeat reported no error at all: it started cleanly,
+connected to Elasticsearch successfully, and quietly collected nothing. A
+pipeline that is silently empty looks exactly like a pipeline with nothing to
+report.
+
+### Still not verified
+
+- **ILM rollover and deletion have not been observed happening.** The policy is
+  attached to the write index and reports `phase: hot`, but rollover needs 1GB or
+  1 day and deletion needs 7 more. What is verified is that the policy exists, is
+  valid, and is bound to the index — not that Elasticsearch has actually executed
+  either transition.
+- **Log rotation by the Docker json-file driver** (10MB × 3) has likewise not
+  been reached in practice.
+- **The app's LLM extraction path** was not exercised: the experiment load
+  deliberately avoids it so as not to spend a Groq rate limit, so
+  `gym_llm_extraction_duration_seconds` and the LLM counters have no data in
+  these runs.
+- **The tests do not run in the host Python** on this machine — `rapidfuzz` is
+  absent from it. They pass in the container image, which is where the
+  application actually runs. This is an environment gap, not a code defect.
 
 ---
 

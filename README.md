@@ -147,7 +147,8 @@ below the confidence threshold is reported rather than saved
 | `observability/elasticsearch/` | ILM retention policy |
 | `observability/kibana/` | Data view and eight saved searches |
 | `observability/cardinality_demo.py` | The Part E2 cardinality explosion demo, capped at 100 series |
-| `observability/results/` | Recorded output of the experiments |
+| `observability/results/` | Recorded output of the experiments, run against the app directly |
+| `observability/results-live/` | The same experiments re-run against the full container stack, with percentiles queried from Prometheus. These are the numbers quoted in the report |
 | `scripts/stack.sh` | Start, check, load, and safely tear down the stack |
 | `scripts/load_generator.py` | Deterministic, repeatable load for the experiments |
 | `scripts/experiment_anomaly.sh` | Part E1: baseline, fault, recovery |
