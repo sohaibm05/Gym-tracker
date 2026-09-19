@@ -128,7 +128,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(gym_http_requests_total{status=~\"5..\"}[5m])) / clamp_min(sum(rate(gym_http_requests_total[5m])), 0.0001)",
+          "expr": "(sum(rate(gym_http_requests_total{status=~\"5..\"}[5m])) or vector(0)) / clamp_min(sum(rate(gym_http_requests_total[5m])), 0.0001)",
           "legendFormat": "5xx share",
           "refId": "A",
           "instant": false,
@@ -828,7 +828,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (route, exception) (rate(gym_http_exceptions_total[5m]))",
+          "expr": "sum by (route, exception) (rate(gym_http_exceptions_total[5m])) or vector(0)",
           "legendFormat": "{{route}} {{exception}}",
           "refId": "A",
           "instant": false,

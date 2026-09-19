@@ -86,15 +86,29 @@ journal text ──▶ extract (LLM) ──▶ score & validate ──▶ REVIEW
 | **Fault injection and the cardinality demo** | **Added for this assignment** |
 | Live set-by-set logging, routines, PRs, measurements (installable PWA) | Added after this assignment |
 
-1019 automated tests pass, 63 of them covering the observability layer added
+1038 automated tests pass, 63 of them covering the observability layer added
 here.
 
+**Without a Groq key.** Pasting an entry needs `GROQ_API_KEY`; everything else
+works without one. Until 20 September, `POST /log` on a server with no key raised
+an unhandled `RuntimeError` and returned a 500 — found by walking through the app
+as a user would, and caught by the logging and metrics on the way (see Part C).
+It now shows *"Parsing is unavailable because this server has no GROQ_API_KEY
+configured. Nothing was saved."* on the normal "Could not parse that entry" page,
+with a `warning`-level log line (`event.action: extraction_unavailable`). The
+check is a `MissingApiKeyError` raised inside `extract_entities` — a subclass of
+the existing `ExtractionError`, so every caller that already handled a failed
+extraction handles this too. Two tests cover it in `tests/test_pipeline.py`.
+
 A second input method — an installable app for logging set by set during a
-workout — was added after this assignment was written. It writes the same
-`workout_logs` table, so every metric, log line and chart described below
-covers it too, and its API routes are labelled by route template like the rest
-(`/api/session/{session_id}/sets`), so it added endpoints without adding
-cardinality. See the README for what it does.
+workout — was added after this assignment was written. Its API routes run through
+the same middleware and are labelled by route template like the rest
+(`/api/session/{session_id}/sets`), so the **application** metrics and request
+logs cover it, and it added endpoints without adding cardinality. The
+**business** metrics do not: they are recorded in the journal save path, and a
+set logged through the workout app does not increment `gym_sets_written_total`.
+That is a real gap in coverage rather than a design choice. See the README for
+what the app does.
 
 ### How to try it
 
@@ -220,7 +234,7 @@ Duration.
 | Panel | Query | What it shows |
 |---|---|---|
 | Request rate | `sum(rate(gym_http_requests_total[1m]))` | Throughput. A counter is meaningless raw (it resets on restart); `rate()` is how it is always read. |
-| Error rate | `sum(rate(gym_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(gym_http_requests_total[5m])), 0.0001)` | 5xx share. `clamp_min` avoids a divide-by-zero making the panel read `NaN` when there is no traffic. |
+| Error rate | `(sum(rate(gym_http_requests_total{status=~"5.."}[5m])) or vector(0)) / clamp_min(sum(rate(gym_http_requests_total[5m])), 0.0001)` | 5xx share. `clamp_min` avoids a divide-by-zero making the panel read `NaN` when there is no traffic. `or vector(0)` is there because a healthy app has *no* `status="5xx"` series at all — without it the panel read "No data" whenever nothing was failing, which looks exactly like a broken panel. Found by looking at the rendered dashboard; the query was valid and returned nothing. |
 | p95 latency | `histogram_quantile(0.95, sum by (le) (rate(gym_http_request_duration_seconds_bucket[5m])))` | 95% of requests in the last 5 minutes were faster than this. |
 | p99 latency | same with `0.99` | The tail. |
 | Latency percentiles | p50, p95, p99 and `sum(rate(..._sum[5m])) / sum(rate(..._count[5m]))` on one axis | **The most instructive panel here**: the mean sits below p95 and barely moves when a minority of requests get slow. |
@@ -228,6 +242,21 @@ Duration.
 | p95 by route | `histogram_quantile(0.95, sum by (le, route) (rate(gym_http_request_duration_seconds_bucket[5m])))` | Which route is slow. `/log` carries the LLM call and is expected to sit high. |
 | In flight | `gym_http_requests_in_flight` | A gauge, read directly — no `rate()`. |
 | Injected faults | `sum by (kind) (increase(gym_faults_injected_total[1m]))` | Zero except during Part E. |
+
+The "Unhandled exceptions" panel, `sum by (route, exception) (rate(gym_http_exceptions_total[5m]))`,
+has the same `or vector(0)` for the same reason.
+
+![Application performance dashboard over the Part E1 experiment](screenshots/01-grafana-app-performance.png)
+
+*The application dashboard over the whole Part E1 run, 15:55–16:05 UTC. Grafana
+draws in the browser's time zone, which here is UTC+5, so the axis reads
+20:55–21:05; the three stages are 20:57–20:59 (baseline), 20:59–21:01 (fault)
+and 21:02–21:04 (recovery). Three things to read off it: the p95 and p99 lines
+jump only during the fault stage while p50 stays flat along the bottom; the
+latency heatmap grows a second band in the 500–750ms buckets, separate from the
+main band under 5ms; and "Injected faults" is non-zero only in that same window.
+Error rate stays at 0.00% throughout. The dip in request rate between the stages
+is the app restarting.*
 
 **2. Business metrics** (`gym-business`) — what the product is doing, not how the
 machine is.
@@ -243,6 +272,31 @@ machine is.
 | Extraction outcomes | `sum by (outcome) (increase(gym_llm_extractions_total[5m]))` |
 | Extraction latency | `histogram_quantile(0.95, sum by (le) (rate(gym_llm_extraction_duration_seconds_bucket[10m])))` |
 | Login attempts | `sum by (result) (increase(gym_logins_total[5m]))` |
+
+![Business metrics dashboard](screenshots/02-grafana-business.png)
+
+*The business dashboard after six journal entries were submitted through the
+review form. Four were saved (5, 4, 6 and 3 sets — **18 sets** and **2 bodyweight
+readings** in total), one was a re-submission held by the duplicate guard, and
+one was blocked by the review form for an invalid rep count. Database commit
+time is p50 17.5ms and p95 85ms.*
+
+**How this data was produced, stated plainly.** The normal path is paste →
+`POST /log` (Groq extracts) → review → `POST /save`, and only the first step
+needs a `GROQ_API_KEY`. This machine has none, so `scripts/submit_reviewed_entries.py`
+submits the review form to `POST /save` directly, in exactly the shape the review
+page renders. Everything from `/save` onwards is the real application path, so
+every business metric is recorded by the app itself; nothing was written to the
+database or to Prometheus by hand. The three panels under "The language model"
+are empty for the same reason: no extraction was ever attempted.
+
+One of the five saves shown is an **empty entry with 0 sets**, which I submitted
+by mistake while working out the form's field names. It wrote no rows, but a
+Summary cannot be un-observed, so it is why "Avg sets per saved entry" reads
+**3.60** (18 ÷ 5) rather than 4.5 (18 ÷ 4). I have left it in rather than
+restart the app to hide it; it is also a fair example of what this metric is for,
+since a real run of 0-set saves is exactly the extraction regression described
+below.
 
 **The metric I explored myself: `gym_sets_per_entry`.**
 
@@ -336,6 +390,16 @@ this one.
 | Disk used | `1 - (node_filesystem_avail_bytes{mountpoint=~"/\|/var/lib"} / node_filesystem_size_bytes{mountpoint=~"/\|/var/lib"})` | Elasticsearch stops accepting writes at its flood-stage watermark, so a full disk silently ends log ingestion. The matcher is not just `/`: on the Docker Desktop VM the data disk is mounted at `/var/lib`, and `mountpoint="/"` alone returned **no data at all**. A panel that silently shows nothing is worse than one that is obviously broken — this one was found by checking that every panel's query actually returns series, not by looking at the dashboard. |
 | Disk I/O time | `sum by (device) (rate(node_disk_io_time_seconds_total[5m]))` | Seconds of I/O per second. Approaching 1 = saturated, which throughput alone does not reveal. |
 | Network | `sum by (device) (rate(node_network_receive_bytes_total{device!="lo"}[5m]))` | Loopback excluded. |
+
+![Host dashboard from node-exporter](screenshots/03-grafana-host.png)
+
+*The host dashboard for the WSL2 VM, over the 30 minutes after the stack was
+restarted on 20 September. 12 cores, 7.56 GiB of memory (38% used), 6.3% of the
+data disk used. The network interfaces are the VM's Docker bridges
+(`br-…`, `docker0`), which is what you would expect when the machine being
+measured is the VM rather than Windows. The uptime of 8.73 minutes is the VM's:
+Docker Desktop had been restarted, and node-exporter reports the kernel it runs
+on, not the laptop.*
 
 ---
 
@@ -566,6 +630,27 @@ then in Discover: `http.request.id: "f1d4bb6745b64b3d"`, sorted ascending.
 one, then pivot to its `http.request.id` to see everything else that request did.
 This is the payoff of correlation: you go from "something threw a
 `ValidationError`" to the complete story of the click that caused it in one hop.
+
+**A working search, on the live stack.** One `POST /save`, traced by its request
+id:
+
+![Kibana Discover tracing one request by id](screenshots/04-kibana-trace-request.png)
+
+*`http.request.id:"8d59a31cdc6f454c"` returns exactly three documents, written by
+three different loggers that never mention the id themselves: the business event
+from the route (`journal entry saved`, `event.action: entry_saved`), the
+middleware's request log (`request served`, `/save`, 200, 9.4ms), and uvicorn's
+access log. The contextvar attached the same id to all three. The columns are
+real indexed fields, not substrings of a message — which is what
+`decode_json_fields` in the Filebeat config is for. Times are shown in the
+browser's zone, UTC+5.*
+
+**Something the observability caught.** While checking Part A, `POST /log`
+without a `GROQ_API_KEY` turned out to return an unhandled 500. The pipeline
+caught it end to end before I had noticed it any other way: a `log.level: error`
+line with `error.type: RuntimeError` and `error.message: GROQ_API_KEY is not set`,
+carrying the request id, and `gym_http_exceptions_total{route="/log",exception="RuntimeError"}`
+going from absent to 1. It is fixed now — see the note in Part A.
 
 ### Worked example: one log, and what is stored
 
@@ -947,9 +1032,9 @@ The fault counter is *absent*, not zero, in the healthy stages: a labelled
 counter that has never been incremented exports no sample at all. `01-baseline-metrics.txt`
 contains no `gym_faults_injected_total` line; `02-fault-metrics.txt` has
 `gym_faults_injected_total{kind="latency"} 121.0`. (121 rather than 120 because
-the script's own pre-stage `/healthz` probes triggered one before the measured
-window opened — which is itself a small demonstration that the counter is
-recording real events and not the stage boundaries.)
+Docker's container health check hit `/healthz` before the measured window opened
+and drew one delay — traced in the Kibana screenshot below. It is a small
+demonstration that the counter records real events, not stage boundaries.)
 
 The server-side `rps` is higher than the client's 5 rps because it counts
 Prometheus's own `/metrics` scrapes as well as the load generator's traffic.
@@ -990,6 +1075,30 @@ the same three windows:
 120 fault warnings, 120 slow requests, zero errors — matching the 120 counted by
 Prometheus over the same window, from a completely separate pipeline. Two
 independent systems, one number.
+
+![Kibana showing the injected-fault warnings](screenshots/05-kibana-injected-faults.png)
+
+*The saved search "07 - Injected faults", `fault.kind:"latency"`, over
+15:59:00–16:01:30 UTC (20:59–21:01:30 in the browser's UTC+5). This wider window
+returns **121**, and the histogram shows where the extra one comes from: a single
+isolated fault at 15:59:10 UTC, then a gap, then the continuous block from
+15:59:16 when the load generator started. Tracing that one
+document by its request id, its access-log line reads `127.0.0.1 - "GET /healthz"`:
+the caller was **Docker's own container health check** (`HEALTHCHECK` in the
+`Dockerfile`, every 10s, from inside the container), not the experiment script,
+whose requests arrive from the bridge gateway `172.28.77.1`. It was the fifth
+request the new process served, so it drew the first delay, and it really was
+held 500ms (15:59:10.386 → 10.887). It is the same 121 that
+`gym_faults_injected_total` reports in `02-fault-metrics.txt`: the metric and the
+log disagree with the stage window by the same one event, for the same reason.*
+
+*I first assumed that extra event came from the script's readiness probe, and
+wrote that down. Following the request id showed otherwise. It is a small case,
+but it is the pattern this assignment is about: the guess was plausible, and the
+log settled it in one query.*
+
+The same experiment on the Grafana side is the application dashboard screenshot
+in Part B.
 
 #### What changed, and what it means
 
@@ -1148,6 +1257,14 @@ label is removed. But the same query evaluated at a past timestamp still returns
 | **16:05:10** | **100** |
 | 16:05:30 | *no data* (label removed, app restarted) |
 | 16:09:00 | *no data* |
+
+![count(demo_requests_total) in the Prometheus graph](screenshots/06-prometheus-cardinality.png)
+
+*`count(demo_requests_total)` in Prometheus's own graph view, 16:03–16:07 UTC.
+The line sits at exactly 100 from about 16:04:55 to 16:05:20 and does not exist
+either side of it: nothing before the demo was first scraped, and nothing after
+the restart without the label. No slow fade over the 5-minute lookback — the cut
+is at a single scrape.*
 
 Both results are true and they are not in conflict. The history is intact —
 every one of those 100 series is still on disk and still queryable at any
@@ -1355,7 +1472,7 @@ happened is worse than one that draws the line.
 
 ### Verified by running it
 
-- **929 automated tests pass**, including 63 new ones covering metrics, JSON log
+- **1038 automated tests pass** (18 skipped), including 63 covering metrics, JSON log
   shape, redaction, request-id propagation, fault injection and the cardinality
   cap.
 - **The app runs** under uvicorn and serves `/metrics` in valid Prometheus
@@ -1399,7 +1516,12 @@ Now observed running:
 - **Part E2** re-run through Prometheus with `count(demo_requests_total)` against
   a running server — which is what disproved this report's own earlier claim
   about what happens after a label is removed.
-- **63 observability tests** pass inside the container image.
+- **The full suite, 1038 tests**, passes inside the container image.
+- **Grafana and Kibana screenshots** of the live stack are in `docs/screenshots/`
+  and placed in Parts B, C and E. Every panel shown was checked to return data;
+  two that read "No data" when the app was healthy were fixed (Part B).
+- **The business dashboard has real data**: entries submitted through the review
+  form, recorded by the app's own save path (Part B says exactly how).
 
 #### What had to be fixed to get there
 
@@ -1440,10 +1562,11 @@ report.
   either transition.
 - **Log rotation by the Docker json-file driver** (10MB × 3) has likewise not
   been reached in practice.
-- **The app's LLM extraction path** was not exercised: the experiment load
-  deliberately avoids it so as not to spend a Groq rate limit, so
-  `gym_llm_extraction_duration_seconds` and the LLM counters have no data in
-  these runs.
+- **The app's LLM extraction path** was not exercised: this machine has no
+  `GROQ_API_KEY`, so `gym_llm_extraction_duration_seconds`, the extraction
+  counters and the weekly-report counter have no data, and the three panels
+  under "The language model" on the business dashboard are empty. What *is*
+  verified is that the app now behaves correctly without a key (Part A).
 - **The tests do not run in the host Python** on this machine — `rapidfuzz` is
   absent from it. They pass in the container image, which is where the
   application actually runs. This is an environment gap, not a code defect.
