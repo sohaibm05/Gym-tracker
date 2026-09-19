@@ -121,7 +121,9 @@ FAULTS = faults.FaultInjector(metrics=METRICS) if faults is not None else None
 if app_metrics is not None:
     app_metrics.set_build_info()
 
-app = FastAPI(title="Gym Tracker", docs_url=None, redoc_url=None)
+# openapi_url too, not just the two doc UIs: left on, /openapi.json serves an
+# unauthenticated map of every route and form field on the site.
+app = FastAPI(title="Gym Tracker", docs_url=None, redoc_url=None, openapi_url=None)
 
 _engine = None
 
@@ -344,13 +346,24 @@ async def log_requests(request: Request, call_next):
     about what happened.
     """
     if _STARTUP_ERROR is not None:
-        # Every route depends on the modules that failed to import, so serve the
-        # reason rather than a stack-less 500 from the platform.
-        logger.error("application failed to start", extra={"url.path": request.url.path})
+        # Every route depends on the modules that failed to import, so there is
+        # nothing to serve. The traceback goes to the logs, where the operator
+        # reads it, and never into the response: it names file paths, module
+        # layout and installed versions, and in this state every URL answers it
+        # without a login.
+        #
+        # Structured rather than printf-formatted, so the stack lands in its own
+        # ECS field and Kibana can show it as a stack rather than as one long
+        # line inside the message.
+        logger.error(
+            "application failed to start",
+            extra={
+                "url.path": request.url.path,
+                "error.stack_trace": _STARTUP_ERROR,
+            },
+        )
         return PlainTextResponse(
-            "The application failed to start.\n\n"
-            "This is an import error, not a configuration one - no secrets are "
-            "shown below.\n\n" + _STARTUP_ERROR,
+            "The application failed to start. The reason is in the server logs.",
             status_code=500,
         )
 
@@ -742,7 +755,7 @@ def _render_result(result: pipeline.PipelineResult, session_date: date) -> str:
             f"({len(result.review_items)})</strong> &mdash; these parts of the entry "
             f"could not be turned into editable rows.<ul>{''.join(rows)}</ul></div>"
         )
-    elif not result.error and not result.duplicate_of_recent and not skipped:
+    elif not result.error and not skipped:
         parts.append('<div class="card muted">Everything you ticked was saved.</div>')
 
     return "".join(parts)
@@ -756,13 +769,20 @@ def _render_result(result: pipeline.PipelineResult, session_date: date) -> str:
 def _safe_next(raw: Optional[str]) -> str:
     """Where to send someone after login, if it is somewhere on this site.
 
-    Only a bare absolute path is accepted. "//evil.example" and
-    "https://evil.example" are both rejected: without this check the ?next=
+    Only a bare absolute path is accepted: without this check the ?next=
     parameter would be an open redirect, and a login page that can bounce you to
     an attacker's copy of itself is worth more to them than no login page.
+
+    Rejecting a leading "//" is not enough. Browsers normalise "\\" to "/" while
+    parsing a URL, so "/\\evil.example" is read as "//evil.example" and lands
+    off-site just the same. Both second characters are refused, along with any
+    control character, which has no place in a path and would be a
+    response-splitting primitive in the Location header.
     """
     candidate = (raw or "").strip()
-    if not candidate.startswith("/") or candidate.startswith("//"):
+    if not candidate.startswith("/") or candidate[1:2] in {"/", "\\"}:
+        return "/"
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in candidate):
         return "/"
     return candidate
 
@@ -1407,11 +1427,18 @@ async def save_reviewed(
     )
 
 
+PROGRESS_MIN_WEEKS = 12
+
+
 @app.get("/progress", response_class=HTMLResponse)
 async def progress(user: "auth.User" = Depends(require_user)) -> HTMLResponse:
     """Charts over this user's logged data. Every figure is computed in code, as
     in the weekly report - this page plots the same Stage A numbers."""
-    weeks = insights.ANALYSIS_WEEKS if insights.ANALYSIS_WEEKS >= 8 else 12
+    # A trend needs more history than a weekly report does, and ANALYSIS_WEEKS
+    # is tuned for the report (6 by default). Take whichever is longer so the
+    # charts never show less than a quarter, and a deployment that widens the
+    # report window widens these too.
+    weeks = max(insights.ANALYSIS_WEEKS, PROGRESS_MIN_WEEKS)
     data = insights.build_dashboard(
         get_engine(), user.user_id, weeks=weeks, timezone_name=user.timezone
     )

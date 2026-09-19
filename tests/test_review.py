@@ -359,6 +359,18 @@ class TestRoundTrip:
         draft = draft_for({"sets": PAYLOAD["sets"], "bodyweight": None})
         assert review.draft_from_form(submitted(draft)).bodyweight is None
 
+    def test_an_absurd_row_count_is_capped(self):
+        """set_count is a number in the POST body and the reader builds a row
+        per unit of it. Unbounded, one request exhausts the worker's memory."""
+        form = submitted(draft_for())
+        form["set_count"] = "100000000"
+        assert len(review.draft_from_form(form).sets) == review.MAX_SET_ROWS
+
+    def test_a_negative_row_count_reads_as_none(self):
+        form = submitted(draft_for())
+        form["set_count"] = "-5"
+        assert review.draft_from_form(form).sets == []
+
 
 class TestEditing:
     def test_a_corrected_field_is_taken(self):

@@ -29,6 +29,7 @@ import hmac
 import os
 import re
 import secrets
+import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -332,14 +333,6 @@ def get_user_by_username(conn: Connection, username: str) -> Optional[User]:
     return _row_to_user(row) if row else None
 
 
-def get_user(conn: Connection, user_id: int) -> Optional[User]:
-    row = conn.execute(
-        text(f"SELECT {_USER_COLUMNS} FROM users WHERE user_id = :user_id"),
-        {"user_id": user_id},
-    ).fetchone()
-    return _row_to_user(row) if row else None
-
-
 def authenticate(conn: Connection, username: str, password: str) -> Optional[User]:
     """Check a username/password pair. None means "no", with no detail as to why.
 
@@ -567,9 +560,7 @@ class RateLimiter:
 
     def check(self, key: str, now: Optional[float] = None) -> bool:
         """Record an attempt. False once the key is over its limit for the window."""
-        import time as _time
-
-        now = _time.monotonic() if now is None else now
+        now = time.monotonic() if now is None else now
         cutoff = now - self.window_seconds
         recent = [stamp for stamp in self._hits.get(key, []) if stamp > cutoff]
         recent.append(now)

@@ -34,6 +34,13 @@ import auth  # noqa: E402
 import pipeline  # noqa: E402
 
 
+# Picked out of the module docstring by shape, not by line number: a slice would
+# go quietly wrong the next time a subcommand is documented above or below it.
+_USAGE = "\n".join(
+    line for line in (__doc__ or "").splitlines() if line.startswith("    python ")
+)
+
+
 def _prompt_password(label: str = "Password") -> str:
     """Ask twice and compare, so a typo does not become the new password."""
     first = getpass.getpass(f"{label}: ")
@@ -165,7 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="\n".join(__doc__.splitlines()[2:11]),
+        epilog=_USAGE,
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

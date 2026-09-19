@@ -12,7 +12,6 @@ import pytest
 
 import insights
 from insights import (
-    Recommendation,
     SetRecord,
     deload_load,
     detect_plateau,

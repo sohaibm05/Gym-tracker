@@ -47,6 +47,13 @@ BODYWEIGHT_FIELDS: Sequence[tuple[str, str, str, str]] = (
     ("notes", "Notes", "n2 w3", "text"),
 )
 
+# How many set rows a submitted form is allowed to claim. `set_count` is just a
+# number in the POST body and `draft_from_form` builds a row per unit of it, so
+# without a bound one request can ask for a hundred million rows and take the
+# worker's memory with it. Far above any real session: the longest entry anyone
+# logs is tens of sets, and rows are added one at a time.
+MAX_SET_ROWS = 500
+
 SET_CHECKBOXES: Sequence[tuple[str, str]] = (
     ("is_warmup", "Warm-up"),
     ("is_dropset", "Drop set"),
@@ -446,11 +453,17 @@ def render_review_body(
         # Each button carries its own mode, which is why the hidden copy is
         # omitted above. Replace deletes the day first, so it is styled as the
         # destructive action it is.
+        #
+        # Add comes first in the markup for the same reason Save does on the
+        # full form: the rows above are still editable, and pressing Enter in a
+        # text field submits via the first button. First must therefore be the
+        # option that cannot lose data — putting Replace there would let a
+        # stray Enter delete the whole day.
         actions = (
-            '<button type="submit" name="mode" value="replace" class="danger">'
-            f"Replace {html.escape(draft.session_date.isoformat())} with this</button>"
             '<button type="submit" name="mode" value="add" class="secondary">'
             "Add as a second copy</button>"
+            '<button type="submit" name="mode" value="replace" class="danger">'
+            f"Replace {html.escape(draft.session_date.isoformat())} with this</button>"
             '<a href="/">Go back &mdash; it was a double-tap</a>'
         )
     else:
@@ -569,6 +582,9 @@ def draft_from_form(
         set_count = int(str(form.get("set_count", "0")).strip() or 0)
     except ValueError:
         set_count = 0
+    # Clamped, not rejected: this form is rendered by render_review_body, so a
+    # count outside the range did not come from it.
+    set_count = min(max(0, set_count), MAX_SET_ROWS)
 
     draft = EntryDraft(
         raw_text=raw_text,
@@ -577,7 +593,7 @@ def draft_from_form(
     )
 
     checkbox_columns = [column for column, _ in SET_CHECKBOXES]
-    for index in range(max(0, set_count)):
+    for index in range(set_count):
         prefix = f"s{index}"
         values = _row_values(form, prefix, pipeline.SET_COLUMNS, checkbox_columns)
         changed = _edited_fields(form, prefix, values)

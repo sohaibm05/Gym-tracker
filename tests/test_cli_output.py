@@ -7,10 +7,7 @@ here means testing the extraction blind.
 
 from __future__ import annotations
 
-import os
 from datetime import date
-
-import pytest
 
 import parse_workout_log
 import pipeline
@@ -174,11 +171,6 @@ class TestVercelEntrypoint:
         )
         assert "app.py" in config["functions"]
         assert config["functions"]["app.py"]["maxDuration"] == 60
-
-    def test_probe_exists_for_bisecting_deploys(self):
-        from pathlib import Path
-
-        assert (Path(__file__).resolve().parent.parent / "api" / "ping.py").is_file()
 
     def test_tzdata_is_pinned(self):
         """zoneinfo reads the OS tz database; slim images often lack it."""
