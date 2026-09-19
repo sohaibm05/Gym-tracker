@@ -146,24 +146,24 @@ checkable against the code.
 
 | Metric | Purpose | Unit | Labels | Where recorded |
 |---|---|---|---|---|
-| `gym_http_requests_total` | Every response served. Numerator and denominator of the error rate. | 1 | `method`, `route`, `status` | `app.py:425` (middleware) |
-| `gym_http_exceptions_total` | Requests that raised out of the handler. Distinguishes a crash from a deliberate 500. | 1 | `route`, `exception` | `app.py:399` |
-| `gym_workout_entries_total` | **Business.** Journal entries reaching a terminal state at save. | 1 | `outcome` = `saved`/`blocked`/`duplicate_held` | `app.py:1210`, `1252`, `1275` |
-| `gym_sets_written_total` | **Business.** Individual sets inserted — the product's unit of value. | 1 | — | `app.py:1278` |
-| `gym_bodyweight_entries_written_total` | **Business.** Bodyweight readings inserted. | 1 | — | `app.py:1279` |
-| `gym_duplicate_decisions_total` | **Business.** How the duplicate prompt was answered. | 1 | `decision` = `held`/`overridden` | `app.py:1227`, `1253` |
+| `gym_http_requests_total` | Every response served. Numerator and denominator of the error rate. | 1 | `method`, `route`, `status` | `app.py:419` (exception path) / `459` (success path), both in the `log_requests` middleware |
+| `gym_http_exceptions_total` | Requests that raised out of the handler. Distinguishes a crash from a deliberate 500. | 1 | `route`, `exception` | `app.py:422` |
+| `gym_workout_entries_total` | **Business.** Journal entries reaching a terminal state at save. | 1 | `outcome` = `saved`/`blocked`/`duplicate_held` | `app.py:1332` (blocked), `1374` (duplicate_held), `1397` (saved) |
+| `gym_sets_written_total` | **Business.** Individual sets inserted — the product's unit of value. | 1 | — | `app.py:1400` |
+| `gym_bodyweight_entries_written_total` | **Business.** Bodyweight readings inserted. | 1 | — | `app.py:1401` |
+| `gym_duplicate_decisions_total` | **Business.** How the duplicate prompt was answered. | 1 | `decision` = `held`/`overridden` | `app.py:1349`, `1375` |
 | `gym_llm_extractions_total` | **Business.** Groq extraction calls by outcome. | 1 | `outcome` = `success`/`rate_limited`/`error` | `pipeline.py:1042` |
-| `gym_weekly_reports_total` | **Business.** Reports generated, by narration success. | 1 | `narration` = `ok`/`failed` | `app.py:1380` |
-| `gym_logins_total` | Authentication outcomes. Failures without successes = credential stuffing. | 1 | `result` = `success`/`failure`/`rate_limited` | `app.py:729`, `752`, `767` |
+| `gym_weekly_reports_total` | **Business.** Reports generated, by narration success. | 1 | `narration` = `ok`/`failed` | `app.py:1509` |
+| `gym_logins_total` | Authentication outcomes. Failures without successes = credential stuffing. | 1 | `result` = `success`/`failure`/`rate_limited` | `app.py:851`, `874`, `889` |
 | `gym_faults_injected_total` | Part E only. Proves from metrics alone when a fault was live. | 1 | `kind` = `latency`/`error` | `faults.py:138` |
 
 #### Gauges — a value that goes up and down
 
 | Metric | Purpose | Unit | Labels | Where recorded |
 |---|---|---|---|---|
-| `gym_http_requests_in_flight` | Concurrent requests. The saturation signal on a single worker. | 1 | — | `app.py:353` / `392` / `421` |
+| `gym_http_requests_in_flight` | Concurrent requests. The saturation signal on a single worker. | 1 | — | `app.py:377` (inc) / `447` (dec, in `finally`) |
 | `gym_llm_extractions_in_flight` | Extractions waiting on Groq right now. | 1 | — | `pipeline.py:1175` / `1212` |
-| `gym_review_drafts_open` | **Business.** Entries parsed but not yet confirmed. | 1 | — | `metrics.py:269` (`DraftTracker` at `453`), driven from `app.py` |
+| `gym_review_drafts_open` | **Business.** Entries parsed but not yet confirmed. | 1 | — | `metrics.py:269` (`DraftTracker` at `453`), driven from `app.py:1272` (opened) / `1406` (closed) |
 | `gym_build_info` | Always 1; labels carry the build identity. | 1 | `version`, `commit` | `metrics.py:277` / `359` |
 
 `gym_review_drafts_open` is this app's version of the brief's *"orders waiting to
@@ -180,9 +180,9 @@ map is capped so a burst cannot grow memory without bound (`metrics.py`,
 
 | Metric | Purpose | Unit | Labels | Where recorded |
 |---|---|---|---|---|
-| `gym_http_request_duration_seconds` | The headline latency metric. | seconds | `method`, `route` | `app.py:393` / `422` |
+| `gym_http_request_duration_seconds` | The headline latency metric. | seconds | `method`, `route` | `app.py:416` (exception path) / `456` (success path) |
 | `gym_llm_extraction_duration_seconds` | **Business.** One Groq extraction, retries included. | seconds | — | `pipeline.py:1042` |
-| `gym_db_commit_duration_seconds` | Time inside the committing transaction. | seconds | — | `app.py:1234` |
+| `gym_db_commit_duration_seconds` | Time inside the committing transaction. | seconds | — | `app.py:1356` |
 
 Bucket boundaries are chosen per metric, because the three live on different
 scales (`metrics.py`): HTTP latency keeps resolution from 5ms to 10s, the LLM
@@ -194,8 +194,8 @@ this is visible in the numbers.
 
 | Metric | Purpose | Unit | Labels | Where recorded |
 |---|---|---|---|---|
-| `gym_entry_text_bytes` | **Business.** Size of a pasted entry. Drives the token budget, so it is a cost metric too. | bytes | — | `app.py:1142` |
-| `gym_sets_per_entry` | **Business.** Sets written per saved entry. | 1 | — | `app.py:1280` |
+| `gym_entry_text_bytes` | **Business.** Size of a pasted entry. Drives the token budget, so it is a cost metric too. | bytes | — | `app.py:1264` |
+| `gym_sets_per_entry` | **Business.** Sets written per saved entry. | 1 | — | `app.py:1402` |
 
 **On Python summaries.** The brief notes that Python summaries lack percentiles,
 and they do: `prometheus_client` implements no streaming quantiles, so a Summary
