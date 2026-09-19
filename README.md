@@ -130,6 +130,7 @@ below the confidence threshold is reported rather than saved
 | `api.py` | The JSON API the workout app calls. Same process, same session cookie, no token |
 | `static/` | The installable workout app: shell, client JS, service worker, manifest, icons |
 | `migrations/003_routines_sessions_measurements.sql` | Adds all of the above to an existing database |
+| `migrations/verify.sql` | Read-only check that a database matches the code, RLS included |
 
 ### Observability (Assignment 1)
 
@@ -184,9 +185,19 @@ psql "$DATABASE_URL" -f migrations/001_add_cheat_reps.sql
 psql "$DATABASE_URL" -f migrations/003_routines_sessions_measurements.sql
 ```
 
-To find out which ones a given database still needs, ask it rather than trying
-to remember. Each migration leaves a fingerprint, so one query answers it — and
-it runs fine in a hosted SQL console:
+Afterwards — or any time you want to know whether a database matches the code —
+run the checker. It reads only catalogs, so it is safe against production, and
+it covers what a schema diagram cannot show you: the constraints and indexes
+that enforce the rules, and whether RLS is on. Seven `PASS` rows is the answer
+you want:
+
+```bash
+psql "$DATABASE_URL" -f migrations/verify.sql
+```
+
+To find out instead which migrations a given database still needs, ask it rather
+than trying to remember. Each migration leaves a fingerprint, so one query
+answers it — and it runs fine in a hosted SQL console:
 
 ```sql
 SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM information_schema.columns
