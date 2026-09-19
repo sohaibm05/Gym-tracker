@@ -30,7 +30,7 @@
 // Bump to invalidate the shell cache. The version is in the name rather than in
 // the entries, so activating a new worker drops the whole old cache at once and
 // cannot leave a half-updated mix of old and new assets.
-const CACHE = 'gym-shell-v1';
+const CACHE = 'gym-shell-v2';
 
 // /workout is deliberately NOT pre-cached at install time.
 //
@@ -39,6 +39,7 @@ const CACHE = 'gym-shell-v1';
 // /workout key before the app had ever run. It is cached on first successful
 // load instead, by the fetch handler below, which checks what it actually got.
 const SHELL = [
+  '/static/theme.css',
   '/static/app.css',
   '/static/app.js',
   '/static/icon.svg',

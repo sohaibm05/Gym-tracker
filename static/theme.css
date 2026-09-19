@@ -1,0 +1,56 @@
+/* Design tokens — the one place the app's look is defined.
+ *
+ * Both halves of the app load this: the server-rendered pages (login, signup,
+ * the journal form, progress, the weekly report) and the live workout PWA.
+ * Before it existed they had separate stylesheets and looked like two different
+ * products — a dark, card-based workout screen bolted to a set of default
+ * HTML forms with blue links.
+ *
+ * Re-skinning is editing this file. Nothing below the token block hard-codes a
+ * colour, so a new palette does not mean hunting hex values through two
+ * stylesheets and an f-string in app.py.
+ */
+
+:root {
+  color-scheme: dark light;
+
+  --bg: #0b0d10;
+  --surface: #14171c;
+  --surface-2: #1b1f26;
+  --border: #272c35;
+  --text: #e8eaed;
+  --text-dim: #9aa3b0;
+  --text-faint: #6b7483;
+
+  --accent: #f26b21;        /* the action colour: start, save, log */
+  --accent-press: #d45713;  /* the same colour pressed, not a transparent one */
+  --accent-ink: #ffffff;
+  --good: #34c759;
+  --warn: #ff9f0a;
+  --bad: #ff453a;
+  --pr: #ffd60a;            /* personal records get their own colour */
+
+  --radius: 14px;
+  --radius-sm: 10px;
+  --tap: 44px;              /* minimum comfortable target */
+
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+/* Dark is the default, not the preference: a gym is not a bright room and the
+ * phone is at arm's length between sets. Light follows the system for anyone
+ * who wants it. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --surface-2: #f0f2f5;
+    --border: #dfe3e8;
+    --text: #15181d;
+    --text-dim: #5b6572;
+    --text-faint: #8b95a3;
+  }
+}

@@ -10,44 +10,9 @@
  * The light theme follows prefers-color-scheme for anyone who wants it.
  */
 
-:root {
-  color-scheme: dark light;
-
-  --bg: #0b0d10;
-  --surface: #14171c;
-  --surface-2: #1b1f26;
-  --border: #272c35;
-  --text: #e8eaed;
-  --text-dim: #9aa3b0;
-  --text-faint: #6b7483;
-
-  --accent: #f26b21;        /* the action colour: start, save, log */
-  --accent-press: #d4571300;
-  --accent-ink: #ffffff;
-  --good: #34c759;
-  --warn: #ff9f0a;
-  --bad: #ff453a;
-  --pr: #ffd60a;            /* personal records get their own colour */
-
-  --radius: 14px;
-  --radius-sm: 10px;
-  --tap: 44px;              /* minimum comfortable target */
-
-  --safe-top: env(safe-area-inset-top, 0px);
-  --safe-bottom: env(safe-area-inset-bottom, 0px);
-}
-
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) {
-    --bg: #f6f7f9;
-    --surface: #ffffff;
-    --surface-2: #f0f2f5;
-    --border: #dfe3e8;
-    --text: #15181d;
-    --text-dim: #5b6572;
-    --text-faint: #8b95a3;
-  }
-}
+/* Tokens live in theme.css, which every page loads before this file.
+ * They were duplicated here and in app.py's inline stylesheet, which is how
+ * the two halves of the app drifted into different colour schemes. */
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 

@@ -473,34 +473,107 @@ async def log_requests(request: Request, call_next):
 # --------------------------------------------------------------------------
 
 _STYLE = """
-:root { color-scheme: light dark; }
-* { box-sizing: border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-       margin: 0; padding: 1rem; max-width: 46rem; margin-inline: auto; line-height: 1.5; }
-h1 { font-size: 1.35rem; margin: 0 0 1rem; }
-h2 { font-size: 1.1rem; margin: 1.4rem 0 .5rem; }
-label { display: block; font-weight: 600; margin: .9rem 0 .3rem; }
-input[type=date], textarea, button, select { width: 100%; font-size: 1rem; padding: .7rem;
-       border-radius: .5rem; border: 1px solid #8884; font-family: inherit; }
-textarea { min-height: 11rem; resize: vertical; }
-button { margin-top: 1rem; font-weight: 600; border: 0; background: #2563eb; color: #fff; }
-button:active { background: #1d4ed8; }
-.card { border: 1px solid #8884; border-radius: .6rem; padding: .8rem 1rem; margin: .8rem 0; }
-.ok { border-left: 4px solid #16a34a; }
-.warn { border-left: 4px solid #d97706; }
-.err { border-left: 4px solid #dc2626; }
-.muted { opacity: .75; font-size: .9rem; }
+/* The server-rendered pages: login, signup, the journal form, progress, the
+ * weekly report, account.
+ *
+ * Every colour here is a token from /static/theme.css, which the workout PWA
+ * reads too. That is the whole point: these pages and the workout app used to
+ * carry separate stylesheets and looked like two different products bolted
+ * together — a dark, card-based app next to a default HTML form with blue
+ * links. A new palette is now an edit to theme.css and nothing else.
+ */
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  margin: 0;
+  padding: 1rem calc(1rem + var(--safe-left, 0px)) calc(2rem + var(--safe-bottom));
+  max-width: 34rem;
+  margin-inline: auto;
+  /* 16px floor: iOS zooms the page when a focused input is smaller. */
+  font-size: 16px;
+  line-height: 1.5;
+  min-height: 100dvh;
+}
+
+h1 { font-size: 1.35rem; margin: 0 0 1rem; font-weight: 650; letter-spacing: -.01em; }
+h2 { font-size: 1.05rem; margin: 1.4rem 0 .5rem; font-weight: 640; }
+
+label { display: block; font-size: .8rem; color: var(--text-dim); margin: .9rem 0 .3rem; }
+
+input[type=date], input[type=text], input[type=password], input[type=number],
+textarea, select {
+  width: 100%;
+  font: inherit;
+  min-height: var(--tap);
+  padding: .55rem .7rem;
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+input:focus, textarea:focus, select:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+textarea { min-height: 11rem; resize: vertical; line-height: 1.45; }
+
+button {
+  width: 100%;
+  font: inherit;
+  min-height: var(--tap);
+  margin-top: 1rem;
+  padding: .6rem 1rem;
+  font-weight: 600;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--accent-ink);
+  cursor: pointer;
+}
+button:active { background: var(--accent-press); border-color: var(--accent-press); }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: .9rem 1rem;
+  margin: .8rem 0;
+}
+.ok   { border-left: 4px solid var(--good); }
+.warn { border-left: 4px solid var(--warn); }
+.err  { border-left: 4px solid var(--bad); }
+.muted { color: var(--text-dim); font-size: .9rem; }
 ul { padding-left: 1.2rem; }
-nav { display: flex; flex-wrap: wrap; align-items: baseline; gap: 1rem;
-      margin-bottom: 1rem; }
-nav a { display: inline-block; }
-nav .who { margin-left: auto; font-size: .9rem; opacity: .8; }
+a { color: var(--accent); }
+
+nav {
+  display: flex; flex-wrap: wrap; align-items: center; gap: .75rem;
+  margin-bottom: 1.25rem; padding-bottom: .75rem;
+  border-bottom: 1px solid var(--border);
+}
+nav a { display: inline-block; color: var(--text-dim); text-decoration: none; font-size: .9rem; }
+nav a:hover { color: var(--text); }
+/* The workout app is the thing you train with, so it reads as the action. */
+nav a.primary {
+  font-weight: 600;
+  min-height: 34px;
+  display: inline-flex; align-items: center;
+  padding: .2rem .75rem;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+nav .who { margin-left: auto; font-size: .85rem; color: var(--text-faint); }
 nav form { display: inline; }
-nav button.link { width: auto; margin: 0; padding: 0; background: none; color: #2563eb;
-      font: inherit; font-weight: 400; text-decoration: underline; cursor: pointer; }
+nav button.link {
+  width: auto; min-height: 0; margin: 0; padding: 0;
+  background: none; border: 0; color: var(--text-dim);
+  font: inherit; font-weight: 400; text-decoration: underline; cursor: pointer;
+}
 pre { white-space: pre-wrap; word-wrap: break-word; }
-input[type=text], input[type=password] { width: 100%; font-size: 1rem; padding: .7rem;
-      border-radius: .5rem; border: 1px solid #8884; font-family: inherit; }
 .auth { max-width: 24rem; margin-inline: auto; }
 .auth .muted a { white-space: nowrap; }
 """
@@ -514,6 +587,10 @@ def _nav(user: Optional["auth.User"]) -> str:
         )
     return (
         '<nav>'
+        # First, and first for a reason: this is the app you train with. It was
+        # reachable only by typing the URL, so signing up landed you on the
+        # journal form and the whole live-logging half was invisible.
+        '<a href="/workout" class="primary">Workout</a>'
         '<a href="/">Log entry</a>'
         '<a href="/progress">Progress</a>'
         '<a href="/weekly-report">Weekly report</a>'
@@ -534,7 +611,11 @@ def _page(
     extra_js: str = "",
     user: Optional["auth.User"] = None,
 ) -> HTMLResponse:
-    css = f"<style>{_STYLE}{extra_css}</style>"
+    # theme.css before the page's own rules: it defines the tokens they read.
+    css = (
+        '<link rel="stylesheet" href="/static/theme.css">'
+        f"<style>{_STYLE}{extra_css}</style>"
+    )
     # Deferred so the markup the charts measure exists before the script runs.
     js = f"<script>{extra_js}</script>" if extra_js else ""
     return HTMLResponse(
