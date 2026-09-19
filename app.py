@@ -494,6 +494,14 @@ ul { padding-left: 1.2rem; }
 nav { display: flex; flex-wrap: wrap; align-items: baseline; gap: 1rem;
       margin-bottom: 1rem; }
 nav a { display: inline-block; }
+nav a.primary {
+  font-weight: 600;
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  background: #ea6a1f;
+  color: #fff;
+  text-decoration: none;
+}
 nav .who { margin-left: auto; font-size: .9rem; opacity: .8; }
 nav form { display: inline; }
 nav button.link { width: auto; margin: 0; padding: 0; background: none; color: #2563eb;
@@ -514,6 +522,10 @@ def _nav(user: Optional["auth.User"]) -> str:
         )
     return (
         '<nav>'
+        # First, and first for a reason: this is the app you train with. It was
+        # reachable only by typing the URL, so signing up landed you on the
+        # journal form and the whole live-logging half was invisible.
+        '<a href="/workout" class="primary">Workout</a>'
         '<a href="/">Log entry</a>'
         '<a href="/progress">Progress</a>'
         '<a href="/weekly-report">Weekly report</a>'
