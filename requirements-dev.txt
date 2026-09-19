@@ -2,3 +2,7 @@
 pytest>=8.0
 # The async fault-injection tests use anyio's pytest plugin.
 anyio>=4.0
+# Shuffles test order. The suite is meant to be order-independent, and was
+# not until an importlib.reload() in test_pipeline.py was replaced with a
+# subprocess; this is what catches the next one.
+pytest-randomly>=3.15

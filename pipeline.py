@@ -1774,6 +1774,21 @@ def load_exercise_names(conn: Connection, user_id: int) -> dict[str, int]:
     return {row[0]: row[1] for row in rows}
 
 
+def _search_key(name: str) -> str:
+    """The exercise search key, delegated to catalog so there is one definition.
+
+    Imported lazily rather than at module scope: `catalog` is a leaf module but
+    this one is imported by the CLI scripts and by serverless bundles that may
+    not ship it, and an exercise must still be creatable without a catalog.
+    """
+    try:
+        import catalog
+
+        return catalog.search_key(name)
+    except Exception:  # noqa: BLE001 - a missing key only costs search quality
+        return " ".join(re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).split())
+
+
 def get_or_create_exercise(
     conn: Connection,
     user_id: int,
@@ -1815,18 +1830,33 @@ def get_or_create_exercise(
     if not muscle_group:
         muscle_group = resolve_muscle_group(proposed_name)
 
+    # search_key is written here too, not only by the live logger. It is the
+    # indexed column the exercise picker searches, so a row created by this path
+    # without one is invisible to that search — and the picker then offers to
+    # "create" a lift the person already has, which is how one lift ends up as
+    # two rows with two separate histories.
+    #
+    # Computed by catalog.search_key so every writer agrees on the value. The
+    # COALESCE on conflict fills it in for rows that predate this.
     row = conn.execute(
         text(
             """
-            INSERT INTO exercises (user_id, name, muscle_group)
-            VALUES (:user_id, :name, :muscle_group)
+            INSERT INTO exercises (user_id, name, muscle_group, search_key)
+            VALUES (:user_id, :name, :muscle_group, :search_key)
             ON CONFLICT (user_id, name) DO UPDATE
                 SET muscle_group = COALESCE(exercises.muscle_group,
-                                            EXCLUDED.muscle_group)
+                                            EXCLUDED.muscle_group),
+                    search_key   = COALESCE(exercises.search_key,
+                                            EXCLUDED.search_key)
             RETURNING exercise_id
             """
         ),
-        {"user_id": user_id, "name": proposed_name, "muscle_group": muscle_group},
+        {
+            "user_id": user_id,
+            "name": proposed_name,
+            "muscle_group": muscle_group,
+            "search_key": _search_key(proposed_name),
+        },
     ).fetchone()
     exercise_id = int(row[0])
     known[proposed_name] = exercise_id

@@ -35,7 +35,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
@@ -255,35 +255,75 @@ def resolve_exercise(conn: Connection, user_id: int, name: str) -> int:
     if len(clean) > 120:
         raise SessionError("That exercise name is too long.")
 
-    key = catalog.search_key(clean)
+    entry = catalog.resolve(clean)
+    # The name that will actually be stored. A catalog hit is filed under the
+    # catalog's spelling, so "bench press barbell" and "Bench Press (Barbell)"
+    # converge on one row instead of two.
+    stored_name = entry.name if entry else clean
+
+    # Search under BOTH what was typed and what would be stored. Looking only
+    # for the typed form misses a row that already exists under the canonical
+    # name, and the insert below then violates exercises_user_name_unique — a
+    # 500 for a lift the person already has. `search_key` is matched too
+    # because it is the indexed column, but it may be NULL on rows created by
+    # the journal-paste flow before this existed, so the name comparisons are
+    # what actually carry those.
     row = conn.execute(
         text(
             "SELECT exercise_id FROM exercises "
-            "WHERE user_id = :user_id AND (search_key = :key OR lower(name) = lower(:name)) "
+            "WHERE user_id = :user_id "
+            "  AND (search_key = :key OR lower(name) = lower(:typed) "
+            "       OR lower(name) = lower(:stored)) "
             "ORDER BY exercise_id LIMIT 1"
         ),
-        {"user_id": user_id, "key": key, "name": clean},
+        {
+            "user_id": user_id,
+            "key": catalog.search_key(stored_name),
+            "typed": clean,
+            "stored": stored_name,
+        },
     ).fetchone()
     if row is not None:
         return int(row[0])
 
-    entry = catalog.resolve(clean)
-    exercise_id = conn.execute(
-        text(
-            "INSERT INTO exercises (user_id, name, muscle_group, equipment, is_custom, search_key) "
-            "VALUES (:user_id, :name, :muscle_group, :equipment, :is_custom, :search_key) "
-            "RETURNING exercise_id"
-        ),
-        {
-            "user_id": user_id,
-            "name": entry.name if entry else clean,
-            "muscle_group": entry.muscle_group if entry else None,
-            "equipment": entry.equipment if entry else None,
-            # A lift absent from the catalog is by definition the person's own.
-            "is_custom": entry is None,
-            "search_key": key,
-        },
-    ).scalar()
+    try:
+        # Savepointed for the same reason as start_session: two requests can
+        # resolve the same new lift at once, and the loser's unique violation
+        # would otherwise abort the caller's whole transaction — taking the
+        # set they were logging down with it.
+        with conn.begin_nested():
+            exercise_id = conn.execute(
+                text(
+                    "INSERT INTO exercises "
+                    "    (user_id, name, muscle_group, equipment, is_custom, search_key) "
+                    "VALUES (:user_id, :name, :muscle_group, :equipment, :is_custom, :search_key) "
+                    "RETURNING exercise_id"
+                ),
+                {
+                    "user_id": user_id,
+                    "name": stored_name,
+                    "muscle_group": entry.muscle_group if entry else None,
+                    "equipment": entry.equipment if entry else None,
+                    # A lift absent from the catalog is by definition the person's own.
+                    "is_custom": entry is None,
+                    # Derived from the name being STORED, never from what was
+                    # typed. A key that does not describe its own row makes the
+                    # index worse than useless: it matches things it should not
+                    # and misses the row it belongs to.
+                    "search_key": catalog.search_key(stored_name),
+                },
+            ).scalar()
+    except Exception:  # noqa: BLE001 - lost a race to create the same lift
+        existing = conn.execute(
+            text(
+                "SELECT exercise_id FROM exercises "
+                "WHERE user_id = :user_id AND lower(name) = lower(:name)"
+            ),
+            {"user_id": user_id, "name": stored_name},
+        ).fetchone()
+        if existing is None:
+            raise
+        return int(existing[0])
 
     logger.info(
         "exercise created",
@@ -302,78 +342,107 @@ def resolve_exercise(conn: Connection, user_id: int, name: str) -> int:
 # --------------------------------------------------------------------------
 
 
+def previous_performance_bulk(
+    conn: Connection,
+    user_id: int,
+    exercise_ids: Sequence[int],
+    before_session_id: Optional[int] = None,
+) -> dict[int, tuple[list[LoggedSet], Optional[datetime]]]:
+    """Last time's sets for several lifts, in ONE query.
+
+    The single-exercise version below delegates here. Called per exercise while
+    building a session, this was the dominant cost of loading the live screen:
+    an eight-lift routine meant eight window-function queries, and the API
+    reloaded the whole session after every logged set, so one tap on the tick
+    cost eight of them on gym wifi.
+
+    Scoped to one earlier session per lift rather than "the last N sets" —
+    repeating a workout would otherwise splice two different days together and
+    show a "previous" that never happened as a single session. Sets from the
+    journal-paste flow have no session, so those group by calendar day instead;
+    both are searched and the most recent wins.
+    """
+    ids = [int(value) for value in exercise_ids]
+    if not ids:
+        return {}
+
+    rows = conn.execute(
+        text(
+            """
+            WITH candidate AS (
+                SELECT wl.exercise_id, wl.log_id, wl.weight_kg, wl.reps,
+                       wl.cheat_reps, wl.is_warmup, wl.is_dropset, wl.rpe, wl.rir,
+                       wl.set_number, wl.logged_at, e.name,
+                       -- A session id where there is one, otherwise the calendar
+                       -- day, so journal-entered sets still group into a workout.
+                       COALESCE(wl.session_id::text, wl.logged_at::date::text) AS grp,
+                       MAX(wl.logged_at) OVER (
+                           PARTITION BY wl.exercise_id,
+                                        COALESCE(wl.session_id::text,
+                                                 wl.logged_at::date::text)
+                       ) AS grp_at
+                  FROM workout_logs wl
+                  JOIN exercises e ON e.exercise_id = wl.exercise_id
+                 WHERE wl.user_id = :user_id
+                   AND wl.exercise_id = ANY(:exercise_ids)
+                   AND (CAST(:before AS bigint) IS NULL
+                        OR wl.session_id IS DISTINCT FROM CAST(:before AS bigint))
+            ),
+            latest AS (
+                SELECT DISTINCT ON (exercise_id) exercise_id, grp
+                  FROM candidate
+                 ORDER BY exercise_id, grp_at DESC
+            )
+            SELECT c.exercise_id, c.log_id, c.weight_kg, c.reps, c.cheat_reps,
+                   c.is_warmup, c.is_dropset, c.rpe, c.rir, c.set_number,
+                   c.logged_at, c.name
+              FROM candidate c
+              JOIN latest l
+                ON l.exercise_id = c.exercise_id AND l.grp = c.grp
+             ORDER BY c.exercise_id, COALESCE(c.set_number, 0), c.log_id
+            """
+        ),
+        {"user_id": user_id, "exercise_ids": ids, "before": before_session_id},
+    ).fetchall()
+
+    found: dict[int, tuple[list[LoggedSet], Optional[datetime]]] = {}
+    for row in rows:
+        exercise_id = int(row[0])
+        sets, _ = found.setdefault(exercise_id, ([], None))
+        sets.append(
+            LoggedSet(
+                log_id=row[1],
+                exercise_id=exercise_id,
+                exercise_name=row[11],
+                weight_kg=float(row[2]) if row[2] is not None else None,
+                reps=row[3],
+                cheat_reps=row[4] or 0,
+                is_warmup=bool(row[5]),
+                is_dropset=bool(row[6]),
+                rpe=float(row[7]) if row[7] is not None else None,
+                rir=row[8],
+                set_number=row[9] or (len(sets) + 1),
+                logged_at=row[10],
+            )
+        )
+
+    return {
+        exercise_id: (sets, sets[-1].logged_at if sets else None)
+        for exercise_id, (sets, _) in found.items()
+    }
+
+
 def previous_performance(
     conn: Connection,
     user_id: int,
     exercise_id: int,
     before_session_id: Optional[int] = None,
 ) -> tuple[list[LoggedSet], Optional[datetime]]:
-    """The sets from the last time this lift was trained, and when that was.
-
-    Scoped to one earlier session rather than "the last N sets" — repeating a
-    workout would otherwise splice two different days together and show a
-    "previous" that never happened as a single session.
-
-    Sets logged through the journal-paste flow have no session, so they are
-    grouped by calendar day instead. Both paths are searched, and the most
-    recent wins, so the Previous column works whichever way the last workout
-    was recorded.
-    """
-    rows = conn.execute(
-        text(
-            """
-            WITH candidate AS (
-                SELECT wl.log_id, wl.weight_kg, wl.reps, wl.cheat_reps,
-                       wl.is_warmup, wl.is_dropset, wl.rpe, wl.rir, wl.set_number,
-                       wl.logged_at,
-                       -- A session id where there is one, otherwise the calendar
-                       -- day, so journal-entered sets still group into a workout.
-                       COALESCE(wl.session_id::text, wl.logged_at::date::text) AS grp,
-                       MAX(wl.logged_at) OVER (
-                           PARTITION BY COALESCE(wl.session_id::text,
-                                                 wl.logged_at::date::text)
-                       ) AS grp_at
-                  FROM workout_logs wl
-                 WHERE wl.user_id = :user_id
-                   AND wl.exercise_id = :exercise_id
-                   AND (:before IS NULL OR wl.session_id IS DISTINCT FROM :before)
-            )
-            SELECT log_id, weight_kg, reps, cheat_reps, is_warmup, is_dropset,
-                   rpe, rir, set_number, logged_at
-              FROM candidate
-             WHERE grp = (SELECT grp FROM candidate ORDER BY grp_at DESC LIMIT 1)
-             ORDER BY COALESCE(set_number, 0), log_id
-            """
-        ),
-        {"user_id": user_id, "exercise_id": exercise_id, "before": before_session_id},
-    ).fetchall()
-
-    if not rows:
-        return [], None
-
-    name = conn.execute(
-        text("SELECT name FROM exercises WHERE exercise_id = :id AND user_id = :user_id"),
-        {"id": exercise_id, "user_id": user_id},
-    ).scalar() or ""
-
-    sets = [
-        LoggedSet(
-            log_id=row[0],
-            exercise_id=exercise_id,
-            exercise_name=name,
-            weight_kg=float(row[1]) if row[1] is not None else None,
-            reps=row[2],
-            cheat_reps=row[3] or 0,
-            is_warmup=bool(row[4]),
-            is_dropset=bool(row[5]),
-            rpe=float(row[6]) if row[6] is not None else None,
-            rir=row[7],
-            set_number=row[8] or (index + 1),
-            logged_at=row[9],
-        )
-        for index, row in enumerate(rows)
-    ]
-    return sets, sets[-1].logged_at
+    """The sets from the last time this lift was trained, and when that was."""
+    found = previous_performance_bulk(
+        conn, user_id, [exercise_id], before_session_id=before_session_id
+    )
+    return found.get(exercise_id, ([], None))
 
 
 # --------------------------------------------------------------------------
@@ -420,17 +489,27 @@ def start_session(
     session_name = (name or "").strip() or (routine.name if routine else "Workout")
 
     try:
-        session_id = conn.execute(
-            text(
-                "INSERT INTO workout_sessions (user_id, routine_id, name) "
-                "VALUES (:user_id, :routine_id, :name) RETURNING session_id"
-            ),
-            {
-                "user_id": user_id,
-                "routine_id": routine.routine_id if routine else None,
-                "name": session_name[:80],
-            },
-        ).scalar()
+        # The INSERT runs inside a SAVEPOINT, and that is load-bearing.
+        #
+        # Postgres aborts the whole transaction on a constraint violation: every
+        # subsequent statement on the connection is rejected with
+        # InFailedSqlTransaction until a rollback. So without the savepoint the
+        # recovery read below — the entire reason this except branch exists —
+        # is itself refused, and the race it was written to absorb surfaces as
+        # a 500. `begin_nested()` scopes the failure to the savepoint, which
+        # rolls back on the way out and leaves the transaction usable.
+        with conn.begin_nested():
+            session_id = conn.execute(
+                text(
+                    "INSERT INTO workout_sessions (user_id, routine_id, name) "
+                    "VALUES (:user_id, :routine_id, :name) RETURNING session_id"
+                ),
+                {
+                    "user_id": user_id,
+                    "routine_id": routine.routine_id if routine else None,
+                    "name": session_name[:80],
+                },
+            ).scalar()
     except Exception as exc:  # noqa: BLE001 - the partial unique index is the guard
         # Two "start workout" taps landing at once: one insert wins, the other
         # violates idx_workout_sessions_one_active_per_user. The loser returns
@@ -495,31 +574,47 @@ def load_session(conn: Connection, user_id: int, session_id: int) -> Optional[Se
                 )
 
     # Then what was actually logged, which may include lifts added mid-session.
-    for logged in _session_sets(conn, user_id, session_id):
+    logged_sets = _session_sets(conn, user_id, session_id)
+
+    # Details for the lifts that are NOT part of the routine, fetched together.
+    # One query whether the person added one exercise mid-session or six.
+    ad_hoc_ids = [
+        logged.exercise_id for logged in logged_sets if logged.exercise_id not in by_exercise
+    ]
+    details: dict[int, tuple[Optional[str], Optional[str]]] = {}
+    if ad_hoc_ids:
+        details = {
+            int(row[0]): (row[1], row[2])
+            for row in conn.execute(
+                text(
+                    "SELECT exercise_id, muscle_group, equipment FROM exercises "
+                    "WHERE user_id = :user_id AND exercise_id = ANY(:ids)"
+                ),
+                {"user_id": user_id, "ids": list(dict.fromkeys(ad_hoc_ids))},
+            ).fetchall()
+        }
+
+    for logged in logged_sets:
         entry = by_exercise.get(logged.exercise_id)
         if entry is None:
-            details = conn.execute(
-                text(
-                    "SELECT muscle_group, equipment FROM exercises "
-                    "WHERE exercise_id = :id AND user_id = :user_id"
-                ),
-                {"id": logged.exercise_id, "user_id": user_id},
-            ).fetchone()
+            muscle_group, equipment = details.get(logged.exercise_id, (None, None))
             entry = SessionExercise(
                 exercise_id=logged.exercise_id,
                 name=logged.exercise_name,
-                muscle_group=details[0] if details else None,
-                equipment=details[1] if details else None,
+                muscle_group=muscle_group,
+                equipment=equipment,
                 position=1000 + len(by_exercise),  # ad-hoc lifts sort to the end
                 added_ad_hoc=True,
             )
             by_exercise[logged.exercise_id] = entry
         entry.sets.append(logged)
 
-    for entry in by_exercise.values():
-        entry.previous, entry.previous_date = previous_performance(
-            conn, user_id, entry.exercise_id, before_session_id=session_id
-        )
+    # One query for every exercise's Previous column, not one per exercise.
+    previous = previous_performance_bulk(
+        conn, user_id, list(by_exercise), before_session_id=session_id
+    )
+    for exercise_id, entry in by_exercise.items():
+        entry.previous, entry.previous_date = previous.get(exercise_id, ([], None))
 
     session.exercises = sorted(by_exercise.values(), key=lambda e: (e.position, e.name))
     return session
@@ -699,7 +794,11 @@ def _validate_set(
         return parsed
 
     weight = _num(weight_kg, "Weight", 0, MAX_WEIGHT_KG)
-    rep_count = _num(reps, "Reps", 0, MAX_REPS)
+    # Reps start at 1, not 0. Zero passes every Python check and is then
+    # rejected by `workout_logs_reps_positive`, which turns a typo into an
+    # opaque 500 instead of the message this validator exists to produce.
+    # Weight legitimately starts at 0 — a bodyweight set carries no load.
+    rep_count = _num(reps, "Reps", 1, MAX_REPS)
     cheated = _num(cheat_reps, "Cheat reps", 0, MAX_REPS) or 0.0
     effort = _num(rpe, "RPE", 1, 10)
     reserve = _num(rir, "RIR", 0, 20)
@@ -870,10 +969,26 @@ def log_set(
 def update_set(
     conn: Connection, user_id: int, log_id: int, **fields: Any
 ) -> LoggedSet:
-    """Correct a set already logged. Records are not lowered here — see below."""
+    """Correct a set already logged. Only the fields passed are changed.
+
+    A partial update, deliberately. The caller edits one number on a row and
+    sends that number; replacing every column from the payload would null the
+    weight, RPE and effort of a set somebody was only fixing a typo in, and
+    clear the warm-up flag of a set they never said was a working set.
+
+    "Passed" means *present in the call*, not "not None": `rpe=None` is a
+    request to clear the RPE, while omitting `rpe` means leave it alone. Those
+    are different intentions and `fields.get(key, default)` cannot tell them
+    apart — the key is present with value None in both cases, so the default
+    never fires. Membership in `fields` is what distinguishes them.
+
+    Records are not lowered here — see the note further down.
+    """
     row = conn.execute(
         text(
-            "SELECT wl.exercise_id, e.name, wl.session_id, wl.set_number, wl.is_warmup "
+            "SELECT wl.exercise_id, e.name, wl.session_id, wl.set_number, "
+            "       wl.is_warmup, wl.weight_kg, wl.reps, wl.cheat_reps, wl.rpe, "
+            "       wl.rir, wl.is_dropset, wl.pain_flag, wl.notes, wl.logged_at "
             "FROM workout_logs wl JOIN exercises e ON e.exercise_id = wl.exercise_id "
             "WHERE wl.log_id = :log_id AND wl.user_id = :user_id"
         ),
@@ -882,14 +997,29 @@ def update_set(
     if row is None:
         raise SessionError("That set does not exist.")
 
+    current = {
+        "weight_kg": float(row[5]) if row[5] is not None else None,
+        "reps": row[6],
+        "cheat_reps": row[7] or 0,
+        "rpe": float(row[8]) if row[8] is not None else None,
+        "rir": row[9],
+    }
+
+    # Start from what is stored and overlay only what was actually sent, so the
+    # validator sees a complete set and the bounds checks still apply to it.
+    merged = dict(current)
+    for key in current:
+        if key in fields:
+            merged[key] = fields[key]
+
     values = _validate_set(
-        fields.get("weight_kg"),
-        fields.get("reps"),
-        fields.get("cheat_reps", 0) or 0,
-        fields.get("rpe"),
-        fields.get("rir"),
+        merged["weight_kg"],
+        merged["reps"],
+        merged["cheat_reps"] or 0,
+        merged["rpe"],
+        merged["rir"],
     )
-    is_warmup = bool(fields.get("is_warmup", row[4]))
+    is_warmup = bool(fields["is_warmup"]) if "is_warmup" in fields else bool(row[4])
 
     conn.execute(
         text(
@@ -924,6 +1054,13 @@ def update_set(
         exercise_name=row[1],
         set_number=int(row[3] or 0),
         is_warmup=is_warmup,
+        # Carried through from the stored row rather than dropped: the API
+        # returns this object, and omitting them would report the set as having
+        # lost its dropset flag, its pain flag and its notes.
+        is_dropset=bool(row[10]),
+        pain_flag=bool(row[11]),
+        notes=row[12],
+        logged_at=row[13],
         **values,
     )
 

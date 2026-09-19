@@ -80,6 +80,10 @@ class PersonalRecord:
     achieved_at: Optional[datetime] = None
     exercise_name: Optional[str] = None
     log_id: Optional[int] = None
+    # Which session set it. Used to tell "this session already holds the
+    # cumulative volume record" from "a previous session held it", which is
+    # what stops every set of a good workout announcing the same PR.
+    session_id: Optional[int] = None
 
     @property
     def label(self) -> str:
@@ -258,7 +262,7 @@ def current(
         text(
             """
             SELECT pr.record_type, pr.value, pr.weight_kg, pr.reps, pr.achieved_at,
-                   e.name, pr.log_id
+                   e.name, pr.log_id, pr.session_id
               FROM personal_records pr
               JOIN exercises e ON e.exercise_id = pr.exercise_id
              WHERE pr.user_id = :user_id AND pr.exercise_id = :exercise_id
@@ -276,6 +280,7 @@ def current(
             achieved_at=row[4],
             exercise_name=row[5],
             log_id=row[6],
+            session_id=row[7],
         )
         for row in rows
     }
@@ -287,7 +292,7 @@ def recent(conn: Connection, user_id: int, limit: int = 20) -> list[PersonalReco
         text(
             """
             SELECT pr.exercise_id, pr.record_type, pr.value, pr.weight_kg, pr.reps,
-                   pr.achieved_at, e.name, pr.log_id
+                   pr.achieved_at, e.name, pr.log_id, pr.session_id
               FROM personal_records pr
               JOIN exercises e ON e.exercise_id = pr.exercise_id
              WHERE pr.user_id = :user_id
@@ -307,6 +312,7 @@ def recent(conn: Connection, user_id: int, limit: int = 20) -> list[PersonalReco
             achieved_at=row[5],
             exercise_name=row[6],
             log_id=row[7],
+            session_id=row[8],
         )
         for row in rows
     ]
@@ -390,6 +396,8 @@ def check_and_update(
     """
     found = candidates(weight_kg, reps, cheat_reps, is_warmup)
 
+    existing = current(conn, user_id, exercise_id)
+
     if session_id is not None and _is_working_set(weight_kg, reps, is_warmup):
         volume = _session_volume(conn, user_id, exercise_id, session_id)
         if volume > 0:
@@ -398,7 +406,6 @@ def check_and_update(
     if not found:
         return []
 
-    existing = current(conn, user_id, exercise_id)
     when = achieved_at or datetime.now().astimezone()
     breaks: list[RecordBreak] = []
 
@@ -409,10 +416,28 @@ def check_and_update(
         if previous_value is not None and value <= previous_value + MIN_IMPROVEMENT:
             continue
 
+        # Session volume is cumulative, so once this session takes the record
+        # every later set in it beats the total this session itself just stored.
+        # Announcing that is congratulating somebody for continuing to train.
+        #
+        # So it is stored — the record really did go up — but reported only the
+        # first time this session takes it. `previous.session_id` is how we
+        # know: a record already held by THIS session is one we set minutes ago.
+        announce = True
+        if (
+            record_type == BEST_SESSION_VOLUME
+            and previous is not None
+            and previous.session_id is not None
+            and previous.session_id == session_id
+        ):
+            announce = False
+
         _upsert(
             conn, user_id, exercise_id, record_type, value,
             set_weight, set_reps, log_id, session_id, when,
         )
+        if not announce:
+            continue
         breaks.append(
             RecordBreak(
                 record_type=record_type,

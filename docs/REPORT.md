@@ -86,7 +86,7 @@ journal text ──▶ extract (LLM) ──▶ score & validate ──▶ REVIEW
 | **Fault injection and the cardinality demo** | **Added for this assignment** |
 | Live set-by-set logging, routines, PRs, measurements (installable PWA) | Added after this assignment |
 
-1010 automated tests pass, 63 of them covering the observability layer added
+1019 automated tests pass, 63 of them covering the observability layer added
 here.
 
 A second input method — an installable app for logging set by set during a

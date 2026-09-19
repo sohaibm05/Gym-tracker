@@ -10,6 +10,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import pathlib
+import subprocess
+import sys
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -27,6 +30,39 @@ from pipeline import (
     resolve_logged_at,
     validate_extraction,
 )
+
+
+def _fresh_import(env: dict[str, str], *expressions: str) -> list[str]:
+    """Import pipeline and insights in a SUBPROCESS with `env` applied.
+
+    These tests check configuration that modules read at import time, so they
+    genuinely need a fresh import. `importlib.reload()` was the obvious way and
+    is the wrong one: it rebinds every class in the module, so any test that
+    already did `from pipeline import WorkoutSet` is left holding a class object
+    the reloaded code no longer produces, and `isinstance` starts returning
+    False. The `finally: reload()` cleanup does not help — it creates a third
+    set of classes rather than restoring the first.
+
+    The result was a suite that failed on roughly a third of orderings, in tests
+    nowhere near the one that did the reloading. A subprocess gets the same
+    fresh import with no way to reach back into this interpreter.
+    """
+    root = str(pathlib.Path(__file__).resolve().parents[1])
+    script = "\n".join([
+        "import sys",
+        f"sys.path.insert(0, {root!r})",
+        "import pipeline, insights",
+        *[f"print({expression})" for expression in expressions],
+    ])
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        env={**os.environ, **env},
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout.strip().splitlines()
+
 
 RAW_ENTRY = (
     "Chest bench press 20kg 12 reps warm up. Chest bench press 24kg 12 reps. "
@@ -513,16 +549,8 @@ class TestEnginePooling:
         engine = pipeline.get_engine(self.URL, serverless=True)
         assert isinstance(engine.pool, NullPool)
 
-    def test_vercel_env_var_switches_it_on(self, monkeypatch):
-        monkeypatch.setenv("VERCEL", "1")
-        import importlib
-
-        reloaded = importlib.reload(pipeline)
-        try:
-            assert reloaded.SERVERLESS is True
-        finally:
-            monkeypatch.delenv("VERCEL", raising=False)
-            importlib.reload(pipeline)
+    def test_vercel_env_var_switches_it_on(self):
+        assert _fresh_import({"VERCEL": "1"}, "pipeline.SERVERLESS") == ["True"]
 
     def test_off_by_default(self):
         assert pipeline.SERVERLESS is False
@@ -583,40 +611,33 @@ class TestEnvHelper:
         monkeypatch.setenv(name, "")
         assert float(pipeline.env(name, default)) == float(default)
 
-    def test_modules_import_with_every_setting_blank(self, monkeypatch):
+    def test_modules_import_with_every_setting_blank(self):
         """The regression: a blank value anywhere must not stop the app booting."""
-        import importlib
-
-        for name in (
-            "CONFIDENCE_THRESHOLD", "FUZZY_MATCH_THRESHOLD", "GROQ_MODEL",
-            "GROQ_TPM_LIMIT", "GROQ_MAX_COMPLETION_TOKENS",
-            "GROQ_MIN_COMPLETION_TOKENS", "GROQ_MAX_RETRY_WAIT_SECONDS",
-            "LOCAL_TIMEZONE", "DEFAULT_SESSION_HOUR", "DUPLICATE_WINDOW_MINUTES",
-            "PLATE_INCREMENT_KG", "ANALYSIS_WEEKS", "PLATEAU_MIN_SESSIONS",
-            "PLATEAU_TOLERANCE", "WORKING_REP_RANGE_LOW", "WORKING_REP_RANGE_HIGH",
-            "PROGRAM_STAGNATION_MIN_EXERCISES", "PROGRAM_STAGNATION_FRACTION",
-            "PAIN_SAFEGUARD_ENABLED", "LOG_LEVEL",
-        ):
-            monkeypatch.setenv(name, "")
-
-        import insights
-
-        reloaded_pipeline = importlib.reload(pipeline)
-        reloaded_insights = importlib.reload(insights)
-        try:
-            assert reloaded_pipeline.CONFIDENCE_THRESHOLD == 0.7
-            assert reloaded_pipeline.LOCAL_TIMEZONE == "UTC"
-            assert reloaded_insights.PLATE_INCREMENT_KG == 2.5
-            # Blank must not silently disable the safeguard.
-            assert reloaded_insights.PAIN_SAFEGUARD_ENABLED is True
-        finally:
-            for name in list(os.environ):
-                if name.startswith(("CONFIDENCE", "FUZZY", "GROQ", "LOCAL", "DEFAULT",
-                                    "DUPLICATE", "PLATE", "ANALYSIS", "PLATEAU",
-                                    "WORKING", "PROGRAM", "PAIN", "LOG_LEVEL")):
-                    monkeypatch.delenv(name, raising=False)
-            importlib.reload(pipeline)
-            importlib.reload(insights)
+        blank = {
+            name: ""
+            for name in (
+                "CONFIDENCE_THRESHOLD", "FUZZY_MATCH_THRESHOLD", "GROQ_MODEL",
+                "GROQ_TPM_LIMIT", "GROQ_MAX_COMPLETION_TOKENS",
+                "GROQ_MIN_COMPLETION_TOKENS", "GROQ_MAX_RETRY_WAIT_SECONDS",
+                "LOCAL_TIMEZONE", "DEFAULT_SESSION_HOUR", "DUPLICATE_WINDOW_MINUTES",
+                "PLATE_INCREMENT_KG", "ANALYSIS_WEEKS", "PLATEAU_MIN_SESSIONS",
+                "PLATEAU_TOLERANCE", "WORKING_REP_RANGE_LOW", "WORKING_REP_RANGE_HIGH",
+                "PROGRAM_STAGNATION_MIN_EXERCISES", "PROGRAM_STAGNATION_FRACTION",
+                "PAIN_SAFEGUARD_ENABLED", "LOG_LEVEL",
+            )
+        }
+        # Importing at all is half the assertion: a blank value that reached
+        # float() would raise before a single request could be served.
+        values = _fresh_import(
+            blank,
+            "pipeline.CONFIDENCE_THRESHOLD",
+            "pipeline.LOCAL_TIMEZONE",
+            "insights.PLATE_INCREMENT_KG",
+            "insights.PAIN_SAFEGUARD_ENABLED",
+        )
+        # Blank must fall back to the default, and must not silently disable
+        # the pain safeguard.
+        assert values == ["0.7", "UTC", "2.5", "True"]
 
 
 # --------------------------------------------------------------------------

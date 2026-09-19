@@ -63,6 +63,19 @@ const mmss = (seconds) => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 };
 
+/**
+ * A YYYY-MM-DD key in the viewer's own timezone.
+ *
+ * NOT toISOString().slice(0,10), which converts to UTC first. The Date being
+ * keyed carries the current time of day, so for anyone west of UTC in the
+ * evening — or east of it in the early morning — that lands on the neighbouring
+ * date and every cell of the heatmap reads the wrong day's sets. The grid would
+ * then shift depending on what time it was opened.
+ */
+const localDateKey = (date) =>
+  `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-`
+  + `${String(date.getDate()).padStart(2, '0')}`;
+
 const relativeDay = (iso) => {
   if (!iso) return '';
   const then = new Date(iso);
@@ -103,10 +116,31 @@ async function api(path, options = {}) {
       const body = await response.json();
       if (body && body.detail) detail = body.detail;
     } catch { /* a non-JSON error body is not worth a second failure */ }
-    throw new Error(detail);
+    const error = new Error(detail);
+    // The status is carried on the error, not inferred from its text. Callers
+    // need to tell a permanent client error (4xx: this set will never be
+    // accepted) from a transient one (5xx, or a network failure with no status
+    // at all: try again later). Matching on the message cannot do that — the
+    // message is the server's `detail` string whenever there is one.
+    error.status = response.status;
+    throw error;
   }
   return response.status === 204 ? null : response.json();
 }
+
+/**
+ * Whether a failed request is permanently refused rather than worth retrying.
+ *
+ * A 4xx means the server understood and said no — the session was finished
+ * elsewhere, the exercise is not this account's — and no amount of retrying
+ * changes that. Everything else (5xx, a timeout, a fetch that rejected because
+ * the uplink is dead) is transient and the request should be kept.
+ *
+ * A rejected fetch has no `.status` at all, which is exactly the case that must
+ * NOT be treated as permanent.
+ */
+const isPermanentFailure = (error) =>
+  Number.isInteger(error && error.status) && error.status >= 400 && error.status < 500;
 
 // ---------------------------------------------------------------------------
 // State
@@ -190,6 +224,9 @@ function announceRecords(breaks) {
 // ---------------------------------------------------------------------------
 
 const outbox = {
+  // True while a drain is in progress. See flush().
+  flushing: false,
+
   read() {
     try { return JSON.parse(localStorage.getItem(OUTBOX_KEY) || '[]'); }
     catch { return []; }
@@ -215,25 +252,45 @@ const outbox = {
    * dropped rather than retried forever.
    */
   async flush() {
-    let items = this.read();
-    if (!items.length) return;
-    while (items.length) {
-      const entry = items[0];
-      try {
-        const result = await api(`/session/${entry.session_id}/sets`, {
-          method: 'POST', body: entry.payload,
-        });
-        if (result.records && result.records.length) announceRecords(result.records);
-      } catch (error) {
-        if (!/^Request failed \(4/.test(error.message) && !navigator.onLine) break;
-        // A 4xx will never succeed on retry; log it and move on.
-        toast('A queued set was rejected', error.message, 'bad');
+    // Re-entrancy guard. flush() is called from boot(), from the `online`
+    // event and from finishWorkout(); two drains running at once both read the
+    // same queue from localStorage — the first has not written its shorter
+    // version yet — and POST the same set twice, giving the workout a
+    // duplicate set and a spurious volume PR.
+    if (this.flushing) return;
+    this.flushing = true;
+    try {
+      let items = this.read();
+      while (items.length) {
+        const entry = items[0];
+        try {
+          const result = await api(`/session/${entry.session_id}/sets`, {
+            method: 'POST', body: entry.payload,
+          });
+          if (result.records && result.records.length) announceRecords(result.records);
+          // Keep the screen in step as the queue drains, so a person watching
+          // it sees their sets appear rather than a stale view until the end.
+          if (result.session && state.session
+              && result.session.session_id === state.session.session_id) {
+            state.session = result.session;
+            if (state.view === 'workout') renderWorkout();
+          }
+        } catch (error) {
+          // Only a permanent refusal is dropped. Anything else — a 502 from a
+          // proxy, a dead uplink the browser has not noticed — leaves the set
+          // at the head of the queue and stops the drain, because sets belong
+          // to a session in order and skipping past one reorders the rest.
+          if (!isPermanentFailure(error)) break;
+          toast('A queued set was rejected', error.message, 'bad');
+        }
+        items = items.slice(1);
+        this.write(items);
       }
-      items = items.slice(1);
-      this.write(items);
+      updateOfflineBanner();
+      if (!items.length) await refreshSession();
+    } finally {
+      this.flushing = false;
     }
-    updateOfflineBanner();
-    if (!items.length) await refreshSession();
   },
 };
 
@@ -444,7 +501,12 @@ async function loadHeatmap() {
     const { sessions } = await api('/sessions?limit=100');
     const byDay = new Map();
     for (const s of sessions) {
-      const key = (s.started_at || '').slice(0, 10);
+      // Parsed and re-keyed locally rather than sliced off the ISO string: the
+      // server sends an offset-aware timestamp, and slicing takes the date in
+      // the SERVER's offset, which is not necessarily the viewer's. Both sides
+      // of this lookup have to be the same kind of day.
+      if (!s.started_at) continue;
+      const key = localDateKey(new Date(s.started_at));
       byDay.set(key, (byDay.get(key) || 0) + (s.total_sets || 0));
     }
 
@@ -459,7 +521,7 @@ async function loadHeatmap() {
     for (let i = 0; i < 18 * 7; i++) {
       const day = new Date(start);
       day.setDate(start.getDate() + i);
-      const key = day.toISOString().slice(0, 10);
+      const key = localDateKey(day);
       const sets = byDay.get(key) || 0;
       if (sets) trained++;
       const level = sets === 0 ? 0 : sets < 8 ? 1 : sets < 16 ? 2 : sets < 25 ? 3 : 4;
@@ -631,14 +693,32 @@ function renderExercise(exercise) {
 }
 
 async function logSet(exercise, weightInput, repsInput, button, asWarmup = false) {
-  const reps = parseInt(repsInput.value || repsInput.placeholder, 10);
+  // Typed values only. The placeholders are hints — last time's numbers, or a
+  // rep-range label like "8-12" — and reading them as input meant a stray tap
+  // on the tick wrote a set nobody performed, with parseInt("8-12") silently
+  // becoming 8 reps. Tapping the Previous cell is the one-tap path to "same as
+  // last time"; it fills these inputs for real, where they can be seen.
+  const reps = parseInt(repsInput.value, 10);
   if (!Number.isFinite(reps) || reps <= 0) {
     repsInput.focus();
     toast('How many reps?', 'Enter a rep count for this set.', 'bad');
     return;
   }
-  const rawWeight = weightInput.value || weightInput.placeholder;
+
+  const rawWeight = weightInput.value.trim();
   const weight = rawWeight === '' ? null : Number(rawWeight);
+  if (rawWeight !== '' && !Number.isFinite(weight)) {
+    weightInput.focus();
+    toast('That weight is not a number', '', 'bad');
+    return;
+  }
+  // An empty weight is a complete log for a pull-up and an omission for a
+  // barbell press, so it is only accepted where it means something.
+  if (weight === null && !exercise.is_bodyweight) {
+    weightInput.focus();
+    toast('How much weight?', 'Tap Previous to reuse last time\u2019s numbers.', 'bad');
+    return;
+  }
 
   const payload = {
     exercise_id: exercise.exercise_id,
@@ -654,16 +734,29 @@ async function logSet(exercise, weightInput, repsInput, button, asWarmup = false
     });
     if (result.records && result.records.length) announceRecords(result.records);
     if (!asWarmup) rest.start(exercise.rest_seconds || 120, exercise.name);
-    await refreshSession();
-  } catch (error) {
-    if (!navigator.onLine) {
-      // Queue it and carry on. Losing a set because the wifi dropped is the
-      // failure this whole outbox exists to prevent.
-      outbox.add({ session_id: state.session.session_id, payload });
-      toast('Saved on this phone', 'It will sync when you are back online.');
-      if (!asWarmup) rest.start(exercise.rest_seconds || 120, exercise.name);
+    // The POST already returned the refreshed session, so re-fetching it would
+    // be a second round trip — and a second full session load on the server —
+    // for something we are holding.
+    if (result.session) {
+      state.session = result.session;
+      renderWorkout();
     } else {
+      await refreshSession();
+    }
+  } catch (error) {
+    if (isPermanentFailure(error)) {
+      // The server understood and refused — the session was finished on another
+      // device, say. Queueing it would retry forever.
       toast('Could not log that set', error.message, 'bad');
+    } else {
+      // Everything else is queued, NOT just the case where navigator.onLine is
+      // false. The common gym failure is an associated access point with a dead
+      // uplink, or a captive portal: the browser still reports itself online,
+      // the request fails, and gating the outbox on navigator.onLine meant the
+      // set was dropped in exactly the situation the outbox exists for.
+      outbox.add({ session_id: state.session.session_id, payload });
+      toast('Saved on this phone', 'It will sync when the connection is back.');
+      if (!asWarmup) rest.start(exercise.rest_seconds || 120, exercise.name);
     }
   } finally {
     button.disabled = false;
@@ -718,6 +811,13 @@ function openPicker(target = 'workout') {
   state.pickerTarget = target;
   state.pickerEquipment = null;
   $('picker-q').value = '';
+  // The chip row is built once and survives between visits, so clearing the
+  // filter in state without clearing the highlight left a chip looking selected
+  // while the results were unfiltered — the screen said "Barbell" and showed
+  // everything.
+  const chips = $('picker-equipment').children;
+  for (const chip of chips) chip.classList.remove('on');
+  if (chips.length) chips[0].classList.add('on');
   show('picker');
   searchExercises();
   setTimeout(() => $('picker-q').focus(), 60);
@@ -950,12 +1050,18 @@ async function saveRoutine() {
   const payload = {
     name: routine.name,
     notes: routine.notes,
+    // Every field the server stores, including the two this editor does not
+    // render. replace_exercises() replaces the whole list with exactly what is
+    // sent, so omitting target_weight_kg and notes silently deleted them from
+    // any routine that had them the moment somebody opened it and pressed save.
     exercises: routine.exercises.map((item) => ({
       exercise_id: item.exercise_id,
       target_sets: item.target_sets || null,
       target_reps_low: item.target_reps_low || null,
       target_reps_high: item.target_reps_high || null,
+      target_weight_kg: item.target_weight_kg ?? null,
       rest_seconds: item.rest_seconds || null,
+      notes: item.notes ?? null,
     })),
   };
 

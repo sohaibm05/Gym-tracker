@@ -1,0 +1,62 @@
+# What must never reach the image.
+#
+# The Dockerfile ends with `COPY . .`, so without this file everything in the
+# working tree is baked into a layer — and a layer is not a secret. Anyone who
+# can `docker pull`, `docker save` or read `docker history` gets whatever was
+# copied, and deleting it in a later layer does not remove it from the earlier
+# one.
+
+# --- Secrets -----------------------------------------------------------
+# .env is gitignored, so it is absent from a clone and present on every machine
+# that follows the setup instructions — which makes a local `docker compose
+# build` the likely way GROQ_API_KEY and DATABASE_URL end up in an image.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Host-specific and huge -------------------------------------------
+# A virtualenv holds binaries built for the host, which are wrong for the image
+# and hundreds of megabytes of wrong.
+.venv/
+venv/
+ENV/
+
+# Full history, including any secret ever committed and later removed.
+.git/
+.gitignore
+.github/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Not needed at runtime --------------------------------------------
+# Excluded so that editing a test or a document does not invalidate the image
+# layer and force a rebuild of everything after it.
+tests/
+docs/
+observability/results/
+*.md
+!README.md
+
+.idea/
+.vscode/
+.DS_Store
+
+# The stack's own configuration is bind-mounted by docker-compose at run time,
+# never copied into the app image.
+observability/prometheus/
+observability/grafana/
+observability/filebeat/
+observability/kibana/
+observability/elasticsearch/
+docker-compose.yml
+Dockerfile
+.dockerignore
