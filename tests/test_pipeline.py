@@ -415,6 +415,24 @@ class TestExtractEntities:
             extract_entities(RAW_ENTRY, date(2026, 8, 14), client=client)
 
 
+class TestMissingApiKey:
+    """No GROQ_API_KEY used to raise out of build_draft and become a 500."""
+
+    def test_build_draft_returns_an_error_draft_instead_of_raising(self, monkeypatch):
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        draft = pipeline.build_draft(RAW_ENTRY, date(2026, 8, 14))
+        assert draft.error is not None
+        assert "GROQ_API_KEY" in draft.error
+        assert draft.sets == []
+
+    def test_an_explicit_client_does_not_need_the_key(self, monkeypatch):
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        client = FakeClient([VALID_JSON])
+        draft = pipeline.build_draft(RAW_ENTRY, date(2026, 8, 14), client=client)
+        assert draft.error is None
+        assert len(client.completions.calls) == 1
+
+
 # --------------------------------------------------------------------------
 # Model constraints
 # --------------------------------------------------------------------------

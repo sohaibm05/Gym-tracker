@@ -1,0 +1,31 @@
+{
+  "label": "01-baseline",
+  "base_url": "http://localhost:8000",
+  "requests": 599,
+  "duration_s": 120.02,
+  "achieved_rps": 4.99,
+  "errors": 0,
+  "error_rate": 0.0,
+  "latency_ms": {
+    "min": 3.0,
+    "mean": 12.2,
+    "p50": 6.3,
+    "p95": 29.1,
+    "p99": 38.9,
+    "max": 64.2
+  },
+  "statuses": {
+    "200": 599
+  },
+  "per_route_p95_ms": {
+    "/": 35.0,
+    "/healthz": 26.2,
+    "/login": 25.1,
+    "/metrics": 26.3,
+    "/progress": 37.1
+  },
+  "window": {
+    "from": "2026-09-19T15:56:52Z",
+    "to": "2026-09-19T15:58:53Z"
+  }
+}

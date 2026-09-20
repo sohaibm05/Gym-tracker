@@ -1,0 +1,31 @@
+{
+  "label": "03-recovery",
+  "base_url": "http://localhost:8000",
+  "requests": 599,
+  "duration_s": 120.01,
+  "achieved_rps": 4.99,
+  "errors": 0,
+  "error_rate": 0.0,
+  "latency_ms": {
+    "min": 3.0,
+    "mean": 12.9,
+    "p50": 6.2,
+    "p95": 31.8,
+    "p99": 41.0,
+    "max": 43.3
+  },
+  "statuses": {
+    "200": 599
+  },
+  "per_route_p95_ms": {
+    "/": 38.7,
+    "/healthz": 24.6,
+    "/login": 26.2,
+    "/metrics": 27.5,
+    "/progress": 40.3
+  },
+  "window": {
+    "from": "2026-09-19T16:01:40Z",
+    "to": "2026-09-19T16:03:40Z"
+  }
+}

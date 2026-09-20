@@ -119,11 +119,21 @@ SAFE_AFTER="$(promql 'count(demo_requests_safe_total)')"
   echo
   echo "## The part people get wrong"
   echo
-  echo "After removing the label the series count does NOT drop to zero straight"
-  echo "away. The old series stop receiving samples, but they stay in Prometheus"
-  echo "until they fall outside the retention window (15 days here). Removing a"
-  echo "bad label stops the bleeding; it does not undo the damage. That is why"
-  echo "cardinality is a code-review question, not an incident-response one."
+  echo "The second row usually reads 'none', and that is NOT the same as the data"
+  echo "having been deleted. When the app stops exporting the labelled counter,"
+  echo "Prometheus writes a stale marker and the series vanishes from queries"
+  echo "evaluated NOW. The samples already written are untouched: query the same"
+  echo "expression at a timestamp inside the first stage and the 100 series are"
+  echo "still there, until the 15-day retention window drops them."
+  echo
+  echo "  # instant, now:      no data"
+  echo "  # instant, --time=<a timestamp during stage 1>:  100"
+  echo
+  echo "So you cannot verify a cardinality fix by watching count() fall: it falls"
+  echo "either way, whether you removed the label or merely stopped the app. And"
+  echo "the memory those series consumed while they were active is never given"
+  echo "back by removing the label afterwards. That is why cardinality is a"
+  echo "code-review question, not an incident-response one."
 } | tee "$RESULTS_DIR/cardinality-stack.md"
 
 log "Cleaning up the demo container"

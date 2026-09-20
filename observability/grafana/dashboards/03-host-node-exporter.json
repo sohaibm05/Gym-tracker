@@ -589,7 +589,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "1 - (node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"})",
+          "expr": "1 - (node_filesystem_avail_bytes{mountpoint=~\"/|/var/lib\"} / node_filesystem_size_bytes{mountpoint=~\"/|/var/lib\"})",
           "legendFormat": "used",
           "refId": "A",
           "instant": false,

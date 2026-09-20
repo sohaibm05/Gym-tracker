@@ -33,7 +33,7 @@ filebeat.autodiscover:
       templates:
         - condition:
             contains:
-              docker.container.labels.co_elastic_logs/enabled: "true"
+              docker.container.labels.co.elastic.logs/enabled: "true"
           config:
             - type: container
               paths:
@@ -86,15 +86,16 @@ processors:
 
 output.elasticsearch:
   hosts: ["http://elasticsearch:9200"]
-  # No `index:` here on purpose. With ILM enabled, the destination is the
-  # rollover alias configured under setup.ilm below, and Filebeat refuses to
-  # start if an explicit index name is set as well — the two would disagree
-  # about where writes go the moment the first rollover happened.
+  # Filebeat 8.x writes to a data stream by default, named filebeat-<version>.
+  # Without this line events go there, bypassing the template and the ILM policy
+  # below, which are both set up for the stream named here instead. The name has
+  # to match setup.template.pattern.
+  index: "filebeat-gym-tracker-logs"
 
 # Filebeat normally creates an index template named after itself. This one is
 # renamed to match the alias, so the template, the alias and the ILM policy all
 # describe the same set of indices.
-setup.template.name: "filebeat-gym-tracker"
+setup.template.name: "filebeat-gym-tracker-logs"
 setup.template.pattern: "filebeat-gym-tracker-*"
 setup.template.overwrite: true
 
@@ -121,7 +122,7 @@ setup.template.overwrite: true
 # `docker compose down -v` deletes both.
 
 setup.ilm.enabled: true
-setup.ilm.rollover_alias: "filebeat-gym-tracker"
+setup.ilm.rollover_alias: "filebeat-gym-tracker-logs"
 setup.ilm.pattern: "{now/d}-000001"
 setup.ilm.policy_name: "gym-tracker-logs"
 setup.ilm.policy_file: /usr/share/filebeat/ilm-policy.json

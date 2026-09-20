@@ -1,22 +1,4 @@
 {
-  "_comment": [
-    "Index Lifecycle Management policy for gym-tracker logs. Loaded by Filebeat",
-    "at startup (setup.ilm.policy_file) and enforced by Elasticsearch itself, so",
-    "retention does not depend on anything outside the cluster staying alive.",
-    "",
-    "This answers the assignment's 'when are old logs deleted?'. An index is",
-    "rolled over once it reaches 1GB, 10,000,000 documents or 1 day of age —",
-    "whichever comes first — and is deleted 7 days after that rollover. Writes",
-    "always go to the newest index, so deleting an old one never interrupts",
-    "ingestion. Deleting by whole index is also far cheaper than deleting",
-    "individual documents, which in Lucene only marks them and reclaims nothing",
-    "until a merge.",
-    "",
-    "7 days suits a course project. Production retention is a legal and",
-    "financial question, not a technical one: long enough to investigate an",
-    "incident nobody noticed for a week, short enough that the storage bill and",
-    "the personal-data exposure stay bounded."
-  ],
   "policy": {
     "phases": {
       "hot": {

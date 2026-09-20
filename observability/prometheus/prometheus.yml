@@ -47,13 +47,18 @@ scrape_configs:
   - job_name: node-exporter
     static_configs:
       # node-exporter runs in the host network namespace, so it is on the
-      # Docker host's own :9100 rather than on this bridge network.
-      - targets: ["host.docker.internal:9100"]
+      # Docker host's own :9100 rather than on this bridge network. 172.28.77.1
+      # is the gym-net bridge gateway (pinned in docker-compose.yml), which is
+      # the host as seen from inside a container. host.docker.internal is not
+      # used: on Docker Desktop it resolves to Windows, not to the Linux VM the
+      # exporter is running in.
+      - targets: ["172.28.77.1:9100"]
         labels:
-          # THE MACHINE BEING MEASURED. This is the Docker host — the laptop or
-          # VM running the stack — not any one container. Every container's CPU
-          # and memory use is included in these totals because they are all
-          # processes on this one kernel.
+          # THE MACHINE BEING MEASURED. On Docker Desktop for Windows this is
+          # the WSL2 Linux VM that runs every container, not the Windows PC
+          # itself. Every container's CPU and memory use is included in these
+          # totals because they are all processes on this one kernel. On a
+          # Linux host it is simply the host.
           service: node-exporter
           machine: docker-host
 

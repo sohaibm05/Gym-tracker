@@ -837,6 +837,14 @@ class ExtractionError(RuntimeError):
     """Raised when extraction fails after the retry."""
 
 
+class MissingApiKeyError(ExtractionError):
+    """No GROQ_API_KEY, so extraction was never attempted.
+
+    A subclass so build_draft can tell the person the server is not configured,
+    rather than that their entry failed after a retry that never happened.
+    """
+
+
 # Characters per token, for sizing only. Prose runs about 4; the JSON coming
 # back is punctuation-dense and runs nearer 3. Deliberately pessimistic - an
 # over-estimate costs a little headroom, an under-estimate truncates an answer.
@@ -1141,6 +1149,10 @@ def extract_entities(
     temperature 0. After both, the caller routes the entry to manual review.
     """
     if client is None:
+        # get_groq_client() raises a bare RuntimeError here, which escaped
+        # build_draft's handler and reached the person as an unhandled 500.
+        if not os.getenv("GROQ_API_KEY"):
+            raise MissingApiKeyError("GROQ_API_KEY is not set")
         client = get_groq_client()
 
     prompt_tokens = estimate_prompt_tokens(raw_text, session_date)
@@ -1727,6 +1739,19 @@ def build_draft(
 
     try:
         payload = extract_entities(raw_text, session_date, client=client)
+    except MissingApiKeyError:
+        logger.warning(
+            "extraction unavailable: GROQ_API_KEY is not set",
+            extra={"event.action": "extraction_unavailable"},
+        )
+        return EntryDraft(
+            raw_text=raw_text,
+            session_date=session_date,
+            error=(
+                "Parsing is unavailable because this server has no GROQ_API_KEY "
+                "configured. Nothing was saved."
+            ),
+        )
     except ExtractionError as exc:
         logger.error(
             "extraction failed, routing the entry to manual review",
