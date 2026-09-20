@@ -166,7 +166,7 @@ checkable against the code.
 | `gym_sets_written_total` | **Business.** Individual sets inserted — the product's unit of value. | 1 | — | `app.py:1400` |
 | `gym_bodyweight_entries_written_total` | **Business.** Bodyweight readings inserted. | 1 | — | `app.py:1401` |
 | `gym_duplicate_decisions_total` | **Business.** How the duplicate prompt was answered. | 1 | `decision` = `held`/`overridden` | `app.py:1349`, `1375` |
-| `gym_llm_extractions_total` | **Business.** Groq extraction calls by outcome. | 1 | `outcome` = `success`/`rate_limited`/`error` | `pipeline.py:1042` |
+| `gym_llm_extractions_total` | **Business.** Groq extraction calls by outcome. | 1 | `outcome` = `success`/`rate_limited`/`error` | `pipeline.py:1050` |
 | `gym_weekly_reports_total` | **Business.** Reports generated, by narration success. | 1 | `narration` = `ok`/`failed` | `app.py:1509` |
 | `gym_logins_total` | Authentication outcomes. Failures without successes = credential stuffing. | 1 | `result` = `success`/`failure`/`rate_limited` | `app.py:851`, `874`, `889` |
 | `gym_faults_injected_total` | Part E only. Proves from metrics alone when a fault was live. | 1 | `kind` = `latency`/`error` | `faults.py:138` |
@@ -176,8 +176,8 @@ checkable against the code.
 | Metric | Purpose | Unit | Labels | Where recorded |
 |---|---|---|---|---|
 | `gym_http_requests_in_flight` | Concurrent requests. The saturation signal on a single worker. | 1 | — | `app.py:377` (inc) / `447` (dec, in `finally`) |
-| `gym_llm_extractions_in_flight` | Extractions waiting on Groq right now. | 1 | — | `pipeline.py:1175` / `1212` |
-| `gym_review_drafts_open` | **Business.** Entries parsed but not yet confirmed. | 1 | — | `metrics.py:269` (`DraftTracker` at `453`), driven from `app.py:1272` (opened) / `1406` (closed) |
+| `gym_llm_extractions_in_flight` | Extractions waiting on Groq right now. | 1 | — | `pipeline.py:1187` / `1224` |
+| `gym_review_drafts_open` | **Business.** Entries parsed but not yet confirmed. | 1 | — | `metrics.py:269` (`DraftTracker` at `397`), driven from `app.py:1272` (opened) / `1406` (closed) |
 | `gym_build_info` | Always 1; labels carry the build identity. | 1 | `version`, `commit` | `metrics.py:277` / `359` |
 
 `gym_review_drafts_open` is this app's version of the brief's *"orders waiting to
@@ -195,7 +195,7 @@ map is capped so a burst cannot grow memory without bound (`metrics.py`,
 | Metric | Purpose | Unit | Labels | Where recorded |
 |---|---|---|---|---|
 | `gym_http_request_duration_seconds` | The headline latency metric. | seconds | `method`, `route` | `app.py:416` (exception path) / `456` (success path) |
-| `gym_llm_extraction_duration_seconds` | **Business.** One Groq extraction, retries included. | seconds | — | `pipeline.py:1042` |
+| `gym_llm_extraction_duration_seconds` | **Business.** One Groq extraction, retries included. | seconds | — | `pipeline.py:1051` |
 | `gym_db_commit_duration_seconds` | Time inside the committing transaction. | seconds | — | `app.py:1356` |
 
 Bucket boundaries are chosen per metric, because the three live on different
@@ -431,8 +431,8 @@ in `app.py`.
 
 | Event | Level | Where | Why |
 |---|---|---|---|
-| `request served` | info | `app.py:429`, middleware | One line per request: method, route, status, duration. The spine everything else hangs off. |
-| `request failed` | error | `app.py:404` | Unhandled exception, with type and stack trace. |
+| `request served` | info | `app.py:463`, middleware | One line per request: method, route, status, duration. The spine everything else hangs off. |
+| `request failed` | error | `app.py:425` | Unhandled exception, with type and stack trace. |
 | `journal entry drafted` | info | `app.py` `/log` | How many sets were extracted, how many flagged — the extraction-quality record. |
 | `journal entry saved` | info | `app.py` `/save` | What was actually written. The audit trail for a row appearing in the database. |
 | `save blocked by the review form` | info | `app.py` `/save` | The review screen refused it; nothing written. |
@@ -834,7 +834,7 @@ Stated plainly, as the brief asks:
 `app.py` (`POST /save`):
 
 ```python
-METRICS.sets_written_total.inc(result.inserted_sets)   # app.py:1278
+METRICS.sets_written_total.inc(result.inserted_sets)   # app.py:1400
 ```
 
 The counter is a float in the process's memory. Nothing is sent anywhere.
