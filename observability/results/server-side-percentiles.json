@@ -23,5 +23,5 @@
     "mean_ms": 0.9,
     "faults_injected": 0
   },
-  "_note": "Computed from the app's own Prometheus histogram buckets by replicating histogram_quantile's linear in-bucket interpolation. See docs/REPORT.md, 'What is verified, and what is not'."
+  "_note": "Computed from the app's own Prometheus histogram buckets by replicating histogram_quantile's linear in-bucket interpolation."
 }

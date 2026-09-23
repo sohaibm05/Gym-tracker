@@ -105,7 +105,13 @@ cmd_urls() {
                      - Gym Tracker / Host (node-exporter)
   Kibana           http://localhost:5601    (Discover -> Open -> saved searches)
   Elasticsearch    http://localhost:9200
-  node-exporter    http://localhost:9100/metrics
+  node-exporter    not reachable at localhost:9100 from Windows. It runs in
+                   the WSL2 VM's network namespace, so it listens on the VM,
+                   not on this host. Prometheus scrapes it at 172.28.77.1:9100
+                   -- see that target on $PROM_URL/targets, or the
+                   Gym Tracker / Host dashboard in Grafana.
+  Cardinality demo http://localhost:8001    (profile "experiment" only, start with:
+                     docker compose --profile experiment up -d cardinality-demo)
 
 EOF
 }

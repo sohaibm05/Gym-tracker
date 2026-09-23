@@ -60,3 +60,9 @@ observability/elasticsearch/
 docker-compose.yml
 Dockerfile
 .dockerignore
+
+# Assignment artefacts: never needed inside the image
+my_entry.txt
+*.pdf
+*.docx
+observability/results-rerun/

@@ -1,0 +1,31 @@
+{
+  "label": "02-fault",
+  "base_url": "http://localhost:8000",
+  "requests": 406,
+  "duration_s": 120.08,
+  "achieved_rps": 3.38,
+  "errors": 0,
+  "error_rate": 0.0,
+  "latency_ms": {
+    "min": 5.1,
+    "mean": 167.5,
+    "p50": 24.2,
+    "p95": 540.0,
+    "p99": 563.3,
+    "max": 681.4
+  },
+  "statuses": {
+    "200": 406
+  },
+  "per_route_p95_ms": {
+    "/": 548.9,
+    "/healthz": 527.4,
+    "/login": 529.7,
+    "/metrics": 525.1,
+    "/progress": 602.5
+  },
+  "window": {
+    "from": "2026-09-21T11:34:04Z",
+    "to": "2026-09-21T11:36:05Z"
+  }
+}

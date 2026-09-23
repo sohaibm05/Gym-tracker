@@ -1,0 +1,181 @@
+{
+ "what": "One real request (GET /login) traced through every stage of the log pipeline, captured 2026-09-22.",
+ "request_id": "259fd665642941e0",
+ "1_stdout_lines": [
+  "{\"@timestamp\": \"2026-09-22T09:12:17.329Z\", \"log.level\": \"info\", \"message\": \"request served\", \"service.name\": \"gym-tracker\", \"service.version\": \"1.0.0\", \"event.dataset\": \"gym_tracker.app\", \"log.logger\": \"gym_tracker.app\", \"log.origin.file.name\": \"app.py\", \"log.origin.file.line\": 463, \"log.origin.function\": \"log_requests\", \"process.pid\": 1, \"http.request.id\": \"259fd665642941e0\", \"http.request.method\": \"GET\", \"url.path\": \"/login\", \"http.route\": \"/login\", \"http.response.status_code\": 200, \"event.duration_ms\": 191.5}",
+  "{\"@timestamp\": \"2026-09-22T09:12:17.332Z\", \"log.level\": \"info\", \"message\": \"172.28.77.1:36834 - \\\"GET /login HTTP/1.1\\\" 200\", \"service.name\": \"gym-tracker\", \"service.version\": \"1.0.0\", \"event.dataset\": \"uvicorn.access\", \"log.logger\": \"uvicorn.access\", \"log.origin.file.name\": \"httptools_impl.py\", \"log.origin.file.line\": 482, \"log.origin.function\": \"send\", \"process.pid\": 1, \"http.request.id\": \"259fd665642941e0\"}"
+ ],
+ "2_docker_json_file_lines": [
+  "{\"log\":\"{\\\"@timestamp\\\": \\\"2026-09-22T09:12:17.329Z\\\", \\\"log.level\\\": \\\"info\\\", \\\"message\\\": \\\"request served\\\", \\\"service.name\\\": \\\"gym-tracker\\\", \\\"service.version\\\": \\\"1.0.0\\\", \\\"event.dataset\\\": \\\"gym_tracker.app\\\", \\\"log.logger\\\": \\\"gym_tracker.app\\\", \\\"log.origin.file.name\\\": \\\"app.py\\\", \\\"log.origin.file.line\\\": 463, \\\"log.origin.function\\\": \\\"log_requests\\\", \\\"process.pid\\\": 1, \\\"http.request.id\\\": \\\"259fd665642941e0\\\", \\\"http.request.method\\\": \\\"GET\\\", \\\"url.path\\\": \\\"/login\\\", \\\"http.route\\\": \\\"/login\\\", \\\"http.response.status_code\\\": 200, \\\"event.duration_ms\\\": 191.5}\\n\",\"stream\":\"stdout\",\"time\":\"2026-09-22T09:12:17.332421916Z\"}",
+  "{\"log\":\"{\\\"@timestamp\\\": \\\"2026-09-22T09:12:17.332Z\\\", \\\"log.level\\\": \\\"info\\\", \\\"message\\\": \\\"172.28.77.1:36834 - \\\\\\\"GET /login HTTP/1.1\\\\\\\" 200\\\", \\\"service.name\\\": \\\"gym-tracker\\\", \\\"service.version\\\": \\\"1.0.0\\\", \\\"event.dataset\\\": \\\"uvicorn.access\\\", \\\"log.logger\\\": \\\"uvicorn.access\\\", \\\"log.origin.file.name\\\": \\\"httptools_impl.py\\\", \\\"log.origin.file.line\\\": 482, \\\"log.origin.function\\\": \\\"send\\\", \\\"process.pid\\\": 1, \\\"http.request.id\\\": \\\"259fd665642941e0\\\"}\\n\",\"stream\":\"stdout\",\"time\":\"2026-09-22T09:12:17.33266166Z\"}"
+ ],
+ "3_elasticsearch": {
+  "index": ".ds-filebeat-gym-tracker-logs-2026.09.22-000002",
+  "stored_fields_with_types": {
+   "@timestamp": {
+    "value": "2026-09-22T09:12:17.329Z",
+    "type": "date"
+   },
+   "log.level": {
+    "value": "info",
+    "type": "keyword"
+   },
+   "message": {
+    "value": "request served",
+    "type": "match_only_text"
+   },
+   "service.name": {
+    "value": "gym-tracker",
+    "type": "keyword"
+   },
+   "http.request.id": {
+    "value": "259fd665642941e0",
+    "type": "keyword"
+   },
+   "http.request.method": {
+    "value": "GET",
+    "type": "keyword"
+   },
+   "url.path": {
+    "value": "/login",
+    "type": "wildcard"
+   },
+   "http.response.status_code": {
+    "value": 200,
+    "type": "long"
+   },
+   "event.duration_ms": {
+    "value": 191.5,
+    "type": "float"
+   },
+   "container.name": {
+    "value": "gym-tracker",
+    "type": "keyword"
+   },
+   "container.image.name": {
+    "value": "gym-tracker-observability-app",
+    "type": "keyword"
+   },
+   "host.name": {
+    "value": "296b6c402856",
+    "type": "keyword"
+   }
+  },
+  "_source": {
+   "@timestamp": "2026-09-22T09:12:17.329Z",
+   "message": "request served",
+   "ecs": {},
+   "process": {
+    "pid": 1
+   },
+   "service": {
+    "name": "gym-tracker",
+    "version": "1.0.0"
+   },
+   "event": {
+    "duration_ms": 191.5,
+    "dataset": "gym_tracker.app"
+   },
+   "log": {
+    "file": {
+     "path": "/var/lib/docker/containers/89ca51f4f5cf62c82f1488f18bff494aadc7bcb3f484da078cc1fc9710d0200f/89ca51f4f5cf62c82f1488f18bff494aadc7bcb3f484da078cc1fc9710d0200f-json.log"
+    },
+    "level": "info",
+    "logger": "gym_tracker.app",
+    "origin": {
+     "file": {
+      "name": "app.py",
+      "line": 463
+     },
+     "function": "log_requests"
+    }
+   },
+   "container": {
+    "id": "89ca51f4f5cf62c82f1488f18bff494aadc7bcb3f484da078cc1fc9710d0200f",
+    "name": "gym-tracker",
+    "image": {
+     "name": "gym-tracker-observability-app"
+    },
+    "labels": {
+     "com_docker_compose_service": "app",
+     "com_docker_compose_oneoff": "False",
+     "com_docker_compose_version": "5.2.0",
+     "com_docker_compose_project_config_files": "C:\\Users\\dell\\Documents\\GitHub\\Gym-tracker\\docker-compose.yml",
+     "desktop_docker_io/ports_scheme": "v2",
+     "co_elastic_logs/enabled": "true",
+     "com_docker_compose_replace": "gym-tracker",
+     "com_docker_compose_depends_on": "postgres:service_healthy:false",
+     "com_docker_compose_project_working_dir": "C:\\Users\\dell\\Documents\\GitHub\\Gym-tracker",
+     "com_docker_compose_image": "sha256:ed266a64a597382f0f345537899b3c37bfd570b3ecee257a77ea060f28df6329",
+     "com_docker_compose_config-hash": "3f2219ccfc35ce0b73497e8f1c7e5eb402cb753a9bc6b2736402b4c7b8a62064",
+     "com_docker_compose_project": "gym-tracker-observability",
+     "desktop_docker_io/ports/8000/tcp": ":8000",
+     "com_docker_compose_container-number": "1"
+    }
+   },
+   "docker": {
+    "container": {
+     "labels": {
+      "com_docker_compose_container-number": "1",
+      "com_docker_compose_project_working_dir": "C:\\Users\\dell\\Documents\\GitHub\\Gym-tracker",
+      "com_docker_compose_project_config_files": "C:\\Users\\dell\\Documents\\GitHub\\Gym-tracker\\docker-compose.yml",
+      "com_docker_compose_service": "app",
+      "desktop_docker_io/ports/8000/tcp": ":8000",
+      "co_elastic_logs/enabled": "true",
+      "com_docker_compose_image": "sha256:ed266a64a597382f0f345537899b3c37bfd570b3ecee257a77ea060f28df6329",
+      "com_docker_compose_project": "gym-tracker-observability",
+      "com_docker_compose_depends_on": "postgres:service_healthy:false",
+      "com_docker_compose_oneoff": "False",
+      "com_docker_compose_replace": "gym-tracker",
+      "desktop_docker_io/ports_scheme": "v2",
+      "com_docker_compose_config-hash": "3f2219ccfc35ce0b73497e8f1c7e5eb402cb753a9bc6b2736402b4c7b8a62064",
+      "com_docker_compose_version": "5.2.0"
+     }
+    }
+   },
+   "host": {
+    "mac": [
+     "7E-F3-04-8C-14-5B"
+    ],
+    "name": "296b6c402856",
+    "hostname": "296b6c402856",
+    "architecture": "x86_64",
+    "os": {
+     "family": "debian",
+     "name": "Ubuntu",
+     "kernel": "6.6.87.2-microsoft-standard-WSL2",
+     "codename": "focal",
+     "type": "linux",
+     "platform": "ubuntu",
+     "version": "20.04.6 LTS (Focal Fossa)"
+    },
+    "containerized": false,
+    "ip": [
+     "172.28.77.7"
+    ]
+   },
+   "url": {
+    "path": "/login"
+   },
+   "stream": "stdout",
+   "input": {},
+   "agent": {
+    "version": "8.15.0",
+    "id": "50fe1acf-c819-4a21-a1ed-a96599d77aac",
+    "name": "296b6c402856",
+    "type": "filebeat"
+   },
+   "http": {
+    "request": {
+     "method": "GET",
+     "id": "259fd665642941e0"
+    },
+    "route": "/login",
+    "response": {
+     "status_code": 200
+    }
+   }
+  }
+ },
+ "4_kibana_query": "http.request.id: \"259fd665642941e0\"  (docs/screenshots/11-kibana-trace-login.png)"
+}

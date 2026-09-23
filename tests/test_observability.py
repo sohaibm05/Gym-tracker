@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from datetime import date
 from io import StringIO
@@ -188,6 +189,42 @@ class TestMetricDefinitions:
         }
         for metric in vars(isolated.metrics).values():
             assert not (set(metric._labelnames) & forbidden), metric._name
+
+    @pytest.mark.parametrize("name, label, values", [
+        ("gym_workout_entries_total", "outcome", metrics_module.ENTRY_OUTCOMES),
+        ("gym_duplicate_decisions_total", "decision", metrics_module.DUPLICATE_DECISIONS),
+        ("gym_llm_extractions_total", "outcome", metrics_module.EXTRACTION_OUTCOMES),
+        ("gym_weekly_reports_total", "narration", metrics_module.NARRATION_RESULTS),
+        ("gym_logins_total", "result", metrics_module.LOGIN_RESULTS),
+        ("gym_faults_injected_total", "kind", metrics_module.FAULT_KINDS),
+    ])
+    def test_labelled_counters_start_at_zero(self, isolated, name, label, values):
+        """A series that first appears already at 1 is invisible to increase().
+
+        So each known label value must be exported at 0 before anything
+        happens. `get_sample_value` returns None for a series that does not
+        exist, which is what this distinguishes from 0.0.
+        """
+        for value in values:
+            assert isolated.registry.get_sample_value(name, {label: value}) == 0.0, value
+
+    def test_call_sites_use_only_the_known_label_values(self):
+        """A new label value at a call site would start uncounted again."""
+        root = Path(__file__).resolve().parent.parent
+        source = "".join((root / f).read_text(encoding="utf-8")
+                         for f in ("app.py", "pipeline.py", "faults.py"))
+        known = {
+            "outcome": set(metrics_module.ENTRY_OUTCOMES) | set(metrics_module.EXTRACTION_OUTCOMES),
+            "decision": set(metrics_module.DUPLICATE_DECISIONS),
+            "result": set(metrics_module.LOGIN_RESULTS),
+        }
+        for label, allowed in known.items():
+            used = set(re.findall(rf'\.labels\(\s*{label}="([^"]+)"', source))
+            assert used and used <= allowed, (label, used - allowed)
+        # The two computed ones, checked by their literals.
+        assert '"failed" if report["narration_error"] else "ok"' in source
+        assert '"rate_limited" if last_error' in source and 'else "error"' in source
+        assert {"error", "latency"} <= set(re.findall(r'self\._record\("(\w+)"\)', source))
 
     def test_render_latest_produces_exposition_format(self, isolated):
         registry = CollectorRegistry()

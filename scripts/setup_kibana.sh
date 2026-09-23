@@ -91,6 +91,6 @@ else
   echo "Import reported a problem. The saved-object schema is version-specific," >&2
   echo "so if this fails on a different Kibana version, create the data view by" >&2
   echo "hand (Stack Management -> Data Views -> filebeat-gym-tracker-*, time" >&2
-  echo "field @timestamp) and type the queries from docs/REPORT.md directly." >&2
+  echo "field @timestamp) and type the queries from the report directly." >&2
   exit 1
 fi

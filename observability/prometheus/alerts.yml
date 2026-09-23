@@ -114,9 +114,12 @@ groups:
     rules:
 
       - alert: HostLowDisk
+        # Same matcher as the host dashboard. On Docker Desktop's WSL2 VM there
+        # is no mountpoint="/" at all; the data disk is /var/lib, so a plain "/"
+        # matches nothing and this alert could never fire.
         expr: |
-          node_filesystem_avail_bytes{mountpoint="/"}
-            / node_filesystem_size_bytes{mountpoint="/"}
+          node_filesystem_avail_bytes{mountpoint=~"/|/var/lib"}
+            / node_filesystem_size_bytes{mountpoint=~"/|/var/lib"}
             < 0.10
         for: 5m
         labels:

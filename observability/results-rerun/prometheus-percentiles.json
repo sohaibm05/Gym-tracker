@@ -1,0 +1,48 @@
+{
+  "queried_at_end_of_each_window": true,
+  "queries": {
+    "pXX": "histogram_quantile(X, sum by (le) (rate(gym_http_request_duration_seconds_bucket{job=\"gym-tracker\"}[2m])))",
+    "faults": "sum by (kind) (increase(gym_faults_injected_total[2m]))"
+  },
+  "stages": {
+    "01-baseline": {
+      "window": {
+        "from": "2026-09-21T11:31:37Z",
+        "to": "2026-09-21T11:33:38Z"
+      },
+      "p50_ms": 2.52,
+      "p95_ms": 4.78,
+      "p99_ms": 4.98,
+      "faults_increase": {
+        "latency": 0.0,
+        "error": 0.0
+      }
+    },
+    "02-fault": {
+      "window": {
+        "from": "2026-09-21T11:34:04Z",
+        "to": "2026-09-21T11:36:05Z"
+      },
+      "p50_ms": 3.26,
+      "p95_ms": 687.46,
+      "p99_ms": 737.49,
+      "faults_increase": {
+        "latency": 117.7,
+        "error": 0.0
+      }
+    },
+    "03-recovery": {
+      "window": {
+        "from": "2026-09-21T11:36:34Z",
+        "to": "2026-09-21T11:38:34Z"
+      },
+      "p50_ms": 2.64,
+      "p95_ms": 5.64,
+      "p99_ms": 20.88,
+      "faults_increase": {
+        "latency": 0.0,
+        "error": 0.0
+      }
+    }
+  }
+}

@@ -12,3 +12,7 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+# Local scratch and course material, not part of the submission
+my_entry.txt
+Assignment-1.pdf

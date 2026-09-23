@@ -17,7 +17,7 @@
 # Elasticsearch runs with security disabled and Grafana with a default password,
 # because requiring a TLS handshake and a credential rotation to look at a chart
 # on localhost teaches nothing about observability. Both would be wrong on a
-# network anyone else can reach — see the "Security" note in docs/REPORT.md.
+# network anyone else can reach — see the note under "Observability" in README.md.
 
 name: gym-tracker-observability
 

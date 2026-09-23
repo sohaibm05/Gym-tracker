@@ -1,0 +1,34 @@
+{
+ "what": "gym_sets_written_total as Prometheus stored it during the 21 September Groq run (Screenshot 2).",
+ "labels": {
+  "__name__": "gym_sets_written_total",
+  "instance": "app:8000",
+  "job": "gym-tracker",
+  "service": "gym-tracker"
+ },
+ "samples_where_value_changed": [
+  {
+   "time_utc": "2026-09-21T05:06:45Z",
+   "value": 0.0
+  },
+  {
+   "time_utc": "2026-09-21T05:12:30Z",
+   "value": 17.0
+  },
+  {
+   "time_utc": "2026-09-21T05:21:00Z",
+   "value": 0.0
+  },
+  {
+   "time_utc": "2026-09-21T05:21:45Z",
+   "value": 3.0
+  },
+  {
+   "time_utc": "2026-09-21T05:22:15Z",
+   "value": 16.0
+  }
+ ],
+ "grafana_query": "increase(gym_sets_written_total[24h])",
+ "grafana_query_result_at_2026-09-21T05:27:00Z": 33.00074995689809,
+ "note": "The drop to 0 at 05:21:00 is the app restarting; increase() treats it as a counter reset, so 17 + 16 = 33."
+}

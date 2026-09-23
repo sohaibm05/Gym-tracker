@@ -1,7 +1,7 @@
 """Prometheus instrumentation for the gym tracker.
 
 Every metric the application exports is declared here and nowhere else, so the
-table in `docs/REPORT.md` has exactly one source of truth to be checked against.
+table in the report has exactly one source of truth to be checked against.
 Call sites import a name from this module; they never build a metric inline.
 
 Four families, because the four Prometheus metric types answer four different
@@ -125,6 +125,20 @@ DB_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0)
 
 
 # --------------------------------------------------------------------------
+# Label values
+# --------------------------------------------------------------------------
+
+# Every value each labelled counter is incremented with. Metrics.__init__
+# creates them all at 0; a test checks the call sites use nothing else.
+ENTRY_OUTCOMES = ("saved", "blocked", "duplicate_held")
+DUPLICATE_DECISIONS = ("held", "overridden")
+EXTRACTION_OUTCOMES = ("success", "rate_limited", "error")
+NARRATION_RESULTS = ("ok", "failed")
+LOGIN_RESULTS = ("success", "failure", "rate_limited")
+FAULT_KINDS = ("latency", "error")
+
+
+# --------------------------------------------------------------------------
 # Metric definitions
 # --------------------------------------------------------------------------
 
@@ -242,6 +256,23 @@ class Metrics:
             ["kind"],
             **kw,
         )
+
+        # Every known label value is created at 0 before anything happens. A
+        # labelled series otherwise first appears when it is first incremented,
+        # so Prometheus's first sample of it already reads 1 and increase() sees
+        # no rise: the dashboard silently drops the first blocked save, the first
+        # duplicate, the first extraction. Found on the business dashboard, which
+        # showed "blocked 0" beside a save the review form had just blocked.
+        for counter, values in (
+            (self.entries_total, ENTRY_OUTCOMES),
+            (self.duplicate_decisions_total, DUPLICATE_DECISIONS),
+            (self.llm_extractions_total, EXTRACTION_OUTCOMES),
+            (self.weekly_reports_total, NARRATION_RESULTS),
+            (self.logins_total, LOGIN_RESULTS),
+            (self.faults_injected_total, FAULT_KINDS),
+        ):
+            for value in values:
+                counter.labels(value)
 
         # ------------------------------------------------------------------
         # GAUGE - a value that goes up and down. "How many right now?"

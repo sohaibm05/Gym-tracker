@@ -38,12 +38,12 @@ and Kibana for logs.
 | Grafana | <http://localhost:3000> (`admin`/`admin`) |
 | Kibana | <http://localhost:5601> |
 
-The full write-up — metric list, architecture, log pipeline, and the two
-experiments — is in **[docs/REPORT.md](docs/REPORT.md)**.
+The report — metric list, architecture, log pipeline, and the two experiments —
+is **[docs/Assignment report 2.docx](docs/Assignment%20report%202.docx)**.
 
 Note that the compose stack is a **local lab**: Elasticsearch runs without
 authentication and Grafana with a default password, both of which would be wrong
-on a shared network. See the security note in the report.
+on a shared network.
 
 ## Two ways to log
 
@@ -148,15 +148,17 @@ below the confidence threshold is reported rather than saved
 | `observability/kibana/` | Data view and eight saved searches |
 | `observability/cardinality_demo.py` | The Part E2 cardinality explosion demo, capped at 100 series |
 | `observability/results/` | Recorded output of the experiments, run against the app directly |
-| `observability/results-live/` | The same experiments re-run against the full container stack, with percentiles queried from Prometheus. These are the numbers quoted in the report |
+| `observability/results-live/` | The same experiments re-run against the full container stack, with percentiles queried from Prometheus. These are the numbers in the 19 September Part E1 tables |
+| `observability/results-rerun/` | The 21–22 September re-run: Part E1 again (client and server-side), plus the one real request traced through the whole log pipeline and the `gym_sets_written_total` samples behind the metric trace |
 | `scripts/stack.sh` | Start, check, load, and safely tear down the stack |
 | `scripts/load_generator.py` | Deterministic, repeatable load for the experiments |
 | `scripts/submit_reviewed_entries.py` | Saves a few entries through the review form, so the business dashboard has data on a machine with no Groq key |
 | `scripts/experiment_anomaly.sh` | Part E1: baseline, fault, recovery |
 | `scripts/experiment_cardinality.sh` | Part E2 |
 | `scripts/setup_kibana.sh` | Imports the Kibana data view and saved searches |
-| `docs/REPORT.md` | **The assignment report — Parts A to E** |
-| `docs/screenshots/` | Grafana, Kibana and Prometheus captured from the running stack, referenced by the report |
+| `docs/Assignment report 2.docx` | **The report — Parts A to E** |
+| `docs/architecture.png` | The architecture diagram used in Part D |
+| `docs/screenshots/` | Grafana, Kibana and Prometheus captures from the running stack; the report embeds the ones it uses |
 
 ## Setup
 
@@ -1125,7 +1127,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-1036 tests, no network and no database required — they cover the Stage A
+1045 tests, no network and no database required — they cover the Stage A
 rule branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold), `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
