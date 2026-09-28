@@ -157,6 +157,7 @@ below the confidence threshold is reported rather than saved
 | `scripts/experiment_cardinality.sh` | Part E2 |
 | `scripts/setup_kibana.sh` | Imports the Kibana data view and saved searches |
 | `docs/Assignment report 2.docx` | **The report — Parts A to E** |
+| `docs/observability-walkthrough.md` | A depth-first tour of three metrics, one Grafana panel, two log events and the anomaly experiment: the code, the query, and what each one read during the recorded run |
 | `docs/architecture.png` | The architecture diagram used in Part D |
 | `docs/screenshots/` | Grafana, Kibana and Prometheus captures from the running stack; the report embeds the ones it uses |
 
