@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Observability Viva Tutor</title>
+  <link rel="stylesheet" href="tutor.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="sidebar" id="sidebar">
+      <div class="brand">gym-tracker / viva-tutor<span>reverse-engineering your own observability stack</span></div>
+      <div class="nav" id="nav"></div>
+    </nav>
+    <main>
+      <button class="menu-btn" id="menu-btn">☰ Menu</button>
+      <div id="page"></div>
+    </main>
+  </div>
+  <!-- Order matters: generated refs/snippets, then curated content, then the UI. -->
+  <script src="snippets.js"></script>
+  <script src="content.js"></script>
+  <script src="content-qa.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

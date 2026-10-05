@@ -66,3 +66,6 @@ my_entry.txt
 *.pdf
 *.docx
 observability/results-rerun/
+
+# The viva tutor is a separate static study site, not part of the app.
+viva-tutor/

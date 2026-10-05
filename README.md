@@ -159,6 +159,33 @@ below the confidence threshold is reported rather than saved
 | `docs/Assignment report 2.docx` | **The report — Parts A to E** |
 | `docs/architecture.png` | The architecture diagram used in Part D |
 | `docs/screenshots/` | Grafana, Kibana and Prometheus captures from the running stack; the report embeds the ones it uses |
+| `viva-tutor/` | Interactive explainer for the viva: architecture, metrics, logs, both experiments, practice questions. Static, separate from the app |
+| `VIVA_GUIDE.md` | The highest-priority viva material on one page |
+
+### Viva Tutor
+
+A static, dependency-free site that walks through this repository's own
+observability implementation. It does not touch the app and needs no Docker,
+database or network.
+
+```bash
+python3 -m http.server 8090          # run from the repository root
+# then open http://localhost:8090/viva-tutor/
+```
+
+Serve it from the repository root, not from `viva-tutor/`, so the `file:line`
+badges can open the real source files. Opening `viva-tutor/index.html`
+directly also works, but those links may not.
+
+Code excerpts and line numbers come from `viva-tutor/snippets.js`, which is
+generated from the source. After changing the code, regenerate and check it:
+
+```bash
+python3 viva-tutor/build_snippets.py           # regenerate snippets.js
+python3 viva-tutor/build_snippets.py --check   # fails on stale anchors, unknown
+                                               # metrics, missing files, or a
+                                               # query not found in its dashboard
+```
 
 ## Setup
 
