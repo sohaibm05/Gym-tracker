@@ -27,6 +27,13 @@ A `ValueError` subclass from a data layer (`RoutineError`, `SessionError`,
 `MeasurementError`) carries a message written for the person, and becomes a 400
 with that message. Anything else becomes a 500 with no detail, because an
 unexpected exception's text is for the logs, not for the browser.
+
+Handlers are plain `def`, not `async def`
+-----------------------------------------
+Every one of them talks to the database through the synchronous SQLAlchemy
+engine. Inside an `async def` that call runs on the event loop itself, so one
+slow query stalls every other request on the worker — /healthz included. A plain
+`def` handler is run in FastAPI's threadpool, where blocking is harmless.
 """
 
 from __future__ import annotations
@@ -147,7 +154,7 @@ def _parse_date(raw: Optional[str], label: str) -> Optional[date]:
 
 
 @router.get("/catalog")
-async def get_catalog(
+def get_catalog(
     q: str = Query("", max_length=80),
     equipment: Optional[str] = Query(None, max_length=30),
     muscle_group: Optional[str] = Query(None, max_length=40),
@@ -199,6 +206,7 @@ async def get_catalog(
             "equipment": row[3],
             "equipment_label": catalog.equipment_label(row[3]),
             "is_custom": bool(row[4]),
+            "is_bodyweight": (row[3] or "") in catalog.BODYWEIGHT_EQUIPMENT,
             "log_count": int(row[5]),
             "in_catalog": catalog.search_key(row[1]) in catalog_names,
         }
@@ -222,7 +230,7 @@ async def get_catalog(
 
 
 @router.post("/exercises")
-async def create_exercise(
+def create_exercise(
     payload: dict[str, Any] = Body(...), user: Any = Depends(current_user)
 ) -> JSONResponse:
     """Resolve a name to one of this user's exercises, creating it if new."""
@@ -248,6 +256,9 @@ async def create_exercise(
             "equipment": row[3],
             "equipment_label": catalog.equipment_label(row[3]),
             "is_custom": bool(row[4]),
+            # The live screen needs this to know an empty weight is a complete
+            # bodyweight set, not an omission.
+            "is_bodyweight": (row[3] or "") in catalog.BODYWEIGHT_EQUIPMENT,
         },
         status_code=201,
     )
@@ -259,7 +270,7 @@ async def create_exercise(
 
 
 @router.get("/routines")
-async def list_routines(
+def list_routines(
     include_archived: bool = Query(False), user: Any = Depends(current_user)
 ) -> JSONResponse:
     with engine().begin() as conn:
@@ -268,7 +279,7 @@ async def list_routines(
 
 
 @router.get("/routines/{routine_id}")
-async def get_routine(routine_id: int, user: Any = Depends(current_user)) -> JSONResponse:
+def get_routine(routine_id: int, user: Any = Depends(current_user)) -> JSONResponse:
     with engine().begin() as conn:
         found = routines_module.get_routine(conn, user.user_id, routine_id)
     if found is None:
@@ -277,7 +288,7 @@ async def get_routine(routine_id: int, user: Any = Depends(current_user)) -> JSO
 
 
 @router.post("/routines")
-async def create_routine(
+def create_routine(
     payload: dict[str, Any] = Body(...), user: Any = Depends(current_user)
 ) -> JSONResponse:
     try:
@@ -295,7 +306,7 @@ async def create_routine(
 
 
 @router.put("/routines/{routine_id}")
-async def update_routine(
+def update_routine(
     routine_id: int,
     payload: dict[str, Any] = Body(...),
     user: Any = Depends(current_user),
@@ -326,7 +337,7 @@ async def update_routine(
 
 
 @router.delete("/routines/{routine_id}")
-async def delete_routine(routine_id: int, user: Any = Depends(current_user)) -> JSONResponse:
+def delete_routine(routine_id: int, user: Any = Depends(current_user)) -> JSONResponse:
     with engine().begin() as conn:
         deleted = routines_module.delete_routine(conn, user.user_id, routine_id)
     if not deleted:
@@ -335,10 +346,13 @@ async def delete_routine(routine_id: int, user: Any = Depends(current_user)) -> 
 
 
 @router.post("/routines/reorder")
-async def reorder_routines(
+def reorder_routines(
     payload: dict[str, Any] = Body(...), user: Any = Depends(current_user)
 ) -> JSONResponse:
-    ids = [int(value) for value in (payload.get("routine_ids") or [])]
+    try:
+        ids = [int(value) for value in (payload.get("routine_ids") or [])]
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="routine_ids must be a list of ids.") from None
     with engine().begin() as conn:
         routines_module.reorder_routines(conn, user.user_id, ids)
         found = routines_module.list_routines(conn, user.user_id)
@@ -351,7 +365,7 @@ async def reorder_routines(
 
 
 @router.get("/session/active")
-async def get_active_session(user: Any = Depends(current_user)) -> JSONResponse:
+def get_active_session(user: Any = Depends(current_user)) -> JSONResponse:
     """The workout in progress, if any. Polled by the PWA on load.
 
     This is what makes a locked phone or a dropped connection recoverable: the
@@ -363,16 +377,20 @@ async def get_active_session(user: Any = Depends(current_user)) -> JSONResponse:
 
 
 @router.post("/session/start")
-async def start_session(
+def start_session(
     payload: dict[str, Any] = Body(default_factory=dict), user: Any = Depends(current_user)
 ) -> JSONResponse:
     routine_id = payload.get("routine_id")
+    try:
+        routine_id = int(routine_id) if routine_id else None
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="routine_id must be an id.") from None
     try:
         with engine().begin() as conn:
             session = sessions_module.start_session(
                 conn,
                 user.user_id,
-                routine_id=int(routine_id) if routine_id else None,
+                routine_id=routine_id,
                 name=payload.get("name"),
             )
     except _USER_FACING as exc:
@@ -381,7 +399,7 @@ async def start_session(
 
 
 @router.get("/session/{session_id}")
-async def get_session(session_id: int, user: Any = Depends(current_user)) -> JSONResponse:
+def get_session(session_id: int, user: Any = Depends(current_user)) -> JSONResponse:
     with engine().begin() as conn:
         session = sessions_module.load_session(conn, user.user_id, session_id)
     if session is None:
@@ -390,7 +408,7 @@ async def get_session(session_id: int, user: Any = Depends(current_user)) -> JSO
 
 
 @router.post("/session/{session_id}/sets")
-async def log_set(
+def log_set(
     session_id: int,
     payload: dict[str, Any] = Body(...),
     user: Any = Depends(current_user),
@@ -441,7 +459,7 @@ async def log_set(
 
 
 @router.put("/sets/{log_id}")
-async def update_set(
+def update_set(
     log_id: int, payload: dict[str, Any] = Body(...), user: Any = Depends(current_user)
 ) -> JSONResponse:
     # Forward only the keys the client actually sent.
@@ -465,7 +483,7 @@ async def update_set(
 
 
 @router.delete("/sets/{log_id}")
-async def delete_set(log_id: int, user: Any = Depends(current_user)) -> JSONResponse:
+def delete_set(log_id: int, user: Any = Depends(current_user)) -> JSONResponse:
     with engine().begin() as conn:
         deleted = sessions_module.delete_set(conn, user.user_id, log_id)
     if not deleted:
@@ -474,7 +492,7 @@ async def delete_set(log_id: int, user: Any = Depends(current_user)) -> JSONResp
 
 
 @router.post("/session/{session_id}/finish")
-async def finish_session(
+def finish_session(
     session_id: int,
     payload: dict[str, Any] = Body(default_factory=dict),
     user: Any = Depends(current_user),
@@ -490,7 +508,7 @@ async def finish_session(
 
 
 @router.delete("/session/{session_id}")
-async def discard_session(session_id: int, user: Any = Depends(current_user)) -> JSONResponse:
+def discard_session(session_id: int, user: Any = Depends(current_user)) -> JSONResponse:
     with engine().begin() as conn:
         deleted = sessions_module.discard_session(conn, user.user_id, session_id)
     if not deleted:
@@ -499,7 +517,7 @@ async def discard_session(session_id: int, user: Any = Depends(current_user)) ->
 
 
 @router.get("/sessions")
-async def list_sessions(
+def list_sessions(
     limit: int = Query(20, ge=1, le=100), user: Any = Depends(current_user)
 ) -> JSONResponse:
     with engine().begin() as conn:
@@ -515,7 +533,7 @@ async def list_sessions(
 
 
 @router.get("/exercises/{exercise_id}/previous")
-async def previous_performance(
+def previous_performance(
     exercise_id: int,
     exclude_session_id: Optional[int] = Query(None),
     user: Any = Depends(current_user),
@@ -541,7 +559,7 @@ async def previous_performance(
 
 
 @router.get("/records")
-async def list_records(
+def list_records(
     limit: int = Query(20, ge=1, le=200), user: Any = Depends(current_user)
 ) -> JSONResponse:
     with engine().begin() as conn:
@@ -550,7 +568,7 @@ async def list_records(
 
 
 @router.post("/records/rebuild")
-async def rebuild_records(user: Any = Depends(current_user)) -> JSONResponse:
+def rebuild_records(user: Any = Depends(current_user)) -> JSONResponse:
     """Recompute every record from the logged sets.
 
     Exposed because the incremental path can only raise a record, never lower
@@ -569,7 +587,7 @@ async def rebuild_records(user: Any = Depends(current_user)) -> JSONResponse:
 
 
 @router.get("/measurements")
-async def get_measurements(
+def get_measurements(
     days: int = Query(90, ge=1, le=3650),
     since: Optional[str] = Query(None),
     until: Optional[str] = Query(None),
@@ -609,7 +627,7 @@ async def get_measurements(
 
 
 @router.post("/measurements")
-async def add_measurements(
+def add_measurements(
     payload: dict[str, Any] = Body(...), user: Any = Depends(current_user)
 ) -> JSONResponse:
     """Record one sitting: several sites sharing a timestamp."""
@@ -636,7 +654,7 @@ async def add_measurements(
 
 
 @router.delete("/measurements/{measurement_id}")
-async def remove_measurement(
+def remove_measurement(
     measurement_id: int, user: Any = Depends(current_user)
 ) -> JSONResponse:
     with engine().begin() as conn:
