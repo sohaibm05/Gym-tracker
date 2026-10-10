@@ -84,6 +84,21 @@ changing anything, run `python scripts/quickstart.py --check`.
 | **Part E1**: slow requests | See section 4 | p95 jumps to about 690 ms during the fault and returns to a few ms afterwards. |
 | **Part E2**: cardinality | See section 4 | `count(demo_requests_total)` reaches 100, then disappears once the label is removed. |
 
+### Assignment 2
+
+| Part | Run / open | What you should see |
+|---|---|---|
+| **A**: OpenAPI | <http://localhost:8000/api/docs> → *Authorize* (Basic, `demo` / `demo-password`) → `POST /api/sessions/{session_id}/sets` → *Try it out* | A 201 with the set; the same Idempotency-Key again gives 200 and `idempotent-replayed: true`. |
+| **A**: traffic and 429 | `python scripts/a2_traffic.py` | Each round: 201 / 200 replayed / 400 / 404 over HTTP and OK / OK replayed / INVALID_ARGUMENT / NOT_FOUND over gRPC. Then rebuild x5: 200, 200, 200, 429, 429 with `Retry-After`. |
+| **A**: reliability | `./scripts/demo_reliability.sh` (Git Bash) | Successes, timeouts retried, `breaker OPEN`, blocked calls, `breaker HALF_OPEN`, `breaker CLOSED`. Saved to `observability/results-a2/reliability.txt`. |
+| **B**: gRPC | `python clients/grpc_client.py --session-id <id> --exercise "Bench Press (Barbell)" --weight 80 --reps 8`, then again with `--reps 0` | `OK` with the set, then `INVALID_ARGUMENT` with "Reps must be between 1 and 500." |
+| **B**: one id across the boundary | add `--request-id a2-demo-1` to the gRPC call, then Kibana: `http.request.id: "a2-demo-1"` | The `rpc served` and `set logged` lines from `gym-tracker-grpc`. |
+| **C**: dashboard | Grafana → *Gym Tracker - HTTP vs gRPC (log a set)* | HTTP and gRPC side by side: calls by status, error ratio, p50/p95, in-flight, sets written vs replayed, the 429s. |
+| **C**: target | Prometheus → *Status → Targets* | `gym-tracker-grpc` is UP. |
+
+A Postgres volume created before Assignment 2 needs migration 004 once:
+`docker compose exec -T postgres psql -U gym -d gymtracker < migrations/004_idempotent_sets.sql`.
+
 To get a request id for Part C:
 
 ```powershell

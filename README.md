@@ -56,6 +56,68 @@ Note that the compose stack is a **local lab**: Elasticsearch runs without
 authentication and Grafana with a default password, both of which would be wrong
 on a shared network.
 
+## Assignment 2: HTTP API, gRPC and metrics
+
+The user task is **logging a set during a live workout**. Over HTTP it is
+`POST /api/sessions/{session_id}/sets`; over gRPC it is
+`gymtracker.v1.WorkoutService/LogSet`, served by a second process
+(`grpc_server.py`, container `gym-grpc`). Both call `sessions.log_set` on the
+same Postgres database. The report is
+**[docs/assignment2-report.md](docs/assignment2-report.md)**.
+
+### Run
+
+```bash
+python scripts/quickstart.py                 # the whole stack, now including gym-grpc
+python scripts/a2_traffic.py                 # success + failure calls over HTTP and gRPC, then the 429 demo
+./scripts/demo_reliability.sh                # the HTTP caller: timeout, retry, breaker open, recovery
+python clients/http_caller.py                # the caller on its own, against a healthy app
+python clients/grpc_client.py --session-id <id> --exercise "Bench Press (Barbell)" --weight 80 --reps 8
+```
+
+An existing Postgres volume needs the new column once:
+
+```bash
+docker compose exec -T postgres psql -U gym -d gymtracker < migrations/004_idempotent_sets.sql
+```
+
+| | |
+|---|---|
+| Swagger UI (try the API) | <http://localhost:8000/api/docs> |
+| OpenAPI document | <http://localhost:8000/api/openapi.json>, committed as [docs/openapi.json](docs/openapi.json) |
+| gRPC | `localhost:50051` |
+| gRPC metrics | <http://localhost:9102/metrics> |
+| Grafana dashboard | "Gym Tracker - HTTP vs gRPC (log a set)" |
+
+### Test
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q tests/test_api_v2.py tests/test_http_caller.py tests/test_grpc_service.py
+python scripts/export_openapi.py --check     # the committed spec matches the code
+```
+
+### Regenerate the gRPC code
+
+After a change to `proto/workout.proto`:
+
+```bash
+python -m grpc_tools.protoc -I proto --python_out=grpc_gen --pyi_out=grpc_gen --grpc_python_out=grpc_gen proto/workout.proto
+```
+
+| File | What it is |
+|---|---|
+| `api.py` | The JSON API: typed request bodies, one error format, Idempotency-Key, the rate limit, and `openapi_document()` |
+| `docs/openapi.json` | The OpenAPI 3.1 document, generated from `api.py` by `scripts/export_openapi.py` |
+| `proto/workout.proto` | The gRPC contract: `WorkoutService.LogSet` |
+| `grpc_gen/` | Code generated from the `.proto` (committed; regenerate with the command above) |
+| `grpc_server.py` | The gRPC server: the LogSet handler, status mapping, request-id propagation, metrics on :9102 |
+| `clients/http_caller.py` | The Python caller: timeout, limited retry with backoff, circuit breaker |
+| `clients/grpc_client.py` | The gRPC client: input from flags, a deadline, result or status printed |
+| `migrations/004_idempotent_sets.sql` | `workout_logs.client_set_id` and its unique index |
+| `observability/grafana/dashboards/04-http-vs-grpc.json` | The HTTP-vs-gRPC dashboard |
+| `scripts/a2_traffic.py`, `scripts/demo_reliability.sh` | Repeatable traffic and the reliability demo |
+
 ## Two ways to log
 
 The app takes training two ways, and both write the same `workout_logs` table,

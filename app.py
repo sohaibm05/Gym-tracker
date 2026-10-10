@@ -1567,6 +1567,22 @@ if api is not None:
         login_required=LoginRequired,
     )
     app.include_router(api.router)
+    api.install_error_handlers(app)
+
+    # The OpenAPI document and a Swagger UI to try the API from, only when asked
+    # for. Off by default for the reason openapi_url is off on the app above: an
+    # unauthenticated map of every route. The compose stack is a local lab and
+    # turns it on; a public deploy leaves it unset.
+    if pipeline is not None and pipeline.env("API_DOCS_ENABLED", "false").lower() == "true":
+        from fastapi.openapi.docs import get_swagger_ui_html
+
+        @app.get("/api/openapi.json", include_in_schema=False)
+        async def api_openapi() -> JSONResponse:
+            return JSONResponse(api.openapi_document())
+
+        @app.get("/api/docs", include_in_schema=False)
+        async def api_docs() -> HTMLResponse:
+            return get_swagger_ui_html(openapi_url="/api/openapi.json", title="Gym Tracker API")
 
     _PWA_DIR = Path(__file__).resolve().parent / "static"
     if _PWA_DIR.is_dir():
