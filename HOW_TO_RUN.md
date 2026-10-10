@@ -60,8 +60,12 @@ about a minute. The script:
     [OK]   8 Kibana saved searches                8 found
 ```
 
-It is safe to run again at any time. To re-check a running stack without
-changing anything, run `python scripts/quickstart.py --check`.
+It is safe to run again at any time, for example after stopping and restarting
+the stack. Metric counters live in the app's memory, so they start again at 0
+when the app restarts (Part D of the report explains this). If that has
+happened, the quick start saves the demo entries again so the business
+dashboard is not empty. To re-check a running stack without changing anything,
+run `python scripts/quickstart.py --check`.
 
 > **Prefer the exact commands from the report?** They work too:
 > `docker compose up -d --build`, then `./scripts/setup_kibana.sh` (Git Bash on
