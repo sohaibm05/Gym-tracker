@@ -1,0 +1,23 @@
+# Line endings.
+#
+# Git for Windows checks text files out with CRLF by default. A shell script
+# with CRLF fails under bash with "$'\r': command not found", and a container
+# that mounts a script or config written on Windows sees the same stray \r.
+# Everything in the index is LF; these rules keep the scripts and the files the
+# containers read LF in every working tree, whatever core.autocrlf says.
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.ndjson text eol=lf
+*.sql text eol=lf
+Dockerfile text eol=lf
+.env.example text eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.docx binary
+*.pdf binary

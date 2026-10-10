@@ -1,16 +1,21 @@
-groq>=0.11.0
-pydantic>=2.7
-sqlalchemy>=2.0
-psycopg2-binary>=2.9
-fastapi>=0.111
-uvicorn[standard]>=0.30
-python-multipart>=0.0.9
-rapidfuzz>=3.9
-python-dotenv>=1.0
+# Exact versions, the set the test suite and the Docker stack were verified
+# with. Unbounded ranges let a fresh `docker compose up --build` pull whatever is
+# newest on the day, and SQLAlchemy 2.1 did exactly that: it changed the default
+# Postgres driver and broke every database call on a clean build. Bump these
+# deliberately, then re-run `pytest -q` and the stack, rather than by accident.
+groq==1.7.0
+pydantic==2.14.0
+sqlalchemy==2.1.4
+psycopg2-binary==2.9.13
+fastapi==0.143.0
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32
+rapidfuzz==3.14.6
+python-dotenv==1.2.4
 # zoneinfo reads the IANA database from the OS. Slim serverless images often
 # ship without it, which makes ZoneInfo("Asia/Karachi") raise at runtime.
-tzdata>=2024.1
+tzdata==2026.5
 # Prometheus instrumentation (metrics.py, /metrics). The app degrades to no-op
 # metrics if this is missing rather than failing to start, so a trimmed
 # serverless bundle loses observability but still serves requests.
-prometheus-client>=0.20
+prometheus-client==0.26.0

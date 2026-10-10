@@ -19,8 +19,13 @@ groups:
       # Prometheus itself for every target, so this fires when a service stops
       # answering — including when the app crashes outright and can no longer
       # report anything about itself.
+      #
+      # The cardinality demo is excluded: it only runs under the "experiment"
+      # profile, so its target is down by design the rest of the time, and
+      # matching it would leave a critical alert firing permanently on a
+      # healthy stack. Its scrape status is still visible on /targets.
       - alert: TargetDown
-        expr: up == 0
+        expr: up{job!="cardinality-demo"} == 0
         for: 1m
         labels:
           severity: critical

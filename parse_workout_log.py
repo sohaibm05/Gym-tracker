@@ -215,7 +215,10 @@ def check_config() -> int:
             from sqlalchemy import create_engine as _create_engine, text as _text
 
             # Short timeout: a diagnostic that hangs is worse than no diagnostic.
-            engine = _create_engine(database_url, connect_args={"connect_timeout": 8})
+            engine = _create_engine(
+                pipeline.normalize_database_url(database_url),
+                connect_args={"connect_timeout": 8},
+            )
             with engine.connect() as conn:
                 rows = conn.execute(_text("SELECT count(*) FROM workout_logs")).scalar_one()
             report("database connection", True, f"{rows} rows in workout_logs")

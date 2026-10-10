@@ -181,8 +181,18 @@ services:
       # stack fits on a laptop; Xms and Xmx are equal so the heap never resizes.
       ES_JAVA_OPTS: "-Xms512m -Xmx512m"
       ingest.geoip.downloader.enabled: "false"
-    ulimits:
-      memlock: { soft: -1, hard: -1 }
+      # Disk watermarks as absolute free space instead of the default 85/90/95%
+      # of the disk. On a big laptop drive that is 91% full there are still tens
+      # of GB free, but the percentage rule refuses to place the log index at
+      # all: the index goes red, nothing is indexed, and Kibana is silently
+      # empty. These still stop writes before the disk genuinely fills.
+      cluster.routing.allocation.disk.watermark.low: "2gb"
+      cluster.routing.allocation.disk.watermark.high: "1gb"
+      cluster.routing.allocation.disk.watermark.flood_stage: "512mb"
+    # No `ulimits: memlock: -1` here. It only matters with
+    # bootstrap.memory_lock=true, which this lab does not set, and some Docker
+    # setups (rootless, Podman, locked-down VMs) refuse to raise that limit at
+    # all, so the container would fail to start for a setting it never uses.
     volumes:
       - elasticsearch-data:/usr/share/elasticsearch/data
     ports:

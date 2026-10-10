@@ -1774,10 +1774,26 @@ def build_draft(
 # --------------------------------------------------------------------------
 
 
+def normalize_database_url(url: str) -> str:
+    """Pin a driverless Postgres URL to psycopg2, the driver requirements.txt installs.
+
+    `postgresql://` names no driver, so SQLAlchemy picks its default — psycopg2
+    up to 2.0, psycopg (v3) from 2.1. psycopg 3 is not installed, so on 2.1 the
+    plain URL every setup guide uses (and that `psql` needs) fails at the first
+    query with "No module named 'psycopg'". Rewriting only the bare scheme keeps
+    `psql "$DATABASE_URL"` working and leaves an explicit `+driver` untouched.
+    """
+    for bare in ("postgresql://", "postgres://"):
+        if url.startswith(bare):
+            return "postgresql+psycopg2://" + url[len(bare):]
+    return url
+
+
 def get_engine(database_url: Optional[str] = None, serverless: Optional[bool] = None) -> Engine:
     url = database_url or os.getenv("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL is not set")
+    url = normalize_database_url(url)
 
     if SERVERLESS if serverless is None else serverless:
         # One connection per request, closed on release. Pooling across

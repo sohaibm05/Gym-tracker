@@ -34,7 +34,18 @@ FAULT_LATENCY_MS="${FAULT_LATENCY_MS:-500}"
 FAULT_LATENCY_EVERY_N="${FAULT_LATENCY_EVERY_N:-5}"
 RESULTS_DIR="${RESULTS_DIR:-observability/results}"
 COMPOSE="${COMPOSE:-docker compose}"
-PYTHON="${PYTHON:-python3}"
+# python3 on Linux and macOS. On Windows (Git Bash) it is usually `python` or
+# `py`, and `python3` can be the Microsoft Store stub, which only prints a hint
+# and fails -- so each candidate has to actually run, not merely exist.
+if [ -z "${PYTHON:-}" ]; then
+  for candidate in python3 python py; do
+    if "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1; then
+      PYTHON="$candidate"
+      break
+    fi
+  done
+fi
+: "${PYTHON:?Python 3.8 or newer is needed on PATH, or set PYTHON=/path/to/python}"
 
 mkdir -p "$RESULTS_DIR"
 
