@@ -1111,6 +1111,34 @@ fine for personal use and is exactly why the duplicate-submission guard exists.
 
 **LLM — Groq free tier.** No billing account is needed anywhere in this stack.
 
+### CI/CD
+
+Two GitHub Actions workflows live in `.github/workflows/`.
+
+**`ci.yml` — every pull request.** Runs the whole test suite on Python 3.11
+(what the Dockerfile ships) and 3.12 against a throwaway Postgres 16 loaded from
+`schema.sql`, so the `needs_db` tests that skip on a laptop actually run. It
+also applies `schema.sql` twice to prove it is still re-runnable, and builds the
+Docker image and waits for its `/healthz`. No secrets are involved; the app
+never reaches Groq or a real database from CI.
+
+**`cd.yml` — every push to `main`.** Re-runs CI as a gate, then publishes the
+image to `ghcr.io/<owner>/gym-tracker` tagged `latest` and `sha-<commit>`, then
+deploys to whichever host has secrets configured:
+
+| Host | Repository secrets |
+|---|---|
+| Vercel | `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID` (the last two are in `.vercel/project.json` after `vercel link`) |
+| Render | `RENDER_DEPLOY_HOOK_URL` (service → Settings → Deploy Hook) |
+
+A host without secrets is skipped, not failed. Set the repository *variable*
+`APP_URL` and the run finishes by waiting for `/healthz` on the live site.
+Turn off the host's own auto-deploy from Git, or every push deploys twice, once
+without waiting for CI.
+
+CD does **not** run migrations. As above, they go in *before* the code that
+needs them, by hand.
+
 ### A note on the model ID
 
 Groq deprecated `llama-3.3-70b-versatile` and `llama-3.1-8b-instant` for free and

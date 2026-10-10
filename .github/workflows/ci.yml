@@ -1,0 +1,144 @@
+# Continuous integration: runs on every pull request. Pushes to main run it
+# through cd.yml, which calls this workflow as the gate before deploying.
+#
+# Three jobs, each answering a different question:
+#   test         - does the code work? Full pytest suite, including the
+#                  `needs_db` tests, against a throwaway Postgres loaded from
+#                  schema.sql. Without a database those tests skip silently,
+#                  which is exactly the gap CI is here to close.
+#   schema       - is schema.sql still safe to re-run? The README promises it
+#                  is (every object IF NOT EXISTS); this applies it twice.
+#   docker       - does the production image still build and pass its own
+#                  /healthz check?
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+  # Lets cd.yml run this exact workflow as a gate before deploying.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is what the Dockerfile ships; 3.12 catches the next upgrade early.
+        python-version: ["3.11", "3.12"]
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: gym_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PGPASSWORD: postgres
+      TEST_DATABASE_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/gym_test
+      # The app must never reach a real LLM or a real database from CI.
+      GROQ_API_KEY: ""
+      DATABASE_URL: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Byte-compile every module
+        run: python -m compileall -q -x '(^|/)(\.git|\.venv)/' .
+
+      - name: Load schema into the test database
+        run: psql -h localhost -U postgres -d gym_test -v ON_ERROR_STOP=1 -q -f schema.sql
+
+      - name: Run tests
+        run: python -m pytest -q -rs
+
+  schema:
+    name: Schema is re-runnable
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGPASSWORD: postgres
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply schema.sql twice
+        run: |
+          psql -h localhost -U postgres -v ON_ERROR_STOP=1 -q -f schema.sql
+          psql -h localhost -U postgres -v ON_ERROR_STOP=1 -q -f schema.sql
+
+  docker:
+    name: Docker image builds and is healthy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: gym-tracker:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start container and wait for /healthz
+        run: |
+          docker run -d --name app -p 8000:8000 gym-tracker:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/healthz; then
+              echo; echo "healthy after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "container never became healthy"
+          docker logs app
+          exit 1
+
+      - name: Container logs
+        if: always()
+        run: docker logs app || true

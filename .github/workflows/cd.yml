@@ -1,0 +1,176 @@
+# Continuous delivery: every push to main that passes CI is published and
+# deployed.
+#
+#   1. ci        - re-runs the full CI workflow as a gate. Nothing ships red.
+#   2. publish   - pushes the Docker image to GitHub Container Registry as
+#                  ghcr.io/<owner>/<repo>:latest and :sha-<commit>, so any
+#                  version can be pulled, or rolled back to, by commit.
+#   3. deploy    - deploys to whichever host is configured: Vercel (the
+#                  README's primary host), Render (the alternative), or both.
+#                  A host with no secrets is skipped with a notice, not failed.
+#   4. smoke     - if APP_URL is set, waits for its /healthz to answer.
+#
+# Repository settings (Settings -> Secrets and variables -> Actions):
+#
+#   Vercel   secrets  VERCEL_TOKEN       vercel.com -> Account Settings -> Tokens
+#                     VERCEL_ORG_ID      `.vercel/project.json` after `vercel link`
+#                     VERCEL_PROJECT_ID  (same file)
+#            Then turn off Vercel's own Git deployments for production (or set
+#            `"git": {"deploymentEnabled": false}`) so main deploys once,
+#            after CI, instead of twice and regardless of CI.
+#
+#   Render   secret   RENDER_DEPLOY_HOOK_URL  dashboard -> service -> Settings
+#                                             -> Deploy Hook. Turn Auto-Deploy
+#                                             off for the same reason.
+#
+#   Both     variable APP_URL  e.g. https://gym-tracker.vercel.app
+#
+# Migrations are NOT run here. The README is explicit that schema changes must
+# land before the code that depends on them, and that is a decision for a
+# person holding the production DATABASE_URL, not for a pipeline.
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never run two deploys at once; a newer push waits rather than cancelling a
+# deploy that is already halfway out.
+concurrency:
+  group: cd-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish image to GHCR
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # GHCR requires a lowercase repository path.
+      - name: Image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-vercel:
+    name: Deploy to Vercel
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: production
+      url: ${{ vars.APP_URL }}
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+    steps:
+      - name: Check configuration
+        id: cfg
+        run: |
+          if [ -z "$VERCEL_TOKEN" ] || [ -z "$VERCEL_ORG_ID" ] || [ -z "$VERCEL_PROJECT_ID" ]; then
+            echo "::notice::Vercel secrets not set; skipping Vercel deploy."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.cfg.outputs.enabled == 'true'
+
+      - uses: actions/setup-node@v4
+        if: steps.cfg.outputs.enabled == 'true'
+        with:
+          node-version: 20
+
+      # Build on the runner and upload the result, so what ships is exactly
+      # this commit with the production env vars Vercel already holds.
+      - name: Build and deploy
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          npm install --global vercel
+          vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
+          vercel build --prod --token="$VERCEL_TOKEN"
+          url=$(vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN")
+          echo "Deployed ${GITHUB_SHA::7} to $url"
+
+  deploy-render:
+    name: Deploy to Render
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+    steps:
+      - name: Trigger Render deploy
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+            echo "::notice::RENDER_DEPLOY_HOOK_URL not set; skipping Render deploy."
+            exit 0
+          fi
+          curl -fsS -X POST "$RENDER_DEPLOY_HOOK_URL" -o /dev/null
+          echo "Render deploy triggered for ${GITHUB_SHA::7}"
+
+  smoke:
+    name: Smoke-check production
+    needs: [deploy-vercel, deploy-render]
+    if: vars.APP_URL != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      APP_URL: ${{ vars.APP_URL }}
+    steps:
+      # Render's free tier builds and cold-starts slowly, so allow ~15 minutes.
+      # This proves the service answers, not that it is this commit: an old
+      # instance still serving mid-rollout passes too.
+      - name: Wait for /healthz
+        run: |
+          for i in $(seq 1 90); do
+            if curl -fsS --max-time 10 "${APP_URL%/}/healthz"; then
+              echo; echo "live and healthy"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::${APP_URL}/healthz did not answer within 15 minutes"
+          exit 1
