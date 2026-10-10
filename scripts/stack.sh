@@ -2,7 +2,7 @@
 #
 # One entry point for the observability stack: start, check, seed, clean up.
 #
-#   ./scripts/stack.sh up        build and start everything, then wait for health
+#   ./scripts/stack.sh up        build, start, seed demo data and verify everything
 #   ./scripts/stack.sh status    what is running, and whether Prometheus sees it
 #   ./scripts/stack.sh urls      where everything is
 #   ./scripts/stack.sh logs      follow the app's logs
@@ -16,47 +16,30 @@
 set -euo pipefail
 
 COMPOSE="${COMPOSE:-docker compose}"
-PYTHON="${PYTHON:-python3}"
+# python3 on Linux and macOS. On Windows (Git Bash) it is usually `python` or
+# `py`, and `python3` can be the Microsoft Store stub, which only prints a hint
+# and fails -- so each candidate has to actually run, not merely exist.
+if [ -z "${PYTHON:-}" ]; then
+  for candidate in python3 python py; do
+    if "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1; then
+      PYTHON="$candidate"
+      break
+    fi
+  done
+fi
+: "${PYTHON:?Python 3.8 or newer is needed on PATH, or set PYTHON=/path/to/python}"
 BASE_URL="${BASE_URL:-http://localhost:8000}"
 PROM_URL="${PROM_URL:-http://localhost:9090}"
 
 log()  { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m!! %s\033[0m\n' "$*"; }
 
-wait_for() {
-  local name="$1" url="$2" tries="${3:-60}"
-  printf 'waiting for %-16s' "$name"
-  for _ in $(seq 1 "$tries"); do
-    if curl -fsS -o /dev/null "$url" 2>/dev/null; then
-      printf ' ready\n'
-      return 0
-    fi
-    printf '.'
-    sleep 2
-  done
-  printf ' TIMED OUT\n'
-  return 1
-}
-
 cmd_up() {
-  log "Building and starting the stack"
-  $COMPOSE up -d --build
-
-  log "Waiting for services"
-  wait_for "app"           "$BASE_URL/healthz"                || warn "app not ready"
-  wait_for "prometheus"    "$PROM_URL/-/ready"                || warn "prometheus not ready"
-  wait_for "grafana"       "http://localhost:3000/api/health" || warn "grafana not ready"
-  wait_for "elasticsearch" "http://localhost:9200/_cluster/health" 90 \
-    || warn "elasticsearch not ready (it is the slowest to start)"
-  wait_for "kibana"        "http://localhost:5601/api/status" 90 || warn "kibana not ready"
-
-  log "Generating a little traffic so nothing is empty"
-  $PYTHON scripts/load_generator.py --requests 40 --rps 10 --label warmup >/dev/null 2>&1 || true
-
-  log "Importing Kibana saved objects"
-  ./scripts/setup_kibana.sh || warn "Kibana import failed — see the message above"
-
-  cmd_urls
+  # The cross-platform quick start does the whole sequence -- build, wait for
+  # health, seed the demo account and business data, generate traffic, import
+  # the Kibana objects -- and then verifies every piece, so `stack.sh up` and
+  # `python scripts/quickstart.py` (for PowerShell users) behave identically.
+  "$PYTHON" scripts/quickstart.py "$@"
 }
 
 cmd_status() {
@@ -122,7 +105,7 @@ cmd_load() {
 }
 
 case "${1:-}" in
-  up)      cmd_up ;;
+  up)      shift; cmd_up "$@" ;;
   status)  cmd_status ;;
   urls)    cmd_urls ;;
   logs)    $COMPOSE logs -f app ;;

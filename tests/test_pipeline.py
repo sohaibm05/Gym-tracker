@@ -579,6 +579,30 @@ class TestEnginePooling:
             pipeline.get_engine()
 
 
+class TestDatabaseUrlDriver:
+    """The plain URL from .env.example and docker-compose must reach psycopg2.
+
+    SQLAlchemy 2.1 maps a driverless postgresql:// to psycopg 3, which is not
+    installed, so a fresh `docker compose up --build` failed every query.
+    No database is needed: the dialect is resolved when the engine is built.
+    """
+
+    @pytest.mark.parametrize("url", [
+        "postgresql://gym:gym@postgres:5432/gymtracker",
+        "postgres://gym:gym@postgres:5432/gymtracker",
+    ])
+    def test_plain_url_uses_the_installed_driver(self, url):
+        engine = pipeline.get_engine(url, serverless=False)
+        assert engine.dialect.driver == "psycopg2"
+
+    def test_explicit_driver_is_left_alone(self):
+        url = "postgresql+psycopg2://u:p@localhost/db"
+        assert pipeline.normalize_database_url(url) == url
+
+    def test_non_postgres_url_is_left_alone(self):
+        assert pipeline.normalize_database_url("sqlite:///x.db") == "sqlite:///x.db"
+
+
 # --------------------------------------------------------------------------
 # Empty environment variables must not crash the app at import
 # --------------------------------------------------------------------------

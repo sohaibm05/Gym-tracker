@@ -13,6 +13,10 @@ key. It is not a load test; see load_generator.py for that.
 
 Usage:
     python scripts/submit_reviewed_entries.py --username you --password ...
+    python scripts/submit_reviewed_entries.py --username demo --password ... --signup
+
+--signup creates the account first if the login fails, so a fresh stack can be
+seeded in one step.
 """
 
 from __future__ import annotations
@@ -76,18 +80,29 @@ def main() -> int:
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument("--username", required=True)
     parser.add_argument("--password", required=True)
+    parser.add_argument("--signup", action="store_true",
+                        help="create the account if logging in fails")
     args = parser.parse_args()
 
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
-    )
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
     def post(path: str, data: dict) -> str:
         body = urllib.parse.urlencode(data).encode()
         with opener.open(args.base_url + path, body) as response:
             return response.read().decode("utf-8", "replace")
 
-    post("/login", {"username": args.username, "password": args.password})
+    # A successful login or signup answers with a redirect that sets the session
+    # cookie; a failed one re-renders the form. Without this check every /save
+    # below would bounce to the login page and be reported as "blocked".
+    credentials = {"username": args.username, "password": args.password}
+    post("/login", credentials)
+    if not len(jar) and args.signup:
+        post("/signup", credentials)
+    if not len(jar):
+        hint = "" if args.signup else " (add --signup to create the account)"
+        print(f"Could not log in as {args.username!r}{hint}.", file=sys.stderr)
+        return 1
 
     submissions = [(d, s, b, "save") for d, s, b in ENTRIES]
     # The same entry again: the duplicate guard should hold it rather than save twice.

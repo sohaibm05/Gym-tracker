@@ -17,11 +17,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# psycopg2-binary ships wheels, so no compiler is needed; curl is here for the
-# container healthcheck below.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/*
+# No apt-get step: psycopg2-binary ships wheels, so no compiler is needed, and
+# the healthcheck below uses Python rather than curl. Every package-manager call
+# is one more mirror that has to be reachable for the build to succeed.
 
 # Dependencies first, as their own layer: application code changes on every
 # commit, requirements.txt rarely does, so this keeps the slow layer cached.
@@ -37,8 +35,10 @@ USER appuser
 
 EXPOSE 8000
 
+# urlopen raises on a refused connection, a timeout or any non-2xx status, so
+# the exit code is non-zero in exactly the cases curl -f would have failed.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=5 \
-    CMD curl -fsS http://localhost:8000/healthz || exit 1
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2)"]
 
 # One worker, deliberately.
 #
@@ -47,5 +47,5 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=5 \
 # load-balanced across them, so every scrape would return a different worker's
 # partial totals and the counters would appear to jump backwards. Running
 # multi-worker needs PROMETHEUS_MULTIPROC_DIR and the MultiProcessCollector;
-# for this workload one worker is simpler and enough. See docs/REPORT.md.
+# for this workload one worker is simpler and enough.
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

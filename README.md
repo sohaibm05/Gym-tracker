@@ -24,8 +24,19 @@ This project carries a full metrics and logging stack: Prometheus and Grafana
 for metrics (including node-exporter for the host), and Filebeat, Elasticsearch
 and Kibana for logs.
 
+**To run it, see [HOW_TO_RUN.md](HOW_TO_RUN.md).** It covers prerequisites, what
+to look at for each part of the report, the experiments and troubleshooting.
+With Docker running, one command starts, fills and checks the whole stack on
+Windows, macOS or Linux:
+
 ```bash
-./scripts/stack.sh up      # everything, then wait for health
+python scripts/quickstart.py           # python3 on macOS/Linux
+```
+
+From a Unix shell (or Git Bash) the same is available as:
+
+```bash
+./scripts/stack.sh up      # everything, then seed demo data and verify it
 ./scripts/stack.sh urls    # where to find it
 ./scripts/stack.sh down    # stop, keeping the data
 ```
@@ -150,6 +161,8 @@ below the confidence threshold is reported rather than saved
 | `observability/results/` | Recorded output of the experiments, run against the app directly |
 | `observability/results-live/` | The same experiments re-run against the full container stack, with percentiles queried from Prometheus. These are the numbers in the 19 September Part E1 tables |
 | `observability/results-rerun/` | The 21–22 September re-run: Part E1 again (client and server-side), plus the one real request traced through the whole log pipeline and the `gym_sets_written_total` samples behind the metric trace |
+| `HOW_TO_RUN.md` | **Running the stack on your own machine**, step by step, and what to look at for each part of the report |
+| `scripts/quickstart.py` | One cross-platform command: start the stack, seed demo data, import the Kibana objects, verify every piece |
 | `scripts/stack.sh` | Start, check, load, and safely tear down the stack |
 | `scripts/load_generator.py` | Deterministic, repeatable load for the experiments |
 | `scripts/submit_reviewed_entries.py` | Saves a few entries through the review form, so the business dashboard has data on a machine with no Groq key |
@@ -1127,7 +1140,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-1045 tests, no network and no database required — they cover the Stage A
+1049 tests, no network and no database required — they cover the Stage A
 rule branches (e1RM, plateau detection, the program-stagnation rollup, every
 increase/hold/deload branch, pain safeguard on and off, the escalation
 threshold), `pipeline.py`'s confidence heuristic, fuzzy matching, timestamp
