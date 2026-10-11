@@ -4,6 +4,12 @@ services:
     name: gym-tracker
     runtime: python
     plan: free
+    # Deploy a commit only once its GitHub checks (the CI workflow) have
+    # passed, instead of on every push. Render counts success, neutral and
+    # skipped as passing, and skips a commit with a failed check or no checks
+    # at all. Applies when this service is managed by this Blueprint; a
+    # service created by hand has the same switch under Settings, Auto-Deploy.
+    autoDeployTrigger: checksPass
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /healthz

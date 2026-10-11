@@ -60,6 +60,10 @@ about a minute. The script:
     [OK]   8 Kibana saved searches                8 found
 ```
 
+The same command runs on a clean GitHub machine for every change to the stack
+(the **Stack** workflow in GitHub Actions). If its badge at the top of the README
+is green, this exact sequence passed there.
+
 It is safe to run again at any time, for example after stopping and restarting
 the stack. Metric counters live in the app's memory, so they start again at 0
 when the app restarts (Part D of the report explains this). If that has

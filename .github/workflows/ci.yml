@@ -1,12 +1,19 @@
-# Lint, unit tests, database tests and the observability configuration.
+# Lint, tests, the observability configuration, and delivery of the Docker image.
 #
-# Needs no secrets, so it runs the same on pull requests from forks. Vercel and
-# Render deploy through their own GitHub integrations, not from this workflow.
+# Needs no secrets: pull requests, forks included, run every check and build
+# the image without pushing it. Pushes to main and v* tags also publish the
+# image to ghcr.io with the run's own GITHUB_TOKEN, and a v* tag gets a GitHub
+# Release. Vercel deploys through its own GitHub integration, and Render
+# (render.yaml, autoDeployTrigger: checksPass) deploys a commit once its checks
+# pass; neither is deployed from this workflow. The full docker compose stack
+# is started by the separate "Stack" workflow.
 name: CI
 
 on:
   push:
     branches: [main]
+    # Release tags: tested like main before anything is published.
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -35,7 +42,7 @@ env:
 
 jobs:
   lint:
-    name: Lint (ruff, compileall, shellcheck, actionlint)
+    name: Lint (ruff, compileall, shellcheck, actionlint, zizmor)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -50,14 +57,16 @@ jobs:
           python-version: "3.11"
 
       # ruff and shellcheck are pinned in requirements-dev.txt so a local run
-      # matches CI. actionlint-py is pinned here only: it fetches the actionlint
-      # binary from GitHub at install time, which a developer's
-      # `pip install -r requirements-dev.txt` should not have to do.
+      # matches CI. actionlint-py and zizmor are pinned in their own file:
+      # actionlint-py fetches the actionlint binary from GitHub at install time,
+      # which a developer's `pip install -r requirements-dev.txt` should not have
+      # to do, and a requirements file (unlike a pin in this workflow) is one
+      # Dependabot keeps up to date.
       - name: Install linters
         id: install
         run: |
           grep -E '^(ruff|shellcheck-py)==' requirements-dev.txt | xargs python -m pip install
-          python -m pip install actionlint-py==1.7.12.25
+          python -m pip install -r .github/requirements-workflow-lint.txt
 
       # The steps after install run even when an earlier linter failed, so one
       # run reports every problem rather than only the first.
@@ -82,6 +91,14 @@ jobs:
         if: ${{ !cancelled() && steps.install.conclusion == 'success' }}
         run: actionlint -color
 
+      # Security audit of the workflows and dependabot.yml: script injection,
+      # dangerous triggers (pull_request_target), excessive permissions,
+      # unpinned actions, checkout credentials left in .git/config. --offline
+      # needs no token, so it gives the same result on a fork's pull request.
+      - name: Workflow security (zizmor)
+        if: ${{ !cancelled() && steps.install.conclusion == 'success' }}
+        run: zizmor --offline --format=github .
+
   unit-tests:
     name: Unit tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -97,13 +114,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # No pip cache: this workflow also publishes images and releases, and a
+      # cache restored into a release run is a poisoning risk (zizmor's
+      # cache-poisoning audit). The pinned wheels install in well under a minute.
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
 
       - name: Install dependencies
         run: |
@@ -167,10 +183,6 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
 
       - name: Install dependencies
         run: python -m pip install -r requirements-dev.txt
@@ -317,3 +329,325 @@ jobs:
             -v "$PWD/observability/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro" \
             -v "$PWD/observability/elasticsearch/ilm-policy.json:/usr/share/filebeat/ilm-policy.json:ro" \
             "$image" filebeat test config -e --strict.perms=false
+
+  # ------------------------------------------------------------------------
+  # Delivery. Everything below is part of the same CI workflow on purpose:
+  # `needs:` guarantees the image is built from the commit the tests just
+  # passed on, in the same run, with the run's own ref and sha. A separate
+  # workflow on `workflow_run` would run in the default branch's context, so
+  # metadata-action tags and the provenance attestation would describe the
+  # newest main commit rather than the one that was tested.
+  # ------------------------------------------------------------------------
+
+  # Every event, pull requests included: the Dockerfile must lint clean, build,
+  # and produce a container that becomes healthy with no database. Needs no
+  # secrets and pushes nothing, so it runs the same on pull requests from forks.
+  docker-image:
+    name: Docker image (lint, build, smoke test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # BuildKit's Dockerfile checks. `call: check` fails the step on any
+      # warning; the Dockerfile has none today.
+      - name: Dockerfile checks
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          call: check
+
+      # linux/amd64 only, loaded into the runner's Docker for the smoke test.
+      # The layer cache it writes is read back by publish-image. ignore-error:
+      # a cache service hiccup costs speed, never a red build.
+      - name: Build (linux/amd64)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: gym-tracker:ci
+          build-args: |
+            APP_VERSION=ci
+            GIT_COMMIT=${{ github.sha }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=image-amd64
+          cache-to: type=gha,mode=max,scope=image-amd64,ignore-error=true
+
+      - name: Smoke test (healthy without a database, non-root, no leaked files)
+        run: bash .github/scripts/smoke_image.sh gym-tracker:ci linux/amd64
+
+  # Pushes to main and v* tags only, once lint, the tests and docker-image pass.
+  #
+  #   main      ghcr.io/<owner>/gym-tracker:main, :latest, :sha-<short>
+  #   v1.2.3    :1.2.3, :1.2, :1     (no :1 for 0.x; pre-releases get only
+  #                                   their full version)
+  #
+  # `latest` follows main, never a tag, so pushing an old tag cannot move it
+  # backwards. Main runs never overlap (the workflow's concurrency group queues
+  # them), so `latest` and `main` only ever move forward. GitHub keeps one
+  # queued run per group, so after a burst of pushes an intermediate commit
+  # may get no run, and no image, of its own.
+  #
+  # Order: push by digest (no tags yet) -> smoke-test that exact digest on both
+  # platforms -> attest it -> only then point the tags at it. A broken image
+  # never becomes :latest or a version tag.
+  publish-image:
+    name: Publish image to GHCR (linux/amd64 + linux/arm64)
+    # Every check in this workflow, so nothing is published from a commit
+    # that failed any of them.
+    needs: [lint, unit-tests, postgres-tests, observability-config, docker-image]
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read # checkout
+      packages: write # push to ghcr.io with GITHUB_TOKEN
+      id-token: write # Sigstore signing certificate for the attestation
+      attestations: write # store the attestation
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+      digest: ${{ steps.build.outputs.digest }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Registry names must be lower case, and the repository is "Gym-tracker".
+      # Derived rather than hard-coded so a fork publishes to its own namespace.
+      - name: Image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      # Every pinned dependency ships a manylinux aarch64 wheel for CPython
+      # 3.11, so the arm64 half compiles nothing under emulation; it only
+      # installs wheels. That is what keeps QEMU affordable here.
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags, labels and annotations
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          # Multi-arch images are an index; GHCR reads the description and
+          # source from the index, so annotate both levels.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=sha,enable=${{ github.ref_type == 'branch' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+
+      # APP_VERSION and GIT_COMMIT become gym_build_info{version,commit} and
+      # the service.version log field (see the Dockerfile's ARG lines).
+      # provenance=max and sbom add BuildKit's SLSA provenance and SPDX SBOM to
+      # the index; they show up as "unknown/unknown" platform entries, the same
+      # as on the official python images.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.image.outputs.name }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.version }}
+            GIT_COMMIT=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+          cache-from: |
+            type=gha,scope=image-amd64
+            type=gha,scope=image-multiarch
+          cache-to: type=gha,mode=max,scope=image-multiarch,ignore-error=true
+
+      - name: Smoke test the pushed digest (linux/amd64)
+        env:
+          REF: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+        run: bash .github/scripts/smoke_image.sh "$REF" linux/amd64
+
+      # The same checks under QEMU: proves the arm64 variant starts, imports
+      # its compiled wheels and answers /healthz, not merely that it was built.
+      # Emulated Python is several times slower, so the image's 3s probe
+      # timeout and 20s start period are relaxed for this run only; the probe
+      # command itself is the image's own.
+      - name: Smoke test the pushed digest (linux/arm64, emulated)
+        env:
+          REF: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+          SMOKE_TIMEOUT: "300"
+          SMOKE_RUN_ARGS: --health-timeout=30s --health-start-period=240s --health-interval=5s
+        run: bash .github/scripts/smoke_image.sh "$REF" linux/arm64
+
+      # GitHub-signed SLSA provenance (Sigstore), stored by GitHub and pushed
+      # next to the image. Verify with:
+      #   gh attestation verify oci://ghcr.io/<owner>/gym-tracker:latest --repo <owner>/Gym-tracker
+      # Storage records only exist for organization-owned repositories.
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      # Re-points the tags at the tested digest without rebuilding. With a
+      # single index as the source, imagetools copies it unchanged, so every
+      # tag resolves to exactly the digest that was smoke-tested and attested;
+      # the loop below fails the job if one does not.
+      - name: Tag the tested digest
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          METADATA_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          mapfile -t tag_args < <(jq -r '.tags[] | "--tag=" + .' <<<"$METADATA_JSON")
+          if [ "${#tag_args[@]}" -eq 0 ]; then
+            echo "::error::metadata-action produced no tags"
+            exit 1
+          fi
+          docker buildx imagetools create "${tag_args[@]}" "${IMAGE}@${DIGEST}"
+          for tag in $(jq -r '.tags[]' <<<"$METADATA_JSON"); do
+            got="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$tag" | jq -r .digest)"
+            if [ "$got" != "$DIGEST" ]; then
+              echo "::error::$tag resolves to $got, expected $DIGEST"
+              exit 1
+            fi
+            echo "$tag -> $got"
+          done
+
+      # A package's first push from Actions may leave it private, and only the
+      # owner can change that (Package settings -> Change visibility), not
+      # GITHUB_TOKEN. Warn rather than fail: the image is still published.
+      - name: Can it be pulled anonymously?
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          repo="${IMAGE#ghcr.io/}"
+          token="$(curl -fsS -m 20 "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -r '.token // empty')" || token=""
+          code=000
+          if [ -n "$token" ]; then
+            code="$(curl -sS -m 20 -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${token}" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json' \
+              "https://ghcr.io/v2/${repo}/manifests/${DIGEST}")" || code=000
+          fi
+          if [ "$code" = 200 ]; then
+            echo "Anonymous pull works: ${IMAGE} is public."
+          else
+            echo "::warning title=GHCR package is not public::Anonymous pull of ${IMAGE} failed (HTTP ${code}). To let anyone pull it without logging in, open https://github.com/${GITHUB_REPOSITORY_OWNER}?tab=packages, choose gym-tracker, Package settings, Change visibility, Public."
+          fi
+
+      - name: Job summary
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          METADATA_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          {
+            echo "### Container image"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image | \`${IMAGE}\` |"
+            echo "| Digest | \`${DIGEST}\` |"
+            echo "| Tags | $(jq -r '.tags | map(sub(".*:"; "") | "`" + . + "`") | join(", ")' <<<"$METADATA_JSON") |"
+            echo "| Platforms | linux/amd64, linux/arm64 |"
+            echo
+            echo '```sh'
+            echo "docker pull ${IMAGE}@${DIGEST}"
+            echo "gh attestation verify oci://${IMAGE}@${DIGEST} --repo ${GITHUB_REPOSITORY}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # v* tags only, after the image is published, so the notes can name it.
+  # GitHub writes the change list (merged PRs since the previous tag); the
+  # image block is prepended to it.
+  release:
+    name: GitHub Release
+    needs: publish-image
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write # create the release
+    steps:
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          IMAGE: ${{ needs.publish-image.outputs.image }}
+          DIGEST: ${{ needs.publish-image.outputs.digest }}
+          VERSION: ${{ needs.publish-image.outputs.version }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::Release $TAG already exists (re-run?); leaving it unchanged."
+            exit 0
+          fi
+          # v1.2.3-rc.1 and the like: mark as pre-release, never as Latest.
+          extra=()
+          case "$TAG" in
+            *-*) extra=(--prerelease --latest=false) ;;
+          esac
+          {
+            echo "## Container image"
+            echo
+            echo '```sh'
+            echo "docker pull ${IMAGE}:${VERSION}"
+            echo '```'
+            echo
+            echo "Platforms: linux/amd64, linux/arm64. Digest: \`${DIGEST}\`"
+            echo
+            echo "Verify the build provenance:"
+            echo
+            echo '```sh'
+            echo "gh attestation verify oci://${IMAGE}@${DIGEST} --repo ${GITHUB_REPOSITORY}"
+            echo '```'
+            echo
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --generate-notes --notes-file "$RUNNER_TEMP/notes.md" "${extra[@]}"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url --jq .url
+
+  # One stable check name for branch protection. Requiring this job instead of
+  # each job above means renaming a job or adding a Python version to the matrix
+  # never leaves a required check that no longer reports. It needs `always()`:
+  # without it, this job is *skipped* when a job it needs fails, and branch
+  # protection counts a skipped check as passing. publish-image and release are
+  # left out: they are skipped on every pull request by design.
+  ci-result:
+    name: CI result
+    if: ${{ always() }}
+    needs: [lint, unit-tests, postgres-tests, observability-config, docker-image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Every job succeeded
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$RESULTS"
+          jq -e 'all(.[]; .result == "success")' <<< "$RESULTS" > /dev/null

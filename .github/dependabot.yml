@@ -1,0 +1,126 @@
+# Dependabot version updates.
+#
+# Every update arrives as a pull request, so CI tests each bump before anyone
+# merges it. Dependabot's pull requests run with a read-only token and no
+# secrets, and CI needs neither, so they get the same checks as any other PR.
+#
+# Security updates (PRs for dependencies with a published advisory) are turned
+# on separately: Settings > Code security > Dependabot security updates. They
+# skip the cooldown below and arrive as soon as an advisory is published.
+#
+# Monthly checks (weekly for nothing): this is a student project, and a stream
+# of bump PRs would only bury the ones that matter.
+#
+# cooldown: wait a week after a release before proposing it. Releases that turn
+# out to be broken or malicious are usually yanked within days, and nothing here
+# needs a new version on day one.
+version: 2
+
+updates:
+  # requirements.txt and requirements-dev.txt (which includes the first), plus
+  # .github/requirements-workflow-lint.txt (actionlint-py, zizmor). All are
+  # pinned exactly on purpose (see the comment in requirements.txt), so every
+  # version change is a PR that CI has tested.
+  - package-ecosystem: pip
+    directories:
+      - /
+      - /.github
+    schedule:
+      interval: monthly
+      time: "06:00"
+      timezone: Asia/Karachi
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+    groups:
+      # Test and lint tools change no runtime behaviour, so they share one PR.
+      # A new ruff minor release can add findings in the rule families ruff.toml
+      # selects; the lint job shows them in this PR.
+      dev-tools:
+        patterns:
+          - pytest
+          - pytest-*
+          - anyio
+          - httpx
+          - ruff
+          - shellcheck-py
+          - actionlint-py
+          - zizmor
+        update-types: [minor, patch]
+      # Patch releases of the runtime dependencies, together in one PR.
+      # Minor and major releases are not grouped: each gets its own PR, so when
+      # one breaks something (SQLAlchemy 2.1 changed the default Postgres
+      # driver) the failing PR names the culprit.
+      runtime-patches:
+        patterns: ["*"]
+        update-types: [patch]
+
+  # Actions used by .github/workflows. They are pinned to full commit SHAs with
+  # the version in a trailing comment; Dependabot updates both.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+      time: "06:00"
+      timezone: Asia/Karachi
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # Dockerfile (FROM python:3.11-slim). 3.11 is deliberate: it is the oldest
+  # Python the app supports, and the lint job byte-compiles every file on it.
+  # Moving the image to a newer Python is a decision, not a routine bump, so
+  # minor/major Python versions are ignored here. With the floating 3.11-slim
+  # tag there is then nothing left to bump; if the FROM line is ever pinned to
+  # an exact tag (python:3.11.N-slim) or a digest, this entry starts proposing
+  # the patch and digest refreshes.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly
+      time: "06:00"
+      timezone: Asia/Karachi
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: docker
+    ignore:
+      - dependency-name: python
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+
+  # docker-compose.yml: the observability lab (postgres, prometheus,
+  # node-exporter, grafana, elasticsearch, kibana, filebeat).
+  # One monthly PR for all of them, because Elasticsearch, Kibana and Filebeat
+  # must stay on the same version. Major versions are ignored: a new Postgres
+  # major cannot open the existing data volume, and Prometheus 3, Grafana 12 and
+  # Elastic 9 are breaking releases (removed flags and settings, changed
+  # defaults) to try out by hand against the lab, not routine bumps.
+  # A Prometheus bump also has to update PROMETHEUS_VERSION/PROMETHEUS_SHA256 in
+  # .github/workflows/ci.yml; CI fails with a message saying so until it does.
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: monthly
+      time: "06:00"
+      timezone: Asia/Karachi
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: stack
+    groups:
+      observability-stack:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: "*"
+        update-types: [version-update:semver-major]

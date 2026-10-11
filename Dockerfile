@@ -33,6 +33,16 @@ COPY . .
 RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /app
 USER appuser
 
+# Build identity: gym_build_info{version,commit} and the service.version field
+# on every log line read these. CI passes both when it publishes the image to
+# GHCR; a plain `docker build` keeps the defaults the code already falls back
+# to, and docker-compose.yml still overrides APP_VERSION at run time. Declared
+# this late so a new commit never invalidates the dependency or COPY layers.
+ARG APP_VERSION=dev
+ARG GIT_COMMIT=unknown
+ENV APP_VERSION=${APP_VERSION} \
+    GIT_COMMIT=${GIT_COMMIT}
+
 EXPOSE 8000
 
 # urlopen raises on a refused connection, a timeout or any non-2xx status, so
