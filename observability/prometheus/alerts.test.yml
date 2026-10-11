@@ -1,0 +1,362 @@
+# Unit tests for the alerting rules in alerts.yml.
+#
+# Run from the repository root with either of:
+#
+#   promtool test rules observability/prometheus/alerts.test.yml
+#
+#   docker run --rm -v "$PWD/observability/prometheus:/etc/prometheus:ro" \
+#     --entrypoint promtool prom/prometheus:v2.54.1 \
+#     test rules /etc/prometheus/alerts.test.yml
+#
+# CI runs the first form on every push and pull request.
+#
+# Each test feeds synthetic series into Prometheus's rule engine and checks
+# which alerts are FIRING at a given time. Pending alerts (condition true but
+# `for:` not yet satisfied) count as "no alert", which is how the tests pin down
+# each rule's `for:` duration as well as its threshold.
+#
+# The series carry the same labels Prometheus attaches when scraping this stack
+# (job, instance and the `service` label from prometheus.yml), so the expected
+# alert labels below are the ones a real alert would carry.
+#
+# rule_files is resolved relative to THIS file's directory, not the working
+# directory, so the same file works locally, in Docker and in CI.
+#
+# Series notation: 'a+bxN' is a, a+b, ..., a+N*b (N+1 samples); 'axN' is a
+# repeated N+1 times. One sample per `interval`.
+
+rule_files:
+  - alerts.yml
+
+# Matches global.evaluation_interval in prometheus.yml.
+evaluation_interval: 15s
+
+tests:
+
+  # --------------------------------------------------------------------------
+  # TargetDown
+  # --------------------------------------------------------------------------
+
+  # The app stops answering at t=1m. `for: 1m` means it is pending, not firing,
+  # until it has been down for a full minute.
+  - name: TargetDown fires once gym-tracker has been down for more than 1m
+    interval: 15s
+    input_series:
+      - series: 'up{job="gym-tracker", instance="app:8000", service="gym-tracker"}'
+        values: '1x3 0x20'
+    alert_rule_test:
+      - eval_time: 1m45s
+        alertname: TargetDown
+        exp_alerts: []
+      - eval_time: 2m15s
+        alertname: TargetDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: gym-tracker
+              instance: app:8000
+              service: gym-tracker
+            exp_annotations:
+              summary: "gym-tracker target is down"
+              description: "Prometheus cannot scrape app:8000 (gym-tracker)."
+
+  # The cardinality demo only runs under the "experiment" compose profile, so
+  # on a healthy default stack its target is down permanently. It must never
+  # raise TargetDown.
+  - name: TargetDown ignores the cardinality-demo target on a healthy stack
+    interval: 15s
+    input_series:
+      - series: 'up{job="cardinality-demo", instance="cardinality-demo:8001", service="cardinality-demo"}'
+        values: '0x60'
+      - series: 'up{job="gym-tracker", instance="app:8000", service="gym-tracker"}'
+        values: '1x60'
+      - series: 'up{job="prometheus", instance="localhost:9090", service="prometheus"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: TargetDown
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: TargetDown
+        exp_alerts: []
+
+  # The exclusion is for that one job only: any other target that goes down
+  # still alerts, even while the cardinality demo is down beside it.
+  - name: TargetDown still fires for other jobs while cardinality-demo is down
+    interval: 15s
+    input_series:
+      - series: 'up{job="cardinality-demo", instance="cardinality-demo:8001", service="cardinality-demo"}'
+        values: '0x20'
+      - series: 'up{job="node-exporter", instance="172.28.77.1:9100", service="node-exporter", machine="docker-host"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TargetDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: node-exporter
+              instance: 172.28.77.1:9100
+              service: node-exporter
+              machine: docker-host
+            exp_annotations:
+              summary: "node-exporter target is down"
+              description: "Prometheus cannot scrape 172.28.77.1:9100 (node-exporter)."
+
+  # --------------------------------------------------------------------------
+  # HighErrorRate
+  # --------------------------------------------------------------------------
+
+  # 1 request in 11 is a 500: about 9.1%, above the 5% threshold. rate() needs
+  # two samples, so the condition first holds at t=15s and `for: 2m` makes the
+  # alert fire from t=2m15s.
+  - name: HighErrorRate fires when more than 5% of responses are 5xx
+    interval: 15s
+    input_series:
+      - series: 'gym_http_requests_total{job="gym-tracker", instance="app:8000", service="gym-tracker", method="POST", route="/log", status="200"}'
+        values: '0+10x40'
+      - series: 'gym_http_requests_total{job="gym-tracker", instance="app:8000", service="gym-tracker", method="POST", route="/log", status="500"}'
+        values: '0+1x40'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: HighErrorRate
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: HighErrorRate
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "More than 5% of requests are failing"
+              description: "5xx rate is 9.091% over the last 5 minutes."
+
+  # 2% server errors, and a flood of 404s. Only 5xx count as failures.
+  - name: HighErrorRate stays quiet below 5% and ignores 4xx
+    interval: 15s
+    input_series:
+      - series: 'gym_http_requests_total{job="gym-tracker", instance="app:8000", service="gym-tracker", method="GET", route="/dashboard", status="200"}'
+        values: '0+49x40'
+      - series: 'gym_http_requests_total{job="gym-tracker", instance="app:8000", service="gym-tracker", method="GET", route="/dashboard", status="500"}'
+        values: '0+1x40'
+      - series: 'gym_http_requests_total{job="gym-tracker", instance="app:8000", service="gym-tracker", method="GET", route="/missing", status="404"}'
+        values: '0+50x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: HighErrorRate
+        exp_alerts: []
+
+  # --------------------------------------------------------------------------
+  # SlowRequests
+  # --------------------------------------------------------------------------
+
+  # Every POST /log lands in the (1s, 2.5s] bucket, so its p95 is interpolated
+  # to 1 + 1.5 * 0.95 = 2.425s. GET /dashboard stays under 0.5s. The alert is
+  # per route, so only /log fires.
+  - name: SlowRequests fires when p95 latency on a route is above 1s for 2m
+    interval: 15s
+    input_series:
+      - series: 'gym_http_request_duration_seconds_bucket{job="gym-tracker", instance="app:8000", service="gym-tracker", method="POST", route="/log", le="0.5"}'
+        values: '0x40'
+      - series: 'gym_http_request_duration_seconds_bucket{job="gym-tracker", instance="app:8000", service="gym-tracker", method="POST", route="/log", le="1.0"}'
+        values: '0x40'
+      - series: 'gym_http_request_duration_seconds_bucket{job="gym-tracker", instance="app:8000", service="gym-tracker", method="POST", route="/log", le="2.5"}'
+        values: '0+4x40'
+      - series: 'gym_http_request_duration_seconds_bucket{job="gym-tracker", instance="app:8000", service="gym-tracker", method="POST", route="/log", le="+Inf"}'
+        values: '0+4x40'
+      - series: 'gym_http_request_duration_seconds_bucket{job="gym-tracker", instance="app:8000", service="gym-tracker", method="GET", route="/dashboard", le="0.5"}'
+        values: '0+4x40'
+      - series: 'gym_http_request_duration_seconds_bucket{job="gym-tracker", instance="app:8000", service="gym-tracker", method="GET", route="/dashboard", le="1.0"}'
+        values: '0+4x40'
+      - series: 'gym_http_request_duration_seconds_bucket{job="gym-tracker", instance="app:8000", service="gym-tracker", method="GET", route="/dashboard", le="2.5"}'
+        values: '0+4x40'
+      - series: 'gym_http_request_duration_seconds_bucket{job="gym-tracker", instance="app:8000", service="gym-tracker", method="GET", route="/dashboard", le="+Inf"}'
+        values: '0+4x40'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: SlowRequests
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: SlowRequests
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              route: /log
+            exp_annotations:
+              summary: "p95 latency above 1s on /log"
+              description: "95th percentile is 2.425s over 5 minutes."
+
+  # --------------------------------------------------------------------------
+  # SlowExtraction
+  # --------------------------------------------------------------------------
+
+  # Half the extractions take 8-13s and half 13-21s, 20 a second in all. The
+  # 95th of every 100 falls in the (13s, 21s] bucket, nine-tenths of the way
+  # through it: p95 = 13 + 8 * 0.9 = 20.2s, above 15s. The rates are chosen so
+  # the arithmetic is exact and the annotation text is stable.
+  - name: SlowExtraction fires when LLM p95 is above 15s for 5m
+    interval: 15s
+    input_series:
+      - series: 'gym_llm_extraction_duration_seconds_bucket{job="gym-tracker", instance="app:8000", service="gym-tracker", le="8.0"}'
+        values: '0x40'
+      - series: 'gym_llm_extraction_duration_seconds_bucket{job="gym-tracker", instance="app:8000", service="gym-tracker", le="13.0"}'
+        values: '0+150x40'
+      - series: 'gym_llm_extraction_duration_seconds_bucket{job="gym-tracker", instance="app:8000", service="gym-tracker", le="21.0"}'
+        values: '0+300x40'
+      - series: 'gym_llm_extraction_duration_seconds_bucket{job="gym-tracker", instance="app:8000", service="gym-tracker", le="+Inf"}'
+        values: '0+300x40'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SlowExtraction
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: SlowExtraction
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Groq extraction p95 above 15s"
+              description: "Parsing an entry is taking 20.2s at p95."
+
+  # --------------------------------------------------------------------------
+  # SavesFailingReview
+  # --------------------------------------------------------------------------
+
+  # Three blocked saves for every successful one: 75% blocked, above 50%.
+  # The counters start at 0 because the app pre-creates every outcome label.
+  - name: SavesFailingReview fires when most saves are blocked for 10m
+    interval: 15s
+    input_series:
+      - series: 'gym_workout_entries_total{job="gym-tracker", instance="app:8000", service="gym-tracker", outcome="blocked"}'
+        values: '0+3x60'
+      - series: 'gym_workout_entries_total{job="gym-tracker", instance="app:8000", service="gym-tracker", outcome="saved"}'
+        values: '0+1x60'
+      - series: 'gym_workout_entries_total{job="gym-tracker", instance="app:8000", service="gym-tracker", outcome="duplicate_held"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SavesFailingReview
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: SavesFailingReview
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Most save attempts are being blocked by the review form"
+              description: "75% of entries are failing validation. Extraction quality may have regressed."
+
+  # --------------------------------------------------------------------------
+  # FaultInjectionActive
+  # --------------------------------------------------------------------------
+
+  # Latency faults are injected from t=1m15s to t=6m15s, then stop. The alert
+  # fires a minute after the first one and clears once the 5m increase() window
+  # no longer contains any of them. The "error" kind never moves.
+  - name: FaultInjectionActive fires while gym_faults_injected_total is increasing
+    interval: 15s
+    input_series:
+      - series: 'gym_faults_injected_total{job="gym-tracker", instance="app:8000", service="gym-tracker", kind="latency"}'
+        values: '0x4 1+1x20 21x40'
+      - series: 'gym_faults_injected_total{job="gym-tracker", instance="app:8000", service="gym-tracker", kind="error"}'
+        values: '0x66'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: FaultInjectionActive
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: FaultInjectionActive
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: FaultInjectionActive
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: gym-tracker
+              instance: app:8000
+              service: gym-tracker
+              kind: latency
+            exp_annotations:
+              summary: "Fault injection is ACTIVE (latency)"
+              description: "This process is deliberately degraded. Unset FAULT_INJECTION_ENABLED and restart the app to clear it."
+      - eval_time: 12m
+        alertname: FaultInjectionActive
+        exp_alerts: []
+
+  # --------------------------------------------------------------------------
+  # HostLowDisk
+  # --------------------------------------------------------------------------
+
+  # /var/lib (the data disk on Docker Desktop's WSL2 VM) has 5% free and fires
+  # after `for: 5m`. / sits at exactly 10% free, which is not below 10%. /boot
+  # is nearly full but is not a mountpoint the rule watches.
+  - name: HostLowDisk fires below 10% free on /var/lib, and only on watched mountpoints
+    interval: 15s
+    input_series:
+      - series: 'node_filesystem_avail_bytes{job="node-exporter", instance="172.28.77.1:9100", service="node-exporter", machine="docker-host", device="/dev/sdd", fstype="ext4", mountpoint="/var/lib"}'
+        values: '5e9x40'
+      - series: 'node_filesystem_size_bytes{job="node-exporter", instance="172.28.77.1:9100", service="node-exporter", machine="docker-host", device="/dev/sdd", fstype="ext4", mountpoint="/var/lib"}'
+        values: '100e9x40'
+      - series: 'node_filesystem_avail_bytes{job="node-exporter", instance="172.28.77.1:9100", service="node-exporter", machine="docker-host", device="/dev/sda2", fstype="ext4", mountpoint="/"}'
+        values: '10e9x40'
+      - series: 'node_filesystem_size_bytes{job="node-exporter", instance="172.28.77.1:9100", service="node-exporter", machine="docker-host", device="/dev/sda2", fstype="ext4", mountpoint="/"}'
+        values: '100e9x40'
+      - series: 'node_filesystem_avail_bytes{job="node-exporter", instance="172.28.77.1:9100", service="node-exporter", machine="docker-host", device="/dev/sda1", fstype="vfat", mountpoint="/boot"}'
+        values: '1e6x40'
+      - series: 'node_filesystem_size_bytes{job="node-exporter", instance="172.28.77.1:9100", service="node-exporter", machine="docker-host", device="/dev/sda1", fstype="vfat", mountpoint="/boot"}'
+        values: '100e6x40'
+    alert_rule_test:
+      - eval_time: 4m45s
+        alertname: HostLowDisk
+        exp_alerts: []
+      - eval_time: 5m30s
+        alertname: HostLowDisk
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: node-exporter
+              instance: 172.28.77.1:9100
+              service: node-exporter
+              machine: docker-host
+              device: /dev/sdd
+              fstype: ext4
+              mountpoint: /var/lib
+            exp_annotations:
+              summary: "Less than 10% disk free on 172.28.77.1:9100"
+              description: "Elasticsearch stops accepting writes at its own flood-stage watermark, so a full disk silently ends log ingestion."
+
+  # --------------------------------------------------------------------------
+  # HostHighCpu
+  # --------------------------------------------------------------------------
+
+  # Each core is idle 0.05s per second: 95% busy, above 90%, for over 10m.
+  - name: HostHighCpu fires when the host is over 90% busy for 10m
+    interval: 15s
+    input_series:
+      - series: 'node_cpu_seconds_total{job="node-exporter", instance="172.28.77.1:9100", service="node-exporter", machine="docker-host", cpu="0", mode="idle"}'
+        values: '0+0.75x60'
+      - series: 'node_cpu_seconds_total{job="node-exporter", instance="172.28.77.1:9100", service="node-exporter", machine="docker-host", cpu="1", mode="idle"}'
+        values: '0+0.75x60'
+      - series: 'node_cpu_seconds_total{job="node-exporter", instance="172.28.77.1:9100", service="node-exporter", machine="docker-host", cpu="0", mode="user"}'
+        values: '0+14.25x60'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: HostHighCpu
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: HostHighCpu
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Host CPU above 90% for 10 minutes"
+
+  # Half idle: 50% busy, nowhere near the threshold.
+  - name: HostHighCpu stays quiet at 50% CPU
+    interval: 15s
+    input_series:
+      - series: 'node_cpu_seconds_total{job="node-exporter", instance="172.28.77.1:9100", service="node-exporter", machine="docker-host", cpu="0", mode="idle"}'
+        values: '0+7.5x60'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HostHighCpu
+        exp_alerts: []

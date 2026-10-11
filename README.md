@@ -1,5 +1,8 @@
 # Gym Tracker
 
+[![CI](https://github.com/sohaibm05/Gym-tracker/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sohaibm05/Gym-tracker/actions/workflows/ci.yml)
+[![Stack](https://github.com/sohaibm05/Gym-tracker/actions/workflows/stack.yml/badge.svg?branch=main)](https://github.com/sohaibm05/Gym-tracker/actions/workflows/stack.yml)
+
 Turns messy free-text gym journal entries into structured Postgres rows, and
 generates a weekly progress report on top of them.
 
@@ -55,6 +58,44 @@ is **[docs/Assignment report 2.docx](docs/Assignment%20report%202.docx)**.
 Note that the compose stack is a **local lab**: Elasticsearch runs without
 authentication and Grafana with a default password, both of which would be wrong
 on a shared network.
+
+## CI/CD
+
+GitHub Actions checks every pull request and every push to `main`. No secrets
+are needed for any of it.
+
+| Workflow | When | What it does |
+|---|---|---|
+| **CI** (`.github/workflows/ci.yml`) | Every PR, push to `main`, `v*` tag | Lint: ruff with defect rules only, byte-compile on 3.11, ShellCheck, actionlint, zizmor. Unit tests on Python 3.11–3.14. The full suite against Postgres 16 with `schema.sql` applied, plus `migrations/verify.sql` and a check that re-running the migrations changes nothing. Observability config: promtool, alert unit tests, dashboard and Kibana checks, compose and Filebeat validation. Builds and smoke-tests the app image. |
+| **Stack** (`.github/workflows/stack.yml`) | PRs and pushes that touch the stack, weekly, on demand | Runs `python scripts/quickstart.py` on a clean runner: the whole 8-service lab, as in [HOW_TO_RUN.md](HOW_TO_RUN.md). Weekly, on demand, and for PRs that change the experiment code or what the app is built from, it also runs shortened Part E1 and E2 and checks their numbers through Prometheus. |
+| **Post-deploy smoke test** | Each Vercel production deploy | Checks that the live site's `/healthz` answers `{"status":"ok"}`. |
+
+The container image and Render wait for CI on the same commit; Vercel does not:
+
+- **Container image.** Pushes to `main` publish `ghcr.io/sohaibm05/gym-tracker`
+  for linux/amd64 and linux/arm64, tagged `latest`, `main` and `sha-<short commit>`,
+  with build provenance attached. A tag like `v1.2.3` also publishes `1.2.3`,
+  `1.2` and `1`, and creates a GitHub Release. Each image is smoke-tested before
+  any tag points at it.
+- **Render** deploys a commit once every check on it passes, Stack and the
+  post-deploy smoke test included (`autoDeployTrigger: checksPass` in
+  `render.yaml`). That applies when the service was created as a Blueprint
+  from `render.yaml`; a service created by hand in the dashboard ignores the
+  file, so set *Settings → Auto-Deploy* to *After CI checks pass* there.
+- **Vercel** deploys every push to `main` through its own GitHub integration,
+  whether or not CI has passed; the post-deploy smoke test checks the live
+  site afterwards.
+- **Dependabot** proposes dependency, action and image updates once a month,
+  each as a PR that CI tests.
+
+One-time settings for the repository owner, all optional:
+
+- Make the GHCR package public: *Packages → gym-tracker → Package settings →
+  Change visibility*. Until then, pulling the image needs a login.
+- Require the **CI result** check in branch protection. It is a single job that
+  passes only when every CI job passed.
+- Add `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` secrets if the Stack workflow
+  ever hits Docker Hub's anonymous pull limit.
 
 ## Two ways to log
 
@@ -162,6 +203,9 @@ below the confidence threshold is reported rather than saved
 | `observability/results-live/` | The same experiments re-run against the full container stack, with percentiles queried from Prometheus. These are the numbers in the 19 September Part E1 tables |
 | `observability/results-rerun/` | The 21–22 September re-run: Part E1 again (client and server-side), plus the one real request traced through the whole log pipeline and the `gym_sets_written_total` samples behind the metric trace |
 | `HOW_TO_RUN.md` | **Running the stack on your own machine**, step by step, and what to look at for each part of the report |
+| `.github/workflows/` | CI (lint, tests, Postgres, observability config, image build and publish), Stack (the whole lab end to end) and the post-deploy smoke test; see [CI/CD](#cicd) |
+| `observability/prometheus/alerts.test.yml` | promtool unit tests for every alert rule |
+| `scripts/check_observability_config.py` | Static checks of the dashboards, Kibana objects, ILM policy and cross-file paths, run by CI |
 | `scripts/quickstart.py` | One cross-platform command: start the stack, seed demo data, import the Kibana objects, verify every piece |
 | `scripts/stack.sh` | Start, check, load, and safely tear down the stack |
 | `scripts/load_generator.py` | Deterministic, repeatable load for the experiments |

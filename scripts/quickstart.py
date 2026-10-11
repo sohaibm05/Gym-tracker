@@ -21,8 +21,10 @@ What it does, in order:
  6. Imports the Kibana data view and the eight saved searches.
  7. Verifies every piece end to end and prints where to look.
 
-Running it again is safe: the build is cached, the demo data is only seeded
-once, and the Kibana import overwrites in place.
+Running it again is safe: the build is cached, the Kibana import overwrites in
+place, and the demo entries are saved again only when the app has restarted
+since they were saved (its counters start at 0 again, which would leave the
+business dashboard empty). `--check` waits for every service, then verifies.
 """
 
 from __future__ import annotations
@@ -220,6 +222,20 @@ def wait_for_services() -> None:
              "See why with:  docker compose logs " + " ".join(late))
 
 
+def app_counter(name: str) -> float:
+    """An unlabelled counter's current value, read straight from the app's /metrics."""
+    status, body = http_get(f"{APP}/metrics")
+    if status != 200:
+        return 0.0
+    for line in body.decode("utf-8", "replace").splitlines():
+        if line.startswith(name + " "):
+            try:
+                return float(line.split()[1])
+            except (IndexError, ValueError):
+                return 0.0
+    return 0.0
+
+
 def logged_in(username: str, password: str) -> bool:
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
@@ -234,8 +250,16 @@ def logged_in(username: str, password: str) -> bool:
 def seed_demo_data() -> None:
     step(f"Demo account and business data (login: {DEMO_USER} / {DEMO_PASSWORD})")
     if logged_in(DEMO_USER, DEMO_PASSWORD):
-        note("The demo account already exists; its entries were saved on an earlier run.")
-        return
+        if app_counter("gym_sets_written_total") > 0:
+            note("The demo account already exists and this app process has counted its entries.")
+            return
+        # Counters live in the app's memory, so they start again at 0 whenever the
+        # app container restarts (Part D of the report walks through exactly this).
+        # The entries are still in Postgres, but the business dashboard reads the
+        # counters, so it would be empty until something is saved again.
+        note("The demo account exists, but the app has restarted since its entries were saved,")
+        note("so the business counters are back at 0. Saving the entries again to refill the")
+        note("business dashboard (this adds a second copy to the demo account's history).")
     result = subprocess.run(
         [sys.executable, "scripts/submit_reviewed_entries.py",
          "--base-url", APP, "--username", DEMO_USER, "--password", DEMO_PASSWORD, "--signup"],
@@ -342,7 +366,12 @@ def verify() -> bool:
         if float(value) > 0:
             break
         time.sleep(3)
-    record(float(value) > 0, "business metrics recorded", f"gym_sets_written_total = {value}")
+    # A WARN, not a FAIL: the counters restart at 0 with the app, so a stack that
+    # was restarted after seeding is healthy but shows 0 until something is saved.
+    hint = "" if float(value) > 0 else (
+        " (counters restart at 0 with the app; run the quick start again to re-seed)")
+    record(float(value) > 0, "business metrics recorded",
+           f"gym_sets_written_total = {value}{hint}", warn_only=True)
 
     found = get_json(f"{GRAFANA}/api/search?type=dash-db", GRAFANA_AUTH) or []
     titles = {d.get("title") for d in found if isinstance(d, dict)}
@@ -399,7 +428,11 @@ def main() -> int:
                         help="seconds of generated traffic (0 to skip; default 60)")
     args = parser.parse_args()
 
-    if not args.check:
+    if args.check:
+        # Right after `docker compose up -d`, Kibana in particular needs a minute
+        # or two; checking before it answers would report a healthy stack as broken.
+        wait_for_services()
+    else:
         preflight()
         start(build=not args.no_build)
         wait_for_services()
