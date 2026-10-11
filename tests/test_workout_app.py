@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 import re
 import sys
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -744,8 +744,6 @@ class TestAgainstPostgres:
     def test_previous_performance_is_one_earlier_session(self, engine):
         """Not "the last N sets" — repeating a workout would splice two
         different days into a Previous column that never happened."""
-        import sqlalchemy as sa
-
         with engine.begin() as conn:
             exercise_id = sessions_module.resolve_exercise(conn, 1, "Squat (Barbell)")
             first = sessions_module.start_session(conn, 1, name="A")
@@ -1062,7 +1060,6 @@ class TestPostgresRegressions:
         whole session after every logged set — so one tap cost a query per lift
         in the routine, on gym wifi.
         """
-        import sqlalchemy as sa
         from sqlalchemy import event
 
         counter = {"n": 0}

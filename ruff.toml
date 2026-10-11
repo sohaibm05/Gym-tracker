@@ -1,0 +1,52 @@
+# Ruff: lint for defects, not for style.
+#
+# With no configuration, ruff 0.17 applies a broad default set (pyupgrade,
+# import order, line length, ...) and reports ~440 findings here, almost all of
+# them style. CI runs this narrower set instead: rules whose findings are code
+# that is wrong or dead, so a red lint job always means something needs fixing.
+# Formatting is deliberately not enforced (no `ruff format --check`).
+#
+# Ruff is pinned in requirements-dev.txt. New ruff releases add rules to the
+# families selected below, so an unpinned ruff can turn CI red on a day nothing
+# in this repository changed.
+
+# The Docker image runs Python 3.11, so syntax that only parses on 3.12+ (PEP 695
+# type parameters, PEP 701 f-strings, ...) is reported as a syntax error.
+target-version = "py311"
+
+[lint]
+select = [
+  "E9",  # syntax errors and unreadable files
+  "F",   # pyflakes: undefined names, unused imports/variables, bad % / format calls, ...
+  "B",   # flake8-bugbear: mutable defaults, loop-variable closures, useless expressions, ...
+  "PLE", # pylint errors: bad __all__, return in __init__, misused await/yield, ...
+]
+ignore = [
+  # `raise X from err` changes exception chaining (__cause__, tracebacks) in
+  # application code; worth doing deliberately, not as a lint fix.
+  "B904",
+  # Adding zip(strict=True) makes a length mismatch raise where it is silently
+  # truncated today -- a behaviour change, not a lint fix.
+  "B905",
+]
+
+[lint.per-file-ignores]
+# `pytest.raises(Exception)` around pydantic validation and one database
+# constraint (6 places). Narrowing them to ValidationError / IntegrityError is a
+# good follow-up; it is not a precondition for running CI.
+"tests/**" = ["B017"]
+
+[lint.flake8-bugbear]
+# FastAPI's parameter markers are designed to be called in argument defaults;
+# without this, B008 reports every Depends()/Form()/Query() (41 in api.py/app.py).
+extend-immutable-calls = [
+  "fastapi.Body",
+  "fastapi.Cookie",
+  "fastapi.Depends",
+  "fastapi.File",
+  "fastapi.Form",
+  "fastapi.Header",
+  "fastapi.Path",
+  "fastapi.Query",
+  "fastapi.Security",
+]

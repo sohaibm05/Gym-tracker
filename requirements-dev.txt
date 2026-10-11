@@ -8,3 +8,8 @@ anyio==4.15.1
 pytest-randomly==5.0.0
 # FastAPI's TestClient is built on httpx.
 httpx==0.28.1
+# Linters. Pinned like everything else: ruff adds rules to the families that
+# ruff.toml selects in minor releases, so an unpinned linter can fail CI on a day
+# nothing in this repository changed. CI's lint job installs only these lines.
+ruff==0.17.0
+shellcheck-py==0.11.0.1
