@@ -67,19 +67,24 @@ are needed for any of it.
 | Workflow | When | What it does |
 |---|---|---|
 | **CI** (`.github/workflows/ci.yml`) | Every PR, push to `main`, `v*` tag | Lint: ruff with defect rules only, byte-compile on 3.11, ShellCheck, actionlint, zizmor. Unit tests on Python 3.11–3.14. The full suite against Postgres 16 with `schema.sql` applied, plus `migrations/verify.sql` and a check that re-running the migrations changes nothing. Observability config: promtool, alert unit tests, dashboard and Kibana checks, compose and Filebeat validation. Builds and smoke-tests the app image. |
-| **Stack** (`.github/workflows/stack.yml`) | PRs and pushes that touch the stack, weekly, on demand | Runs `python scripts/quickstart.py` on a clean runner: the whole 8-service lab, exactly as in [HOW_TO_RUN.md](HOW_TO_RUN.md). On `main`, weekly, and for PRs that change the experiment code, it also runs shortened Part E1 and E2 and checks their numbers through Prometheus. |
+| **Stack** (`.github/workflows/stack.yml`) | PRs and pushes that touch the stack, weekly, on demand | Runs `python scripts/quickstart.py` on a clean runner: the whole 8-service lab, as in [HOW_TO_RUN.md](HOW_TO_RUN.md). Weekly, on demand, and for PRs that change the experiment code or what the app is built from, it also runs shortened Part E1 and E2 and checks their numbers through Prometheus. |
 | **Post-deploy smoke test** | Each Vercel production deploy | Checks that the live site's `/healthz` answers `{"status":"ok"}`. |
 
-Delivery happens only after every CI job has passed on the same commit:
+The container image and Render wait for CI on the same commit; Vercel does not:
 
 - **Container image.** Pushes to `main` publish `ghcr.io/sohaibm05/gym-tracker`
-  for linux/amd64 and linux/arm64, tagged `latest`, `main` and `sha-<commit>`,
+  for linux/amd64 and linux/arm64, tagged `latest`, `main` and `sha-<short commit>`,
   with build provenance attached. A tag like `v1.2.3` also publishes `1.2.3`,
   `1.2` and `1`, and creates a GitHub Release. Each image is smoke-tested before
   any tag points at it.
-- **Render** deploys a commit once its checks pass (`autoDeployTrigger:
-  checksPass` in `render.yaml`).
-- **Vercel** deploys through its own GitHub integration.
+- **Render** deploys a commit once every check on it passes, Stack and the
+  post-deploy smoke test included (`autoDeployTrigger: checksPass` in
+  `render.yaml`). That applies when the service was created as a Blueprint
+  from `render.yaml`; a service created by hand in the dashboard ignores the
+  file, so set *Settings → Auto-Deploy* to *After CI checks pass* there.
+- **Vercel** deploys every push to `main` through its own GitHub integration,
+  whether or not CI has passed; the post-deploy smoke test checks the live
+  site afterwards.
 - **Dependabot** proposes dependency, action and image updates once a month,
   each as a PR that CI tests.
 

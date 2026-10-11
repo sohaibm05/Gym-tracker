@@ -124,3 +124,8 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: [version-update:semver-major]
+      # promtool in CI is downloaded at the same version with a pinned
+      # checksum (PROMETHEUS_VERSION/PROMETHEUS_SHA256 in ci.yml), so a
+      # Prometheus bump is a two-file change made by hand, not a grouped PR
+      # that would fail CI's version check every time.
+      - dependency-name: prom/prometheus

@@ -9,9 +9,11 @@
 #
 # It also runs shortened Part E experiments -- E2 (cardinality, ~2 min) and E1
 # (latency fault with 60 s stages, ~4 min) -- checks their numbers through the
-# Prometheus HTTP API, then re-runs `quickstart.py --check`. That happens on
-# pushes to main, on the weekly schedule, when started by hand, and on pull
-# requests that touch the experiment code itself.
+# Prometheus HTTP API, then re-runs `quickstart.py --check`. That happens on the
+# weekly schedule, when started by hand, and on pull requests that touch the
+# experiment code or what the app is built from. Not on pushes to main: the PR
+# already ran them, and a timing flake there would fail a check on the main
+# commit, which also holds back Render (autoDeployTrigger: checksPass).
 #
 # Needs no secrets. DOCKERHUB_USERNAME + DOCKERHUB_TOKEN are optional: when
 # both secrets exist, images are pulled logged in (higher Docker Hub limit);
@@ -69,8 +71,9 @@ on:
 permissions:
   contents: read
 
-# A new push to a pull request cancels that PR's older run. Runs on main are
-# never cancelled, so every commit on main keeps a result.
+# A new push to a pull request cancels that PR's older run. A running main
+# run is never cancelled; GitHub keeps only one *pending* run per group, so
+# after a burst of pushes an intermediate main commit may get no run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -91,7 +94,9 @@ jobs:
     # Expected: ~8 min without the experiments, ~14 min with them.
     timeout-minutes: 45
     env:
-      LOAD_SECONDS: ${{ inputs.load_seconds || 30 }}
+      # Empty except on workflow_dispatch; the step falls back to 30. (Not
+      # `inputs.load_seconds || 30`: a requested 0 would become 30.)
+      LOAD_SECONDS: ${{ inputs.load_seconds }}
       # Booleans only; the token itself is passed to one step below.
       HAVE_DOCKERHUB_LOGIN: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
     steps:
@@ -113,11 +118,12 @@ jobs:
           run=false
           reason="pull request does not touch the experiment code"
           case "$EVENT" in
-            push|schedule) run=true; reason="$EVENT" ;;
+            schedule) run=true; reason="$EVENT" ;;
+            push) run=false; reason="push to main: the pull request already ran them" ;;
             workflow_dispatch)
               run="${DISPATCH_EXPERIMENTS:-false}"; reason="workflow_dispatch input experiments=$run" ;;
             pull_request)
-              pattern='^((app|faults|metrics|logging_setup)\.py|docker-compose\.yml|scripts/(experiment_anomaly\.sh|experiment_cardinality\.sh|load_generator\.py)|observability/(cardinality_demo\.py|prometheus/.*)|\.github/(workflows/stack\.yml|scripts/smoke_assert\.py))$'
+              pattern='^((app|faults|metrics|logging_setup)\.py|requirements\.txt|Dockerfile|docker-compose\.yml|scripts/(experiment_anomaly\.sh|experiment_cardinality\.sh|load_generator\.py)|observability/(cardinality_demo\.py|prometheus/.*)|\.github/(workflows/stack\.yml|scripts/smoke_assert\.py))$'
               if changed="$(git diff --name-only HEAD^1 HEAD)"; then
                 if hits="$(grep -E "$pattern" <<<"$changed")"; then
                   run=true; reason="pull request changes: $(tr '\n' ' ' <<<"$hits")"
@@ -225,10 +231,15 @@ jobs:
             if docker compose pull --ignore-buildable --quiet && docker pull --quiet "$base"; then
               echo "Pulled in ${SECONDS}s"
               docker image ls
+              # Nothing after this step needs Docker Hub, and node-exporter and
+              # Filebeat mount host paths, so do not leave a token on disk.
+              if [ "$HAVE_DOCKERHUB_LOGIN" = true ]; then docker logout; fi
               exit 0
             fi
-            echo "::warning title=Image pull attempt $attempt failed::retrying"
-            sleep $(( attempt * 30 ))
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning title=Image pull attempt $attempt failed::retrying"
+              sleep $(( attempt * 30 ))
+            fi
           done
           echo "::error title=Image pull failed::see the log above. '429 Too Many Requests' is the Docker Hub pull limit; setting DOCKERHUB_USERNAME and DOCKERHUB_TOKEN raises it"
           exit 1
@@ -236,7 +247,7 @@ jobs:
       - name: Start, seed and verify the stack (scripts/quickstart.py)
         id: quickstart
         timeout-minutes: 20
-        run: python scripts/quickstart.py --load-seconds "$LOAD_SECONDS" 2>&1 | tee "$ARTIFACTS/quickstart.log"
+        run: python scripts/quickstart.py --load-seconds "${LOAD_SECONDS:-30}" 2>&1 | tee "$ARTIFACTS/quickstart.log"
 
       - name: Summarise the quickstart checks
         if: ${{ !cancelled() && steps.quickstart.outcome != 'skipped' }}
@@ -313,8 +324,8 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      # The VM is discarded after the job anyway; this is the command the
-      # README gives for leaving nothing behind, so it is exercised too.
+      # The VM is discarded after the job anyway; this is the command
+      # HOW_TO_RUN.md gives for leaving nothing behind, so it is exercised too.
       - name: Tear down (docker compose --profile experiment down -v)
         if: always()
         timeout-minutes: 5

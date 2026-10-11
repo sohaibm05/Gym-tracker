@@ -11,8 +11,8 @@
 #
 # /healthz does not touch Postgres, so the container must become healthy with
 # no DATABASE_URL at all. Checks, in order:
-#   1. the image is for the requested platform
-#   2. the Dockerfile HEALTHCHECK reports "healthy" (the same probe compose uses)
+#   1. the Dockerfile HEALTHCHECK reports "healthy" (the same probe compose uses)
+#   2. the container runs on the requested platform
 #   3. GET /healthz through the published port returns {"status": "ok"}
 #   4. the process runs as the unprivileged appuser (uid 10001), not root
 #   5. .dockerignore worked: no .env, tests/, .git/ or .github/ under /app
@@ -63,16 +63,7 @@ fi
 echo "Starting $image${platform:+ for $platform}"
 docker run "${run_args[@]}" "$image" >/dev/null
 
-# 1. Platform. Read from the container's image, so a tag that resolved to the
-#    wrong variant is caught rather than silently tested.
-actual="$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$(docker inspect -f '{{.Image}}' "$name")")"
-echo "Image platform: $actual"
-if [ -n "$platform" ]; then
-  want="${platform%/v*}"          # linux/arm64/v8 -> linux/arm64
-  [ "$actual" = "$want" ] || fail "expected platform $want, got $actual"
-fi
-
-# 2. Docker's own health status.
+# 1. Docker's own health status.
 deadline=$(( $(date +%s) + timeout ))
 while :; do
   state="$(docker inspect -f '{{.State.Status}}' "$name")"
@@ -88,6 +79,22 @@ while :; do
   sleep 2
 done
 echo "Health: healthy after $(( timeout - (deadline - $(date +%s)) ))s"
+
+# 2. Platform, read from the running process rather than from image metadata:
+#    under Docker's containerd image store (Docker 29), `docker image inspect`
+#    on a multi-platform digest reports the host's variant, not the one this
+#    container runs. qemu-user reports the emulated machine to `uname -m`.
+machine="$(docker exec "$name" uname -m)"
+case "$machine" in
+  x86_64) actual=linux/amd64 ;;
+  aarch64) actual=linux/arm64 ;;
+  *) actual="linux/$machine" ;;
+esac
+echo "Running platform: $actual"
+if [ -n "$platform" ]; then
+  want="${platform%/v*}"          # linux/arm64/v8 -> linux/arm64
+  [ "$actual" = "$want" ] || fail "expected platform $want, got $actual"
+fi
 
 # 3. /healthz from outside the container, through the published port.
 hostport="$(docker port "$name" 8000/tcp | head -n 1)"

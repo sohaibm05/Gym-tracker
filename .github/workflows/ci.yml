@@ -12,18 +12,21 @@ name: CI
 on:
   push:
     branches: [main]
-    # Release tags: tested like main before anything is published.
-    tags: ["v*"]
+    # Release tags, semver only (v1.2.3, v1.2.3-rc.1): tested like main
+    # before anything is published. A tag like "v2-test" does not run this.
+    tags: ["v[0-9]+.[0-9]+.[0-9]+", "v[0-9]+.[0-9]+.[0-9]+-*"]
   pull_request:
   workflow_dispatch:
 
-# Read-only token. Nothing here writes to the repository; uploading artifacts
-# uses the runner's own token and needs no extra scope.
+# Read-only token by default. Only publish-image (packages, attestations) and
+# release (contents: write, to create a GitHub Release) ask for more, and only
+# in those jobs. Uploading artifacts needs no extra scope.
 permissions:
   contents: read
 
-# A new push to a pull request cancels that PR's older run. Pushes to main are
-# never cancelled, so every commit on main keeps a result.
+# A new push to a pull request cancels that PR's older run. A running main
+# run is never cancelled; GitHub does keep only one *pending* run per group,
+# so after a burst of pushes to main an intermediate commit may get no run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -206,9 +209,9 @@ jobs:
             END { if (NR != 7) { print "::error title=verify.sql::expected 7 rows, got " NR; bad = 1 }; exit bad }
           ' "$RUNNER_TEMP/verify.txt"
 
-      # The README promises 001 and 003 are re-runnable and that a migrated
-      # database matches schema.sql. Re-running them over a fresh schema must
-      # leave pg_dump's output unchanged. pg_dump runs inside the service
+      # The README promises 001 and 003 are re-runnable. Re-running them over
+      # a fresh schema.sql database must leave pg_dump's output unchanged (this
+      # does not compare an old, migrated database with schema.sql). pg_dump runs inside the service
       # container so its version always matches the server; the \restrict lines
       # carry a random per-dump token (pg_dump 16.10+) and are dropped.
       - name: Re-running migrations 001 and 003 changes nothing
@@ -362,8 +365,9 @@ jobs:
           call: check
 
       # linux/amd64 only, loaded into the runner's Docker for the smoke test.
-      # The layer cache it writes is read back by publish-image. ignore-error:
-      # a cache service hiccup costs speed, never a red build.
+      # This job publishes nothing, so it may use the Actions cache (publish-image
+      # deliberately does not). ignore-error: a cache service hiccup costs speed,
+      # never a red build.
       - name: Build (linux/amd64)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -389,9 +393,10 @@ jobs:
   #
   # `latest` follows main, never a tag, so pushing an old tag cannot move it
   # backwards. Main runs never overlap (the workflow's concurrency group queues
-  # them), so `latest` and `main` only ever move forward. GitHub keeps one
-  # queued run per group, so after a burst of pushes an intermediate commit
-  # may get no run, and no image, of its own.
+  # them), so normally `latest` and `main` only move forward; re-running an
+  # older main run by hand would point them back at that older commit. GitHub
+  # keeps one queued run per group, so after a burst of pushes an intermediate
+  # commit may get no run, and no image, of its own.
   #
   # Order: push by digest (no tags yet) -> smoke-test that exact digest on both
   # platforms -> attest it -> only then point the tags at it. A broken image
@@ -429,9 +434,12 @@ jobs:
       # Every pinned dependency ships a manylinux aarch64 wheel for CPython
       # 3.11, so the arm64 half compiles nothing under emulation; it only
       # installs wheels. That is what keeps QEMU affordable here.
+      # cache-image: false -- the default restores the binfmt image from the
+      # Actions cache and runs it --privileged; see the cache note below.
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: arm64
+          cache-image: false
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -479,10 +487,11 @@ jobs:
             GIT_COMMIT=${{ github.sha }}
           provenance: mode=max
           sbom: true
-          cache-from: |
-            type=gha,scope=image-amd64
-            type=gha,scope=image-multiarch
-          cache-to: type=gha,mode=max,scope=image-multiarch,ignore-error=true
+          # No Actions cache in the publishing job: every job on main can write
+          # cache entries (the runtime token is issued to all of them), and a
+          # poisoned layer would be pushed and attested as if built here.
+          # Building from scratch costs a few minutes under QEMU, nothing else.
+          no-cache: true
 
       - name: Smoke test the pushed digest (linux/amd64)
         env:

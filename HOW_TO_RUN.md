@@ -61,8 +61,8 @@ about a minute. The script:
 ```
 
 The same command runs on a clean GitHub machine for every change to the stack
-(the **Stack** workflow in GitHub Actions). If its badge at the top of the README
-is green, this exact sequence passed there.
+(the **Stack** workflow in GitHub Actions, with 30 seconds of traffic instead of
+60). If its badge at the top of the README is green, this sequence passed there.
 
 It is safe to run again at any time, for example after stopping and restarting
 the stack. Metric counters live in the app's memory, so they start again at 0
