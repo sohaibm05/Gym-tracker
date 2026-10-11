@@ -8,3 +8,6 @@ anyio==4.15.1
 pytest-randomly==5.0.0
 # FastAPI's TestClient is built on httpx.
 httpx==0.28.1
+# Regenerates grpc_gen/ from proto/workout.proto. Only needed after a .proto
+# change, so it is not in the runtime image.
+grpcio-tools==1.80.0

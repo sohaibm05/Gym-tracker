@@ -19,3 +19,8 @@ tzdata==2026.5
 # metrics if this is missing rather than failing to start, so a trimmed
 # serverless bundle loses observability but still serves requests.
 prometheus-client==0.26.0
+# The gRPC service (grpc_server.py, Assignment 2 Part B). protobuf must be at
+# least the version the code in grpc_gen/ was generated against (6.31.1); the
+# generated module checks this at import and refuses an older runtime.
+grpcio==1.80.0
+protobuf==6.33.6

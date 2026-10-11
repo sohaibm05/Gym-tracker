@@ -26,6 +26,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import math
 import os
 import re
 import secrets
@@ -568,6 +569,21 @@ class RateLimiter:
         if len(self._hits) > 4096:
             self._prune(cutoff)
         return len(recent) <= self.limit
+
+    def retry_after(self, key: str, now: Optional[float] = None) -> int:
+        """Whole seconds until `key` would next be allowed, or 0 if it is now.
+
+        Enough of the oldest attempts have to age out of the window to bring the
+        count below the limit; the last of those to expire sets the time. Rounded
+        up, so a client that waits exactly this long is not refused again.
+        """
+        now = time.monotonic() if now is None else now
+        cutoff = now - self.window_seconds
+        recent = sorted(stamp for stamp in self._hits.get(key, []) if stamp > cutoff)
+        if len(recent) < self.limit:
+            return 0
+        frees_at = recent[len(recent) - self.limit] + self.window_seconds
+        return max(1, math.ceil(frees_at - now))
 
     def reset(self, key: str) -> None:
         self._hits.pop(key, None)

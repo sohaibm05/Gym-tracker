@@ -7,6 +7,8 @@
 # Ports on the host:
 #   8000  gym-tracker      the app itself
 #   8001  cardinality-demo Part E2 (profile "experiment", not started by default)
+#   50051 grpc             the gRPC LogSet service (Assignment 2)
+#   9102  grpc             its Prometheus metrics
 #   9090  prometheus
 #   9100  node-exporter
 #   3000  grafana          admin / admin on first login
@@ -73,6 +75,9 @@ services:
       FAULT_LATENCY_EVERY_N: ${FAULT_LATENCY_EVERY_N:-1}
       FAULT_ERROR_EVERY_N: ${FAULT_ERROR_EVERY_N:-0}
       FAULT_PATH_PREFIX: ${FAULT_PATH_PREFIX:-}
+      # Assignment 2: serves /api/openapi.json and a Swagger UI at /api/docs.
+      # Fine on a local lab; leave it off on anything public.
+      API_DOCS_ENABLED: "true"
     ports:
       - "8000:8000"
     # Bounds the log on disk. Without this the json-file driver grows without
@@ -85,6 +90,45 @@ services:
         max-file: "3"
     labels:
       # Read by Filebeat's autodiscover rules (observability/filebeat/filebeat.yml).
+      co.elastic.logs/enabled: "true"
+    networks: [gym-net]
+
+  # Assignment 2, Part B: the gRPC LogSet service. Same image and the same
+  # database as the app above, its own process - the HTTP and gRPC versions of
+  # "log a set" share sessions.log_set and Postgres, not a network hop.
+  grpc:
+    build: .
+    container_name: gym-grpc
+    command: ["python", "grpc_server.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://gym:gym@postgres:5432/gymtracker
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: json
+      SERVICE_NAME: gym-tracker-grpc
+      APP_VERSION: ${APP_VERSION:-1.0.0}
+      GRPC_PORT: "50051"
+      GRPC_METRICS_PORT: "9102"
+    ports:
+      - "50051:50051"   # gRPC
+      - "9102:9102"     # Prometheus metrics
+    # The image's HEALTHCHECK probes the web app on :8000, which this container
+    # does not run. The metrics endpoint answering means the process is up.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9102/metrics', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      start_period: 15s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      # Same label as the app, so Filebeat ships these logs to the same index.
       co.elastic.logs/enabled: "true"
     networks: [gym-net]
 
