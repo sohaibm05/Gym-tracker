@@ -164,7 +164,7 @@ services:
 
   # Machine-level metrics: CPU, memory, disk and network for the Docker host.
   node-exporter:
-    image: prom/node-exporter:v1.8.2
+    image: prom/node-exporter:v1.12.1
     container_name: gym-node-exporter
     command:
       - --path.procfs=/host/proc
@@ -188,7 +188,7 @@ services:
     pid: host
 
   grafana:
-    image: grafana/grafana:11.2.0
+    image: grafana/grafana:11.6.16
     container_name: gym-grafana
     depends_on: [prometheus]
     environment:
@@ -213,7 +213,7 @@ services:
   # ------------------------------------------------------------------------
 
   elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.19.23
     container_name: gym-elasticsearch
     environment:
       discovery.type: single-node
@@ -253,7 +253,7 @@ services:
     networks: [gym-net]
 
   kibana:
-    image: docker.elastic.co/kibana/kibana:8.15.0
+    image: docker.elastic.co/kibana/kibana:8.19.23
     container_name: gym-kibana
     depends_on:
       elasticsearch:
@@ -271,7 +271,7 @@ services:
     networks: [gym-net]
 
   filebeat:
-    image: docker.elastic.co/beats/filebeat:8.15.0
+    image: docker.elastic.co/beats/filebeat:8.19.23
     container_name: gym-filebeat
     depends_on:
       elasticsearch:
