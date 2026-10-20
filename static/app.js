@@ -105,8 +105,11 @@ const relativeDay = (iso) => {
 async function api(path, options = {}) {
   const response = await fetch(`/api${path}`, {
     credentials: 'same-origin',
-    headers: options.body ? { 'Content-Type': 'application/json' } : {},
     ...options,
+    headers: {
+      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(options.headers || {}),
+    },
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
 
@@ -117,8 +120,9 @@ async function api(path, options = {}) {
   if (!response.ok) {
     let detail = `Request failed (${response.status})`;
     try {
+      // Every /api error is {"error": {"code", "message", "request_id"}}.
       const body = await response.json();
-      if (body && body.detail) detail = body.detail;
+      if (body && body.error && body.error.message) detail = body.error.message;
     } catch { /* a non-JSON error body is not worth a second failure */ }
     const error = new Error(detail);
     // The status is carried on the error, not inferred from its text. Callers
@@ -145,6 +149,28 @@ async function api(path, options = {}) {
  */
 const isPermanentFailure = (error) =>
   Number.isInteger(error && error.status) && error.status >= 400 && error.status < 500;
+
+/**
+ * A fresh Idempotency-Key for one set.
+ *
+ * Made once, when the set is logged, and sent unchanged on the first attempt
+ * and on every retry from the outbox. A set whose response was lost — written
+ * on the server, failed on the phone — is then recognised when it is retried
+ * instead of being written twice. randomUUID needs a secure context (https or
+ * localhost); on plain http over the LAN the fallback gives the same 122 bits.
+ */
+function newIdempotencyKey() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** Log one set. The key travels as a header so the body stays the set itself. */
+const postSet = (sessionId, payload, key) => api(`/sessions/${sessionId}/sets`, {
+  method: 'POST',
+  body: payload,
+  headers: key ? { 'Idempotency-Key': key } : {},
+});
 
 // ---------------------------------------------------------------------------
 // State
@@ -276,9 +302,8 @@ const outbox = {
       const entry = items[0];
       let result = null;
       try {
-        result = await api(`/session/${entry.session_id}/sets`, {
-          method: 'POST', body: entry.payload,
-        });
+        // Entries queued before keys existed have none, and go without one.
+        result = await postSet(entry.session_id, entry.payload, entry.key);
       } catch (error) {
         // Only a permanent refusal is dropped. Anything else — a 502 from a
         // proxy, a dead uplink the browser has not noticed — leaves the set
@@ -545,7 +570,7 @@ function goBack() {
 async function loadHome() {
   const [{ routines }, { session }] = await Promise.all([
     api('/routines'),
-    api('/session/active'),
+    api('/sessions/active'),
   ]);
   state.routines = routines;
   adoptSession(session);
@@ -644,7 +669,7 @@ async function loadHeatmap() {
 
 async function startWorkout(routineId) {
   try {
-    const { session } = await api('/session/start', {
+    const { session } = await api('/sessions', {
       method: 'POST',
       body: routineId ? { routine_id: routineId } : {},
     });
@@ -659,7 +684,7 @@ async function startWorkout(routineId) {
 async function refreshSession() {
   if (!state.session) return;
   try {
-    const { session } = await api(`/session/${state.session.session_id}`);
+    const { session } = await api(`/sessions/${state.session.session_id}`);
     adoptSession(session);
     if (state.view === 'workout') renderWorkout();
   } catch { /* offline: keep showing what we have */ }
@@ -847,11 +872,12 @@ async function logSet(exercise, weightInput, repsInput, button, asWarmup = false
     is_warmup: asWarmup,
   };
 
+  // One key for this set, whether it goes now or from the outbox later.
+  const key = newIdempotencyKey();
+
   button.disabled = true;
   try {
-    const result = await api(`/session/${state.session.session_id}/sets`, {
-      method: 'POST', body: payload,
-    });
+    const result = await postSet(state.session.session_id, payload, key);
     if (result.records && result.records.length) announceRecords(result.records);
     if (!asWarmup) rest.start(exercise.rest_seconds || 120, exercise.name);
     // The POST already returned the refreshed session, so re-fetching it would
@@ -874,7 +900,7 @@ async function logSet(exercise, weightInput, repsInput, button, asWarmup = false
       // uplink, or a captive portal: the browser still reports itself online,
       // the request fails, and gating the outbox on navigator.onLine meant the
       // set was dropped in exactly the situation the outbox exists for.
-      outbox.add({ session_id: state.session.session_id, payload });
+      outbox.add({ session_id: state.session.session_id, payload, key });
       // Drawn as a pending row straight away. Left off the screen, the set
       // looked like it had not been logged and got logged again.
       const block = state.session.exercises.find((e) => e.exercise_id === exercise.exercise_id);
@@ -911,7 +937,7 @@ async function finishWorkout() {
     return;
   }
   try {
-    const { session } = await api(`/session/${state.session.session_id}/finish`, {
+    const { session } = await api(`/sessions/${state.session.session_id}/finish`, {
       method: 'POST', body: {},
     });
     rest.stop();
@@ -930,7 +956,7 @@ async function discardWorkout() {
   if (!confirm('Discard this workout and every set in it? This cannot be undone.')) return;
   try {
     const discarded = state.session.session_id;
-    await api(`/session/${discarded}`, { method: 'DELETE' });
+    await api(`/sessions/${discarded}`, { method: 'DELETE' });
     rest.stop();
     state.session = null;
     adHoc.clear();
@@ -1222,7 +1248,7 @@ async function saveRoutine() {
 
   try {
     if (routine.routine_id) {
-      await api(`/routines/${routine.routine_id}`, { method: 'PUT', body: payload });
+      await api(`/routines/${routine.routine_id}`, { method: 'PATCH', body: payload });
     } else {
       await api('/routines', { method: 'POST', body: payload });
     }

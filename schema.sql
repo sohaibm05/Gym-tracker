@@ -211,6 +211,11 @@ CREATE TABLE IF NOT EXISTS workout_logs (
     -- other would invent a precision nobody gave.
     rpe                   NUMERIC(3, 1),
     rir                   INTEGER,
+    -- The Idempotency-Key the client sent with a live set, after rir for the
+    -- same reason as the three above: migration 004 appends it. A retried
+    -- request carrying a key already stored returns that set instead of
+    -- writing a second one. NULL for every set logged without a key.
+    client_set_id         TEXT,
 
     CONSTRAINT workout_logs_weight_nonneg CHECK (weight_kg IS NULL OR weight_kg >= 0),
     CONSTRAINT workout_logs_reps_positive CHECK (reps IS NULL OR reps > 0),
@@ -225,6 +230,12 @@ CREATE TABLE IF NOT EXISTS workout_logs (
 
 CREATE INDEX IF NOT EXISTS idx_workout_logs_session
     ON workout_logs (session_id);
+
+-- One set per key per person. The check in sessions.log_set finds a replay;
+-- this index is what makes two copies of the same request racing each other
+-- end with one row rather than two.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workout_logs_client_set_id
+    ON workout_logs (user_id, client_set_id) WHERE client_set_id IS NOT NULL;
 
 -- --------------------------------------------------------------------------
 -- Measurements and personal records

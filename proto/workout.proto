@@ -1,0 +1,89 @@
+// The gym tracker's gRPC contract (Assignment 2, Part B).
+//
+// One operation from the "log a set" user task, served by grpc_server.py in its
+// own process and container. It is the gRPC twin of
+//
+//     POST /api/sessions/{session_id}/sets
+//
+// and both call the same function, sessions.log_set, against the same Postgres
+// database. Neither wraps the other.
+//
+// Generate the Python code (writes into grpc_gen/):
+//
+//     python -m grpc_tools.protoc -I proto --python_out=grpc_gen \
+//         --pyi_out=grpc_gen --grpc_python_out=grpc_gen proto/workout.proto
+//
+// Authentication: HTTP Basic credentials in the `authorization` metadata key,
+// checked against the same accounts table as the web app. A caller may send
+// `x-request-id` metadata; the server logs under it and returns it in the
+// trailing metadata, as the HTTP API does with the X-Request-ID header.
+
+syntax = "proto3";
+
+package gymtracker.v1;
+
+service WorkoutService {
+  // Log one set into a workout in progress.
+  //
+  // Status codes, with their HTTP equivalents:
+  //   OK                   201 written, or 200 replayed (see `replayed`)
+  //   INVALID_ARGUMENT     400 a field is missing or out of range
+  //   NOT_FOUND            404 no such workout for this account
+  //   FAILED_PRECONDITION  409 the workout has already been finished
+  //   UNAUTHENTICATED      401 missing or wrong credentials
+  //   INTERNAL             500 unexpected; the detail is in the server logs
+  rpc LogSet(LogSetRequest) returns (LogSetResponse);
+}
+
+message LogSetRequest {
+  int64 session_id = 1;
+
+  // Which lift: an id from the catalog, or a name to look up or create.
+  oneof exercise {
+    int64 exercise_id = 2;
+    string exercise_name = 3;
+  }
+
+  // `optional` so that "not sent" stays distinguishable from zero: a set with
+  // no weight is a bodyweight set, and a set with no reps is refused - where
+  // reps = 0 is refused with a different message, exactly as over HTTP.
+  optional double weight_kg = 4;
+  optional int32 reps = 5;
+  int32 cheat_reps = 6;
+  bool is_warmup = 7;
+  optional double rpe = 8;
+  optional int32 rir = 9;
+
+  // One per set, resent unchanged on a retry. A key this account has already
+  // used returns the set written under it instead of writing another.
+  string idempotency_key = 10;
+}
+
+message LoggedSet {
+  int64 log_id = 1;
+  int64 exercise_id = 2;
+  string exercise_name = 3;
+  int32 set_number = 4;
+  optional double weight_kg = 5;
+  optional int32 reps = 6;
+  int32 cheat_reps = 7;
+  bool is_warmup = 8;
+  double volume_kg = 9;
+  string display = 10;
+  string logged_at = 11;  // ISO 8601
+}
+
+message RecordBreak {
+  string record_type = 1;
+  string label = 2;
+  double value = 3;
+  optional double previous_value = 4;
+}
+
+message LogSetResponse {
+  LoggedSet set = 1;
+  // Personal records this set beat. Always empty on a replay.
+  repeated RecordBreak records = 2;
+  // True when the idempotency key had been used and nothing new was written.
+  bool replayed = 3;
+}

@@ -136,6 +136,33 @@ EXTRACTION_OUTCOMES = ("success", "rate_limited", "error")
 NARRATION_RESULTS = ("ok", "failed")
 LOGIN_RESULTS = ("success", "failure", "rate_limited")
 FAULT_KINDS = ("latency", "error")
+# Assignment 2. A live set arrives over HTTP or gRPC, and is either written or
+# recognised as a retry of one already written (same Idempotency-Key).
+LIVE_SET_TRANSPORTS = ("http", "grpc")
+LIVE_SET_OUTCOMES = ("written", "replayed")
+# Every status grpc_server.py can answer with. Bounded by construction: the
+# handler maps each failure onto one of these and nothing else.
+GRPC_CODES = (
+    "OK", "INVALID_ARGUMENT", "NOT_FOUND", "FAILED_PRECONDITION",
+    "UNAUTHENTICATED", "INTERNAL",
+)
+GRPC_METHODS = (("gymtracker.v1.WorkoutService", "LogSet"),)
+
+
+def _live_sets_counter(kw: dict[str, Any]) -> Any:
+    """Declared once, registered by both processes - the HTTP app and the gRPC
+    server each count the sets that arrived through them."""
+    counter = Counter(
+        "gym_live_sets_total",
+        "Sets logged from the live workout logger, by transport and whether the "
+        "request wrote a new set or replayed one already written.",
+        ["transport", "outcome"],
+        **kw,
+    )
+    for transport in LIVE_SET_TRANSPORTS:
+        for outcome in LIVE_SET_OUTCOMES:
+            counter.labels(transport, outcome)
+    return counter
 
 
 # --------------------------------------------------------------------------
@@ -274,6 +301,12 @@ class Metrics:
             for value in values:
                 counter.labels(value)
 
+        # Business (Assignment 2): sets from the live logger. Missing in A1 -
+        # gym_sets_written_total only counts the journal flow at POST /save, so
+        # a whole workout logged set by set never appeared on the dashboard.
+        # `outcome="replayed"` counts retries the Idempotency-Key absorbed.
+        self.live_sets_total = _live_sets_counter(kw)
+
         # ------------------------------------------------------------------
         # GAUGE - a value that goes up and down. "How many right now?"
         # ------------------------------------------------------------------
@@ -380,6 +413,63 @@ METRICS = Metrics()
 def build_metrics(registry: Any = None) -> Metrics:
     """A second, isolated metric set. For tests; the app uses METRICS."""
     return Metrics(registry=registry)
+
+
+class GrpcMetrics:
+    """The gRPC server's metrics (Assignment 2, Part C).
+
+    A separate class with its own registry, because the gRPC server is its own
+    process with its own /metrics port. Built on the default registry it would
+    also export every gym_http_* series at zero under the grpc job, and a panel
+    summing HTTP traffic across jobs would then be adding up a process that
+    never serves HTTP.
+
+    Measured at the SERVER, inside the interceptor around the handler. That is
+    the time the service spent, comparable with gym_http_request_duration_seconds
+    which the HTTP middleware also measures server-side. Network time and the
+    client's own deadline handling are not included.
+    """
+
+    def __init__(self, registry: Any = None) -> None:
+        if registry is None and PROMETHEUS_AVAILABLE:
+            registry = CollectorRegistry()
+        self.registry = registry
+        kw = {"registry": registry} if (registry is not None and PROMETHEUS_AVAILABLE) else {}
+
+        # Calls and the error rate: one series per method and status code. The
+        # numerator of the error rate is every code except OK.
+        self.handled_total = Counter(
+            "gym_grpc_server_handled_total",
+            "gRPC calls completed by the server, by service, method and status code.",
+            ["grpc_service", "grpc_method", "grpc_code"],
+            **kw,
+        )
+        # The same buckets as HTTP, so the two transports' p50/p95 are computed
+        # from comparable bucket boundaries and can sit on one panel.
+        self.handling_seconds = Histogram(
+            "gym_grpc_server_handling_seconds",
+            "Server-side time to handle one gRPC call, by service and method.",
+            ["grpc_service", "grpc_method"],
+            buckets=HTTP_DURATION_BUCKETS,
+            **kw,
+        )
+        # In-flight rather than message size: a LogSet request is a handful of
+        # scalar fields, tens of bytes whatever the input, so a size histogram
+        # would be one flat line. Concurrency is what saturates first - the
+        # server has a fixed thread pool - and it is the gRPC twin of
+        # gym_http_requests_in_flight.
+        self.in_flight = Gauge(
+            "gym_grpc_server_in_flight",
+            "gRPC calls currently being handled, by method.",
+            ["grpc_method"],
+            **kw,
+        )
+        self.live_sets_total = _live_sets_counter(kw)
+
+        for service, method in GRPC_METHODS:
+            self.in_flight.labels(method)
+            for code in GRPC_CODES:
+                self.handled_total.labels(service, method, code)
 
 
 # --------------------------------------------------------------------------

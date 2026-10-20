@@ -42,6 +42,17 @@ scrape_configs:
     #   credentials: "the-same-value-as-METRICS_TOKEN"
 
   # ------------------------------------------------------------------------
+  # The gRPC LogSet service (Assignment 2). Its own process, so its own
+  # target: if it goes down, up{job="gym-tracker-grpc"} drops to 0 while the
+  # web app's stays at 1.
+  # ------------------------------------------------------------------------
+  - job_name: gym-tracker-grpc
+    static_configs:
+      - targets: ["grpc:9102"]
+        labels:
+          service: gym-tracker-grpc
+
+  # ------------------------------------------------------------------------
   # Machine metrics: CPU, memory, disk, network
   # ------------------------------------------------------------------------
   - job_name: node-exporter

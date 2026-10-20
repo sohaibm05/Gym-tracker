@@ -38,6 +38,7 @@ from datetime import datetime
 from typing import Any, Optional, Sequence
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import Connection
 
 import catalog
@@ -59,6 +60,45 @@ MAX_REPS = 500
 
 class SessionError(ValueError):
     """A session action failed, with a reason meant for the person."""
+
+
+class SessionNotFound(SessionError):
+    """The workout or set named does not exist for this person.
+
+    A subclass, so every existing `except SessionError` still catches it. The
+    distinction is for the transports: HTTP answers 404 and gRPC NOT_FOUND,
+    where a plain SessionError (bad input) is 400 and INVALID_ARGUMENT.
+    """
+
+
+class SessionConflict(SessionError):
+    """The request is valid but the workout's state refuses it - already finished.
+
+    HTTP 409, gRPC FAILED_PRECONDITION. Retrying the same request cannot succeed.
+    """
+
+
+# An Idempotency-Key: what a client generates once per set and resends on every
+# retry of it. A UUID fits; the bound keeps an attacker-supplied header out of
+# the index at any size.
+MAX_IDEMPOTENCY_KEY = 64
+_IDEMPOTENCY_KEY_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+)
+
+
+def check_idempotency_key(key: Optional[str]) -> Optional[str]:
+    """The key, stripped, or None when absent. Raises on a malformed one."""
+    if key is None:
+        return None
+    key = key.strip()
+    if not key:
+        return None
+    if len(key) > MAX_IDEMPOTENCY_KEY or not set(key) <= _IDEMPOTENCY_KEY_CHARS:
+        raise SessionError(
+            f"Idempotency-Key must be 1-{MAX_IDEMPOTENCY_KEY} letters, digits, '-' or '_'."
+        )
+    return key
 
 
 # --------------------------------------------------------------------------
@@ -84,6 +124,11 @@ class LoggedSet:
     pain_flag: bool = False
     notes: Optional[str] = None
     logged_at: Optional[datetime] = None
+    # True when log_set found this set already written under the same
+    # Idempotency-Key and returned it instead of inserting. Not part of
+    # to_dict(): the transports report it in their own way (a 200 and a header,
+    # or a response field).
+    replayed: bool = False
 
     @property
     def volume_kg(self) -> float:
@@ -484,7 +529,7 @@ def start_session(
     if routine_id is not None:
         routine = routines_module.get_routine(conn, user_id, routine_id)
         if routine is None:
-            raise SessionError("That routine does not exist.")
+            raise SessionNotFound("That routine does not exist.")
 
     session_name = (name or "").strip() or (routine.name if routine else "Workout")
 
@@ -656,6 +701,46 @@ def _session_sets(conn: Connection, user_id: int, session_id: int) -> list[Logge
     ]
 
 
+def find_set_by_key(conn: Connection, user_id: int, key: str) -> Optional[LoggedSet]:
+    """The set this person logged under an Idempotency-Key, marked as a replay."""
+    row = conn.execute(
+        text(
+            """
+            SELECT wl.log_id, wl.exercise_id, e.name, wl.set_number, wl.weight_kg,
+                   wl.reps, wl.cheat_reps, wl.is_warmup, wl.is_dropset, wl.rpe,
+                   wl.rir, wl.pain_flag, wl.notes, wl.logged_at
+              FROM workout_logs wl
+              JOIN exercises e ON e.exercise_id = wl.exercise_id
+             WHERE wl.user_id = :user_id AND wl.client_set_id = :key
+            """
+        ),
+        {"user_id": user_id, "key": key},
+    ).fetchone()
+    if row is None:
+        return None
+    logger.info(
+        "set replayed",
+        extra={"event.action": "set_replayed", "user.id": user_id, "log.id": row[0]},
+    )
+    return LoggedSet(
+        log_id=row[0],
+        exercise_id=row[1],
+        exercise_name=row[2],
+        set_number=row[3] or 0,
+        weight_kg=float(row[4]) if row[4] is not None else None,
+        reps=row[5],
+        cheat_reps=row[6] or 0,
+        is_warmup=bool(row[7]),
+        is_dropset=bool(row[8]),
+        rpe=float(row[9]) if row[9] is not None else None,
+        rir=row[10],
+        pain_flag=bool(row[11]),
+        notes=row[12],
+        logged_at=row[13],
+        replayed=True,
+    )
+
+
 def finish_session(
     conn: Connection, user_id: int, session_id: int, notes: Optional[str] = None
 ) -> Session:
@@ -666,7 +751,7 @@ def finish_session(
     """
     session = load_session(conn, user_id, session_id)
     if session is None:
-        raise SessionError("That workout does not exist.")
+        raise SessionNotFound("That workout does not exist.")
     if not session.is_active:
         return session
 
@@ -834,13 +919,27 @@ def log_set(
     rir: Optional[int] = None,
     pain_flag: bool = False,
     notes: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> tuple[LoggedSet, list[records.RecordBreak]]:
     """Write one set and report any record it beat.
 
     The record check runs in the caller's transaction alongside the insert, so a
     set and the PR it set commit together. A PR announced for a set that failed
     to save would be the worst of both.
+
+    With an `idempotency_key`, a key this person has already used returns the
+    set written under it - `replayed=True`, no records - instead of writing it
+    again. This is the rule both the HTTP route and the gRPC LogSet call rely
+    on, so a retry is safe whichever way it arrives.
     """
+    key = check_idempotency_key(idempotency_key)
+    if key is not None:
+        # Before the session checks, not after: a set that was written and whose
+        # response was lost must replay even if the workout was finished since.
+        existing = find_set_by_key(conn, user_id, key)
+        if existing is not None:
+            return existing, []
+
     session = conn.execute(
         text(
             "SELECT finished_at FROM workout_sessions "
@@ -849,9 +948,9 @@ def log_set(
         {"session_id": session_id, "user_id": user_id},
     ).fetchone()
     if session is None:
-        raise SessionError("That workout does not exist.")
+        raise SessionNotFound("That workout does not exist.")
     if session[0] is not None:
-        raise SessionError("That workout has already been finished.")
+        raise SessionConflict("That workout has already been finished.")
 
     if exercise_id is None:
         if not exercise_name:
@@ -897,32 +996,48 @@ def log_set(
             f"single workout. Start a new workout if that is really the plan."
         )
 
-    log_id = conn.execute(
-        text(
-            """
-            INSERT INTO workout_logs
-                (user_id, exercise_id, session_id, logged_at, weight_kg, reps,
-                 cheat_reps, set_number, is_warmup, is_dropset, rpe, rir,
-                 pain_flag, notes, extraction_confidence)
-            VALUES
-                (:user_id, :exercise_id, :session_id, now(), :weight_kg, :reps,
-                 :cheat_reps, :set_number, :is_warmup, :is_dropset, :rpe, :rir,
-                 :pain_flag, :notes, 1.0)
-            RETURNING log_id, logged_at
-            """
-        ),
-        {
-            "user_id": user_id,
-            "exercise_id": exercise_id,
-            "session_id": session_id,
-            "set_number": next_number,
-            "is_warmup": is_warmup,
-            "is_dropset": is_dropset,
-            "pain_flag": pain_flag,
-            "notes": (notes or "").strip() or None,
-            **values,
-        },
-    ).fetchone()
+    insert = text(
+        """
+        INSERT INTO workout_logs
+            (user_id, exercise_id, session_id, logged_at, weight_kg, reps,
+             cheat_reps, set_number, is_warmup, is_dropset, rpe, rir,
+             pain_flag, notes, extraction_confidence, client_set_id)
+        VALUES
+            (:user_id, :exercise_id, :session_id, now(), :weight_kg, :reps,
+             :cheat_reps, :set_number, :is_warmup, :is_dropset, :rpe, :rir,
+             :pain_flag, :notes, 1.0, :client_set_id)
+        RETURNING log_id, logged_at
+        """
+    )
+    params = {
+        "user_id": user_id,
+        "exercise_id": exercise_id,
+        "session_id": session_id,
+        "set_number": next_number,
+        "is_warmup": is_warmup,
+        "is_dropset": is_dropset,
+        "pain_flag": pain_flag,
+        "notes": (notes or "").strip() or None,
+        "client_set_id": key,
+        **values,
+    }
+    if key is None:
+        log_id = conn.execute(insert, params).fetchone()
+    else:
+        # Two copies of one request in flight at once - the original that timed
+        # out on the client and its retry - both pass the lookup above. The
+        # unique index lets one insert win; the loser lands here and returns the
+        # winner's set. A SAVEPOINT for the same reason as in start_session: a
+        # constraint violation otherwise aborts the whole transaction and the
+        # recovery read would be refused.
+        try:
+            with conn.begin_nested():
+                log_id = conn.execute(insert, params).fetchone()
+        except IntegrityError:
+            existing = find_set_by_key(conn, user_id, key)
+            if existing is None:
+                raise
+            return existing, []
 
     written = LoggedSet(
         log_id=int(log_id[0]),
@@ -995,7 +1110,7 @@ def update_set(
         {"log_id": log_id, "user_id": user_id},
     ).fetchone()
     if row is None:
-        raise SessionError("That set does not exist.")
+        raise SessionNotFound("That set does not exist.")
 
     current = {
         "weight_kg": float(row[5]) if row[5] is not None else None,
