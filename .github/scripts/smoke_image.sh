@@ -60,6 +60,15 @@ if [ -n "${SMOKE_RUN_ARGS:-}" ]; then
   run_args+=("${extra_args[@]}")
 fi
 
+# Docker's classic image store, which GitHub's runners use, maps a digest
+# reference to a single image. Once the amd64 run has pulled
+# ghcr.io/...@sha256:<index>, pulling the same reference for arm64 fails with
+# "cannot overwrite digest". Dropping the local copy first makes `docker run`
+# pull the platform asked for; a local tag such as gym-tracker:ci is untouched.
+if [[ "$image" == *@sha256:* ]]; then
+  docker image rm "$image" >/dev/null 2>&1 || true
+fi
+
 echo "Starting $image${platform:+ for $platform}"
 docker run "${run_args[@]}" "$image" >/dev/null
 
