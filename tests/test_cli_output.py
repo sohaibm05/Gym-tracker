@@ -167,7 +167,7 @@ class TestVercelEntrypoint:
         from pathlib import Path
 
         config = json.loads(
-            (Path(__file__).resolve().parent.parent / "vercel.json").read_text()
+            (Path(__file__).resolve().parent.parent / "vercel.json").read_text(encoding="utf-8")
         )
         assert "app.py" in config["functions"]
         assert config["functions"]["app.py"]["maxDuration"] == 60
@@ -178,7 +178,7 @@ class TestVercelEntrypoint:
 
         requirements = (
             Path(__file__).resolve().parent.parent / "requirements.txt"
-        ).read_text()
+        ).read_text(encoding="utf-8")
         assert "tzdata" in requirements
 
 
