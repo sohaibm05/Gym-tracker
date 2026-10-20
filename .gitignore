@@ -8,6 +8,9 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
+# JUnit reports, written when the CI test commands are run locally
+reports/
+.ruff_cache/
 *.egg-info/
 .DS_Store
 .idea/
