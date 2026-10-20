@@ -60,9 +60,14 @@ for target in data:
     note = ""
     if job == "cardinality-demo" and health != "up":
         note = "  (expected: only runs under the experiment profile)"
-    print(f"  [{mark}] {job:<18} {target['scrapeUrl']}{note}")
-    if health != "up" and target.get("lastError") and not note:
-        print(f"         last error: {target['lastError']}")
+    # No single quotes anywhere in this program: the shell passes it inside a
+    # single-quoted string, so a quoted dict key would lose its quotes and reach
+    # Python as a bare (undefined) name.
+    url = target["scrapeUrl"]
+    print(f"  [{mark}] {job:<18} {url}{note}")
+    error = target.get("lastError")
+    if health != "up" and error and not note:
+        print(f"         last error: {error}")
 ' || warn "could not read targets"
 
   log "Documents indexed"

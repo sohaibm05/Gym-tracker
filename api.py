@@ -45,6 +45,13 @@ SessionNotFound becomes 404, SessionConflict 409, anything else of theirs 400.
 FastAPI's own body/query validation is also answered 400, so "your input is
 wrong" is one status, not two. Anything unexpected becomes a 500 with no
 detail, because an unexpected exception's text is for the logs.
+
+Handlers are plain `def`, not `async def`
+-----------------------------------------
+Every one of them talks to the database through the synchronous SQLAlchemy
+engine. Inside an `async def` that call runs on the event loop itself, so one
+slow query stalls every other request on the worker — /healthz included. A plain
+`def` handler is run in FastAPI's threadpool, where blocking is harmless.
 """
 
 from __future__ import annotations
@@ -411,7 +418,7 @@ class RebuiltOut(BaseModel):
 
 
 @router.get("/catalog", responses=BAD_INPUT)
-async def get_catalog(
+def get_catalog(
     q: str = Query("", max_length=80),
     equipment: Optional[str] = Query(None, max_length=30),
     muscle_group: Optional[str] = Query(None, max_length=40),
@@ -463,6 +470,7 @@ async def get_catalog(
             "equipment": row[3],
             "equipment_label": catalog.equipment_label(row[3]),
             "is_custom": bool(row[4]),
+            "is_bodyweight": (row[3] or "") in catalog.BODYWEIGHT_EQUIPMENT,
             "log_count": int(row[5]),
             "in_catalog": catalog.search_key(row[1]) in catalog_names,
         }
@@ -486,7 +494,7 @@ async def get_catalog(
 
 
 @router.post("/exercises", status_code=201, responses=BAD_INPUT)
-async def create_exercise(
+def create_exercise(
     payload: CreateExerciseIn, user: Any = Depends(current_user)
 ) -> JSONResponse:
     """Resolve a name to one of this user's exercises, creating it if new."""
@@ -513,6 +521,9 @@ async def create_exercise(
             "equipment": row[3],
             "equipment_label": catalog.equipment_label(row[3]),
             "is_custom": bool(row[4]),
+            # The live screen needs this to know an empty weight is a complete
+            # bodyweight set, not an omission.
+            "is_bodyweight": (row[3] or "") in catalog.BODYWEIGHT_EQUIPMENT,
         },
         status_code=201,
     )
@@ -524,7 +535,7 @@ async def create_exercise(
 
 
 @router.get("/routines")
-async def list_routines(
+def list_routines(
     include_archived: bool = Query(False), user: Any = Depends(current_user)
 ) -> JSONResponse:
     with engine().begin() as conn:
@@ -533,7 +544,7 @@ async def list_routines(
 
 
 @router.get("/routines/{routine_id}", responses=NOT_FOUND)
-async def get_routine(routine_id: int, user: Any = Depends(current_user)) -> JSONResponse:
+def get_routine(routine_id: int, user: Any = Depends(current_user)) -> JSONResponse:
     with engine().begin() as conn:
         found = routines_module.get_routine(conn, user.user_id, routine_id)
     if found is None:
@@ -542,7 +553,7 @@ async def get_routine(routine_id: int, user: Any = Depends(current_user)) -> JSO
 
 
 @router.post("/routines", status_code=201, responses=BAD_INPUT)
-async def create_routine(payload: RoutineIn, user: Any = Depends(current_user)) -> JSONResponse:
+def create_routine(payload: RoutineIn, user: Any = Depends(current_user)) -> JSONResponse:
     try:
         with engine().begin() as conn:
             created = routines_module.create_routine(
@@ -558,7 +569,7 @@ async def create_routine(payload: RoutineIn, user: Any = Depends(current_user)) 
 
 
 @router.patch("/routines/{routine_id}", responses={**BAD_INPUT, **NOT_FOUND})
-async def update_routine(
+def update_routine(
     routine_id: int, payload: RoutineIn, user: Any = Depends(current_user)
 ) -> JSONResponse:
     """Change a routine. Only the fields sent are touched.
@@ -594,7 +605,7 @@ async def update_routine(
 
 
 @router.delete("/routines/{routine_id}", response_model=DeletedOut, responses=NOT_FOUND)
-async def delete_routine(routine_id: int, user: Any = Depends(current_user)) -> JSONResponse:
+def delete_routine(routine_id: int, user: Any = Depends(current_user)) -> JSONResponse:
     with engine().begin() as conn:
         deleted = routines_module.delete_routine(conn, user.user_id, routine_id)
     if not deleted:
@@ -603,7 +614,7 @@ async def delete_routine(routine_id: int, user: Any = Depends(current_user)) -> 
 
 
 @router.post("/routines/reorder", responses=BAD_INPUT)
-async def reorder_routines(payload: ReorderIn, user: Any = Depends(current_user)) -> JSONResponse:
+def reorder_routines(payload: ReorderIn, user: Any = Depends(current_user)) -> JSONResponse:
     with engine().begin() as conn:
         routines_module.reorder_routines(conn, user.user_id, payload.routine_ids)
         found = routines_module.list_routines(conn, user.user_id)
@@ -616,7 +627,7 @@ async def reorder_routines(payload: ReorderIn, user: Any = Depends(current_user)
 
 
 @router.get("/sessions/active")
-async def get_active_session(user: Any = Depends(current_user)) -> JSONResponse:
+def get_active_session(user: Any = Depends(current_user)) -> JSONResponse:
     """The workout in progress, if any. Polled by the PWA on load.
 
     This is what makes a locked phone or a dropped connection recoverable: the
@@ -628,7 +639,7 @@ async def get_active_session(user: Any = Depends(current_user)) -> JSONResponse:
 
 
 @router.post("/sessions", status_code=201, responses={**BAD_INPUT, **NOT_FOUND})
-async def start_session(
+def start_session(
     payload: StartSessionIn = Body(default_factory=StartSessionIn),
     user: Any = Depends(current_user),
 ) -> JSONResponse:
@@ -650,7 +661,7 @@ async def start_session(
 
 
 @router.get("/sessions/{session_id}", responses=NOT_FOUND)
-async def get_session(session_id: int, user: Any = Depends(current_user)) -> JSONResponse:
+def get_session(session_id: int, user: Any = Depends(current_user)) -> JSONResponse:
     with engine().begin() as conn:
         session = sessions_module.load_session(conn, user.user_id, session_id)
     if session is None:
@@ -675,7 +686,7 @@ async def get_session(session_id: int, user: Any = Depends(current_user)) -> JSO
         **CONFLICT,
     },
 )
-async def log_set(
+def log_set(
     session_id: int,
     payload: LogSetIn,
     idempotency_key: Optional[str] = Header(
@@ -739,7 +750,7 @@ async def log_set(
 
 
 @router.patch("/sets/{log_id}", responses={**BAD_INPUT, **NOT_FOUND})
-async def update_set(
+def update_set(
     log_id: int, payload: UpdateSetIn, user: Any = Depends(current_user)
 ) -> JSONResponse:
     """Correct a set. PATCH: only the fields sent change; null clears one."""
@@ -763,7 +774,7 @@ async def update_set(
 
 
 @router.delete("/sets/{log_id}", response_model=DeletedOut, responses=NOT_FOUND)
-async def delete_set(log_id: int, user: Any = Depends(current_user)) -> JSONResponse:
+def delete_set(log_id: int, user: Any = Depends(current_user)) -> JSONResponse:
     with engine().begin() as conn:
         deleted = sessions_module.delete_set(conn, user.user_id, log_id)
     if not deleted:
@@ -772,7 +783,7 @@ async def delete_set(log_id: int, user: Any = Depends(current_user)) -> JSONResp
 
 
 @router.post("/sessions/{session_id}/finish", responses={**BAD_INPUT, **NOT_FOUND})
-async def finish_session(
+def finish_session(
     session_id: int,
     payload: FinishSessionIn = Body(default_factory=FinishSessionIn),
     user: Any = Depends(current_user),
@@ -789,7 +800,7 @@ async def finish_session(
 
 
 @router.delete("/sessions/{session_id}", response_model=DeletedOut, responses=NOT_FOUND)
-async def discard_session(session_id: int, user: Any = Depends(current_user)) -> JSONResponse:
+def discard_session(session_id: int, user: Any = Depends(current_user)) -> JSONResponse:
     with engine().begin() as conn:
         deleted = sessions_module.discard_session(conn, user.user_id, session_id)
     if not deleted:
@@ -798,7 +809,7 @@ async def discard_session(session_id: int, user: Any = Depends(current_user)) ->
 
 
 @router.get("/sessions", responses=BAD_INPUT)
-async def list_sessions(
+def list_sessions(
     limit: int = Query(20, ge=1, le=100), user: Any = Depends(current_user)
 ) -> JSONResponse:
     with engine().begin() as conn:
@@ -814,7 +825,7 @@ async def list_sessions(
 
 
 @router.get("/exercises/{exercise_id}/previous", responses=BAD_INPUT)
-async def previous_performance(
+def previous_performance(
     exercise_id: int,
     exclude_session_id: Optional[int] = Query(None),
     user: Any = Depends(current_user),
@@ -840,7 +851,7 @@ async def previous_performance(
 
 
 @router.get("/records", responses=BAD_INPUT)
-async def list_records(
+def list_records(
     limit: int = Query(20, ge=1, le=200), user: Any = Depends(current_user)
 ) -> JSONResponse:
     with engine().begin() as conn:
@@ -876,7 +887,7 @@ REBUILD_LIMITER = auth.RateLimiter(REBUILD_LIMIT, REBUILD_WINDOW_SECONDS)
         }
     },
 )
-async def rebuild_records(user: Any = Depends(current_user)) -> JSONResponse:
+def rebuild_records(user: Any = Depends(current_user)) -> JSONResponse:
     """Recompute every record from the logged sets. Rate limited per account.
 
     Exposed because the incremental path can only raise a record, never lower
@@ -910,7 +921,7 @@ async def rebuild_records(user: Any = Depends(current_user)) -> JSONResponse:
 
 
 @router.get("/measurements", responses=BAD_INPUT)
-async def get_measurements(
+def get_measurements(
     days: int = Query(90, ge=1, le=3650),
     since: Optional[str] = Query(None),
     until: Optional[str] = Query(None),
@@ -950,7 +961,7 @@ async def get_measurements(
 
 
 @router.post("/measurements", status_code=201, responses=BAD_INPUT)
-async def add_measurements(
+def add_measurements(
     payload: MeasurementsIn, user: Any = Depends(current_user)
 ) -> JSONResponse:
     """Record one sitting: several sites sharing a timestamp."""
@@ -978,7 +989,7 @@ async def add_measurements(
 @router.delete(
     "/measurements/{measurement_id}", response_model=DeletedOut, responses=NOT_FOUND
 )
-async def remove_measurement(
+def remove_measurement(
     measurement_id: int, user: Any = Depends(current_user)
 ) -> JSONResponse:
     with engine().begin() as conn:

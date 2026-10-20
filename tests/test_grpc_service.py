@@ -36,6 +36,16 @@ def db():
     return FakeLiveDb()
 
 
+@pytest.fixture(autouse=True)
+def _isolated_root_logger(monkeypatch):
+    """The server logs from its own worker threads. If an earlier test left a
+    root handler on a captured stream pytest has since closed, every one of
+    those lines prints a "Logging error" traceback. Start from no handlers."""
+    import logging
+
+    monkeypatch.setattr(logging.getLogger(), "handlers", [])
+
+
 @pytest.fixture
 def service(db, monkeypatch):
     monkeypatch.setattr(
@@ -164,14 +174,25 @@ class TestTelemetry:
                 assert not set(sample.labels) & forbidden, sample
 
 
-def test_the_client_deadline_is_enforced(db, monkeypatch):
+def test_the_client_deadline_is_enforced(db, monkeypatch, caplog):
     """A server slower than the deadline: the client gives up on time."""
-    import time as time_module
+    import logging
+    import threading
+
+    release = threading.Event()
+    served = threading.Event()
+
+    class _Served(logging.Handler):
+        def emit(self, record):
+            if record.getMessage() == "rpc served":
+                served.set()
 
     monkeypatch.setattr(
         auth, "authenticate",
-        lambda conn, username, password: time_module.sleep(1.0) or USER,
+        lambda conn, username, password: release.wait(5) and USER,
     )
+    caplog.set_level(logging.INFO)
+    logging.getLogger().addHandler(_Served())
     metrics = app_metrics.GrpcMetrics(CollectorRegistry())
     server, port = grpc_server.build_server(lambda: db, metrics, "localhost:0")
     server.start()
@@ -181,6 +202,10 @@ def test_the_client_deadline_is_enforced(db, monkeypatch):
         _, code, _, _, elapsed = grpc_client.log_set(
             f"localhost:{port}", request, "demo", "demo-password", deadline=0.2)
     finally:
+        # The handler is still running after the client gave up. Let it finish
+        # and log before this test's logging setup is torn down.
+        release.set()
+        served.wait(5)
         server.stop(grace=None)
     assert code == grpc.StatusCode.DEADLINE_EXCEEDED
     assert elapsed < 900

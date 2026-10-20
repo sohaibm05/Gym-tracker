@@ -11,3 +11,8 @@ httpx==0.28.1
 # Regenerates grpc_gen/ from proto/workout.proto. Only needed after a .proto
 # change, so it is not in the runtime image.
 grpcio-tools==1.80.0
+# Linters. Pinned like everything else: ruff adds rules to the families that
+# ruff.toml selects in minor releases, so an unpinned linter can fail CI on a day
+# nothing in this repository changed. CI's lint job installs only these lines.
+ruff==0.17.0
+shellcheck-py==0.11.0.1

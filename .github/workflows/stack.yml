@@ -1,0 +1,332 @@
+# The whole observability lab, started the way a marker starts it.
+#
+# `python scripts/quickstart.py` builds the app image, starts all eight
+# services with docker compose, seeds the demo account, generates traffic,
+# imports the Kibana objects and verifies every piece. This job fails unless
+# quickstart exits 0, i.e. no check printed [FAIL]. A [WARN] (for example
+# HostLowDisk) is shown as an annotation but does not fail the job, exactly as
+# quickstart itself treats it.
+#
+# It also runs shortened Part E experiments -- E2 (cardinality, ~2 min) and E1
+# (latency fault with 60 s stages, ~4 min) -- checks their numbers through the
+# Prometheus HTTP API, then re-runs `quickstart.py --check`. That happens on the
+# weekly schedule, when started by hand, and on pull requests that touch the
+# experiment code or what the app is built from. Not on pushes to main: the PR
+# already ran them, and a timing flake there would fail a check on the main
+# commit, which also holds back Render (autoDeployTrigger: checksPass).
+#
+# Needs no secrets. DOCKERHUB_USERNAME + DOCKERHUB_TOKEN are optional: when
+# both secrets exist, images are pulled logged in (higher Docker Hub limit);
+# when either is missing, that step is skipped.
+name: Stack
+
+on:
+  pull_request:
+    # Only changes that can affect the running stack. Docs, tests, Vercel and
+    # Render config are covered by the CI workflow and do not start 8 containers.
+    paths:
+      - ".github/workflows/stack.yml"
+      - ".github/scripts/smoke_assert.py"
+      - ".dockerignore"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "requirements.txt"
+      - "schema.sql"
+      - "*.py"
+      - "static/**"
+      - "observability/**"
+      - "!observability/results*/**"
+      - "scripts/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/stack.yml"
+      - ".github/scripts/smoke_assert.py"
+      - ".dockerignore"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "requirements.txt"
+      - "schema.sql"
+      - "*.py"
+      - "static/**"
+      - "observability/**"
+      - "!observability/results*/**"
+      - "scripts/**"
+  schedule:
+    # Mondays 04:23 UTC. Catches drift that no commit made: a new runner image
+    # (ubuntu-latest moves to Ubuntu 26.04, Docker 29 and Compose 5 in
+    # November 2026), a re-pushed python:3.11-slim, a registry change.
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      experiments:
+        description: "Also run shortened Part E1 and E2 and check their results"
+        type: boolean
+        default: true
+      load_seconds:
+        description: "Seconds of generated traffic in quickstart (default 30)"
+        type: number
+        default: 30
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels that PR's older run. A running main
+# run is never cancelled; GitHub keeps only one *pending* run per group, so
+# after a burst of pushes an intermediate main commit may get no run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Explicit bash = `bash -eo pipefail`, so `quickstart.py ... | tee log` fails
+# when quickstart fails. The implicit default has no pipefail.
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  stack:
+    name: Full stack end to end (docker compose + quickstart)
+    runs-on: ubuntu-latest
+    # Expected: ~8 min without the experiments, ~14 min with them.
+    timeout-minutes: 45
+    env:
+      # Empty except on workflow_dispatch; the step falls back to 30. (Not
+      # `inputs.load_seconds || 30`: a requested 0 would become 30.)
+      LOAD_SECONDS: ${{ inputs.load_seconds }}
+      # Booleans only; the token itself is passed to one step below.
+      HAVE_DOCKERHUB_LOGIN: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # On a pull request HEAD is the merge commit; depth 2 brings its first
+          # parent (the base), so the next step can list the files the PR changes.
+          fetch-depth: 2
+
+      # The experiments add ~6 minutes, so a pull request runs them only when
+      # it changes what they exercise. Everything else gets the quickstart run.
+      - name: Decide whether to run the Part E experiments
+        env:
+          EVENT: ${{ github.event_name }}
+          DISPATCH_EXPERIMENTS: ${{ inputs.experiments }}
+        run: |
+          run=false
+          reason="pull request does not touch the experiment code"
+          case "$EVENT" in
+            schedule) run=true; reason="$EVENT" ;;
+            push) run=false; reason="push to main: the pull request already ran them" ;;
+            workflow_dispatch)
+              run="${DISPATCH_EXPERIMENTS:-false}"; reason="workflow_dispatch input experiments=$run" ;;
+            pull_request)
+              pattern='^((app|faults|metrics|logging_setup)\.py|requirements\.txt|Dockerfile|docker-compose\.yml|scripts/(experiment_anomaly\.sh|experiment_cardinality\.sh|load_generator\.py)|observability/(cardinality_demo\.py|prometheus/.*)|\.github/(workflows/stack\.yml|scripts/smoke_assert\.py))$'
+              if changed="$(git diff --name-only HEAD^1 HEAD)"; then
+                if hits="$(grep -E "$pattern" <<<"$changed")"; then
+                  run=true; reason="pull request changes: $(tr '\n' ' ' <<<"$hits")"
+                fi
+              else
+                run=true; reason="could not list the changed files, so running them"
+              fi ;;
+          esac
+          echo "RUN_EXPERIMENTS=$run" >> "$GITHUB_ENV"
+          echo "Part E experiments: $run ($reason)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # quickstart.py and the experiment scripts use only the standard library.
+      # Pinned so the runner image's own Python (3.12 on 24.04, 3.14 on 26.04)
+      # is not one more thing that changes when ubuntu-latest moves.
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # Fails fast, with a reason, on the runner differences that would
+      # otherwise surface minutes later as an unexplained [FAIL].
+      - name: Runner preflight (Docker data root, ports, subnet, disk)
+        timeout-minutes: 2
+        run: |
+          artifacts="$RUNNER_TEMP/stack-smoke"
+          mkdir -p "$artifacts"
+          echo "ARTIFACTS=$artifacts" >> "$GITHUB_ENV"
+          {
+            echo "== host"; uname -a; echo "cpus: $(nproc)"; free -m; df -h /
+            echo "== docker"; docker version; docker compose version
+            docker info --format 'storage={{.Driver}} root={{.DockerRootDir}} logging={{.LoggingDriver}} cgroup={{.CgroupDriver}}/v{{.CgroupVersion}} {{json .DriverStatus}}'
+            echo "== vm.max_map_count: $(sysctl -n vm.max_map_count)"
+            echo "== routes"; ip -4 route
+          } 2>&1 | tee "$artifacts/runner.txt"
+
+          bad=0
+          # Filebeat bind-mounts /var/lib/docker/containers and tails json-file logs.
+          root="$(docker info --format '{{.DockerRootDir}}')"
+          logging="$(docker info --format '{{.LoggingDriver}}')"
+          if [ "$root" != /var/lib/docker ]; then
+            echo "::error title=Docker data root::containers live under $root but docker-compose.yml mounts /var/lib/docker/containers into Filebeat"
+            bad=1
+          fi
+          if [ "$logging" != json-file ]; then
+            echo "::error title=Docker log driver::the default log driver is $logging; Filebeat reads json-file logs"
+            bad=1
+          fi
+          # gym-net is pinned to 172.28.77.0/24; Prometheus scrapes node-exporter at 172.28.77.1:9100.
+          if ip -4 -o addr show | grep -q ' 172\.28\.77\.' || ip -4 route | grep -q '^172\.28\.77\.'; then
+            echo "::error title=Subnet in use::172.28.77.0/24 (gym-net in docker-compose.yml) is already in use on this runner"
+            bad=1
+          fi
+          # quickstart checks 8000, 9090, 3000, 9200 and 5601 itself. It skips
+          # 9100 (node-exporter binds the host's own port) and 8001 (Part E2).
+          python - <<'PY' || bad=1
+          import socket, sys
+          busy = []
+          for port in (9100, 8001):
+              with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                  try:
+                      probe.bind(("0.0.0.0", port))
+                  except OSError:
+                      busy.append(port)
+          for port in busy:
+              print(f"::error title=Port {port} in use::something on the runner already listens on {port}")
+          sys.exit(1 if busy else 0)
+          PY
+          # Single-node Elasticsearch only warns below this, but there is no
+          # reason to run it below the documented minimum.
+          if [ "$(sysctl -n vm.max_map_count)" -lt 262144 ]; then
+            sudo sysctl -w vm.max_map_count=262144
+          fi
+          exit "$bad"
+
+      # The images take ~6.5 GB unpacked. Cleaning is skipped when there is
+      # room, because deleting the Android SDK alone takes about a minute.
+      # 20 GB keeps Elasticsearch far from its 2gb low watermark and the disk
+      # well above HostLowDisk's 10%.
+      - name: Make room for the images if the disk is tight
+        timeout-minutes: 5
+        run: |
+          avail_gb=$(( $(df --output=avail -k / | tail -n 1) / 1024 / 1024 ))
+          echo "Free on /: ${avail_gb} GB"
+          if [ "$avail_gb" -lt 20 ]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
+
+      - name: Log in to Docker Hub (only when both secrets are set)
+        if: env.HAVE_DOCKERHUB_LOGIN == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Separate from `up`, so a registry problem (rate limit, outage) is
+      # retried and reported as a pull failure rather than as a broken stack.
+      # The Elastic images come from docker.elastic.co, the rest from Docker Hub.
+      - name: Pull images
+        timeout-minutes: 12
+        run: |
+          base="$(awk 'toupper($1) == "FROM" { print $2; exit }' Dockerfile)"
+          SECONDS=0
+          for attempt in 1 2 3; do
+            if docker compose pull --ignore-buildable --quiet && docker pull --quiet "$base"; then
+              echo "Pulled in ${SECONDS}s"
+              docker image ls
+              # Nothing after this step needs Docker Hub, and node-exporter and
+              # Filebeat mount host paths, so do not leave a token on disk.
+              if [ "$HAVE_DOCKERHUB_LOGIN" = true ]; then docker logout; fi
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning title=Image pull attempt $attempt failed::retrying"
+              sleep $(( attempt * 30 ))
+            fi
+          done
+          echo "::error title=Image pull failed::see the log above. '429 Too Many Requests' is the Docker Hub pull limit; setting DOCKERHUB_USERNAME and DOCKERHUB_TOKEN raises it"
+          exit 1
+
+      - name: Start, seed and verify the stack (scripts/quickstart.py)
+        id: quickstart
+        timeout-minutes: 20
+        run: python scripts/quickstart.py --load-seconds "${LOAD_SECONDS:-30}" 2>&1 | tee "$ARTIFACTS/quickstart.log"
+
+      - name: Summarise the quickstart checks
+        if: ${{ !cancelled() && steps.quickstart.outcome != 'skipped' }}
+        run: python .github/scripts/smoke_assert.py summary "$ARTIFACTS/quickstart.log" --title "quickstart (build, start, seed, verify)"
+
+      # Part E2 in --stack mode: 100 requests with a unique request_id label,
+      # then the label removed. Before E1, because E1 recreates the app.
+      - name: Part E2 (cardinality through Prometheus)
+        if: env.RUN_EXPERIMENTS == 'true'
+        timeout-minutes: 6
+        run: |
+          export RESULTS_DIR="$ARTIFACTS/e2"
+          bash scripts/experiment_cardinality.sh --stack 2>&1 | tee "$ARTIFACTS/e2.log"
+          python .github/scripts/smoke_assert.py e2 "$RESULTS_DIR"
+
+      # Part E1 with 60 s stages instead of 120 s: baseline, 500 ms on every
+      # 5th request, recovery. p95 and the fault counter are then read back
+      # from Prometheus at the end of each stage's window.
+      - name: Part E1 (latency fault through Prometheus)
+        if: env.RUN_EXPERIMENTS == 'true'
+        timeout-minutes: 10
+        run: |
+          export RESULTS_DIR="$ARTIFACTS/e1" STAGE_SECONDS=60
+          bash scripts/experiment_anomaly.sh 2>&1 | tee "$ARTIFACTS/e1.log"
+          python .github/scripts/smoke_assert.py e1 "$RESULTS_DIR" --threshold 0.3
+
+      # Expected WARNs here, not failures: the business counters are back at 0
+      # (E1 recreated the app) and FaultInjectionActive stays firing for up to
+      # 5 minutes after the fault stage.
+      - name: Stack still passes after the experiments (quickstart --check)
+        id: recheck
+        if: env.RUN_EXPERIMENTS == 'true'
+        timeout-minutes: 8
+        run: python scripts/quickstart.py --check 2>&1 | tee "$ARTIFACTS/quickstart-check.log"
+
+      - name: Summarise quickstart --check
+        if: ${{ !cancelled() && steps.recheck.outcome != 'skipped' }}
+        run: python .github/scripts/smoke_assert.py summary "$ARTIFACTS/quickstart-check.log" --title "quickstart --check after the experiments"
+
+      - name: Collect diagnostics
+        if: ${{ failure() || cancelled() }}
+        timeout-minutes: 5
+        run: |
+          set +e
+          d="${ARTIFACTS:-$RUNNER_TEMP/stack-smoke}/diagnostics"
+          mkdir -p "$d/logs"
+          compose() { docker compose --profile experiment "$@"; }
+          compose ps -a > "$d/compose-ps.txt" 2>&1
+          compose ps -a --format json > "$d/compose-ps.json" 2>&1
+          while read -r service; do
+            compose logs --no-color --timestamps "$service" > "$d/logs/$service.log" 2>&1
+          done < <(compose config --services)
+          docker ps -aq --filter label=com.docker.compose.project=gym-tracker-observability \
+            | xargs -r docker inspect > "$d/docker-inspect.json" 2>&1
+          get() { curl -sS -m 10 "$1" > "$d/$2" 2>&1; }
+          get http://localhost:9090/api/v1/targets prometheus-targets.json
+          get http://localhost:9090/api/v1/alerts prometheus-alerts.json
+          get 'http://localhost:9200/_cluster/health?pretty' es-cluster-health.json
+          get 'http://localhost:9200/_cat/indices?v' es-indices.txt
+          get 'http://localhost:9200/_cat/allocation?v' es-allocation.txt
+          get http://localhost:5601/api/status kibana-status.json
+          { df -h; echo; free -m; echo; docker system df; } > "$d/host.txt" 2>&1
+          # An OOM kill shows up here and nowhere else.
+          sudo dmesg -T 2>/dev/null | tail -n 300 > "$d/dmesg-tail.txt"
+          ls -la "$d" "$d/logs"
+          exit 0
+
+      - name: Upload logs and results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: stack-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/stack-smoke/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # The VM is discarded after the job anyway; this is the command
+      # HOW_TO_RUN.md gives for leaving nothing behind, so it is exercised too.
+      - name: Tear down (docker compose --profile experiment down -v)
+        if: always()
+        timeout-minutes: 5
+        run: docker compose --profile experiment down -v --remove-orphans --timeout 20

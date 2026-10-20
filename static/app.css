@@ -156,6 +156,8 @@ label { display: block; font-size: .8rem; color: var(--text-dim); margin-bottom:
 }
 .settable td { padding: .25rem .25rem; text-align: center; vertical-align: middle; }
 .settable tr.logged td { opacity: .72; }
+/* Queued on the phone, not yet on the server. */
+.settable tr.logged.pending td { opacity: .5; font-style: italic; }
 .settable .setno { width: 2.2rem; color: var(--text-dim); font-weight: 640; font-size: .85rem; }
 .settable .prev {
   width: 5.2rem; color: var(--text-faint); font-size: .8rem;

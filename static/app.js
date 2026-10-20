@@ -43,6 +43,10 @@ const el = (tag, props = {}, ...children) => {
     if (value == null) continue;
     if (key === 'dataset' || (key === 'style' && typeof value === 'object')) {
       Object.assign(node[key], value);
+    } else if (key.includes('-')) {
+      // 'aria-label' and friends are attributes, not properties: assigning
+      // node['aria-label'] just adds an expando the accessibility tree ignores.
+      node.setAttribute(key, value);
     } else {
       node[key] = value;
     }
@@ -250,8 +254,8 @@ function announceRecords(breaks) {
 // ---------------------------------------------------------------------------
 
 const outbox = {
-  // True while a drain is in progress. See flush().
-  flushing: false,
+  // The drain in progress, if any. See flush().
+  draining: null,
 
   read() {
     try { return JSON.parse(localStorage.getItem(OUTBOX_KEY) || '[]'); }
@@ -277,47 +281,145 @@ const outbox = {
    * rejects outright (a 400 — the session was finished elsewhere, say) is
    * dropped rather than retried forever.
    */
-  async flush() {
-    // Re-entrancy guard. flush() is called from boot(), from the `online`
-    // event and from finishWorkout(); two drains running at once both read the
-    // same queue from localStorage — the first has not written its shorter
-    // version yet — and POST the same set twice, giving the workout a
-    // duplicate set and a spurious volume PR.
-    if (this.flushing) return;
-    this.flushing = true;
-    try {
-      let items = this.read();
-      while (items.length) {
-        const entry = items[0];
-        try {
-          // Entries queued before keys existed have none, and go without one.
-          const result = await postSet(entry.session_id, entry.payload, entry.key);
-          if (result.records && result.records.length) announceRecords(result.records);
-          // Keep the screen in step as the queue drains, so a person watching
-          // it sees their sets appear rather than a stale view until the end.
-          if (result.session && state.session
-              && result.session.session_id === state.session.session_id) {
-            state.session = result.session;
-            if (state.view === 'workout') renderWorkout();
-          }
-        } catch (error) {
-          // Only a permanent refusal is dropped. Anything else — a 502 from a
-          // proxy, a dead uplink the browser has not noticed — leaves the set
-          // at the head of the queue and stops the drain, because sets belong
-          // to a session in order and skipping past one reorders the rest.
-          if (!isPermanentFailure(error)) break;
-          toast('A queued set was rejected', error.message, 'bad');
-        }
-        items = items.slice(1);
-        this.write(items);
-      }
-      updateOfflineBanner();
-      if (!items.length) await refreshSession();
-    } finally {
-      this.flushing = false;
+  flush() {
+    // One drain at a time, and every caller waits on the same one.
+    //
+    // flush() is called from boot(), from the `online` event and from
+    // finishWorkout(). Two drains running at once both read the same queue from
+    // localStorage and POST the same set twice. But merely returning early when
+    // one is running is not enough either: finishWorkout() would then "await"
+    // a flush that returned at once and close the session while sets were still
+    // in flight — and the server rejects those as already finished.
+    if (!this.draining) {
+      this.draining = this.drain().finally(() => { this.draining = null; });
     }
+    return this.draining;
+  },
+
+  async drain() {
+    let items = this.read();
+    while (items.length) {
+      const entry = items[0];
+      let result = null;
+      try {
+        // Entries queued before keys existed have none, and go without one.
+        result = await postSet(entry.session_id, entry.payload, entry.key);
+      } catch (error) {
+        // Only a permanent refusal is dropped. Anything else — a 502 from a
+        // proxy, a dead uplink the browser has not noticed — leaves the set
+        // at the head of the queue and stops the drain, because sets belong
+        // to a session in order and skipping past one reorders the rest.
+        if (!isPermanentFailure(error)) break;
+        toast('A queued set was rejected', error.message, 'bad');
+      }
+      // Written BEFORE the screen is updated: adoptSession() overlays whatever
+      // is still queued, and the set just sent must not be drawn twice.
+      items = items.slice(1);
+      this.write(items);
+
+      if (result) {
+        if (result.records && result.records.length) announceRecords(result.records);
+        // Keep the screen in step as the queue drains, so a person watching
+        // it sees their sets appear rather than a stale view until the end.
+        if (result.session && state.session
+            && result.session.session_id === state.session.session_id) {
+          adoptSession(result.session);
+          if (state.view === 'workout') renderWorkout();
+        }
+      }
+    }
+    updateOfflineBanner();
+    if (!items.length) await refreshSession();
+  },
+
+  /** Whether any set for this session is still waiting to be sent. */
+  hasPending(sessionId) {
+    return this.read().some((entry) => entry.session_id === sessionId);
   },
 };
+
+// ---------------------------------------------------------------------------
+// Exercises added to the live workout before any set is logged on them
+// ---------------------------------------------------------------------------
+
+/**
+ * The server only learns about a lift when a set is logged on it, so a block
+ * added from the picker exists only here until then. Without this list, the
+ * next server copy of the session — after logging a set on another lift, or a
+ * re-sync when the phone wakes — silently dropped it.
+ *
+ * Kept in localStorage, keyed by session, so a reload does not lose it either.
+ * `memory` is the fallback for private mode, where storage throws.
+ */
+const ADHOC_KEY = 'gym.adhoc.v1';
+
+const adHoc = {
+  memory: null,
+
+  list(sessionId) {
+    let stored = this.memory;
+    try { stored = JSON.parse(localStorage.getItem(ADHOC_KEY) || 'null') || stored; } catch {}
+    return stored && stored.session_id === sessionId ? stored.blocks : [];
+  },
+  save(sessionId, blocks) {
+    this.memory = { session_id: sessionId, blocks };
+    try { localStorage.setItem(ADHOC_KEY, JSON.stringify(this.memory)); } catch {}
+  },
+  add(sessionId, block) {
+    const blocks = this.list(sessionId).filter((b) => b.exercise_id !== block.exercise_id);
+    blocks.push(block);
+    this.save(sessionId, blocks);
+  },
+  update(sessionId, exerciseId, changes) {
+    this.save(sessionId, this.list(sessionId).map(
+      (b) => (b.exercise_id === exerciseId ? { ...b, ...changes } : b)));
+  },
+  clear() {
+    this.memory = null;
+    try { localStorage.removeItem(ADHOC_KEY); } catch {}
+  },
+};
+
+/**
+ * Take a session fresh from the server and make it the one on screen.
+ *
+ * Overlays the two things only this phone knows: lifts added but not yet
+ * logged, and sets queued in the outbox. Queued sets are drawn as pending rows
+ * so a set logged on a dead connection visibly exists — otherwise the row looks
+ * untouched and the natural reaction is to log it again, queueing a duplicate.
+ *
+ * Only ever pass a session object straight from the API: this mutates it, and
+ * adopting the same object twice would draw the queued sets twice.
+ */
+function adoptSession(session) {
+  if (!session) {
+    state.session = null;
+    return;
+  }
+
+  const known = new Set(session.exercises.map((e) => e.exercise_id));
+  // A block the server now has (because a set was logged on it) is dropped from
+  // the local list; the server's copy is the truth from here on.
+  const pendingBlocks = adHoc.list(session.session_id).filter((b) => !known.has(b.exercise_id));
+  adHoc.save(session.session_id, pendingBlocks);
+  for (const block of pendingBlocks) session.exercises.push({ ...block, sets: [] });
+
+  for (const entry of outbox.read()) {
+    if (entry.session_id !== session.session_id) continue;
+    const block = session.exercises.find((e) => e.exercise_id === entry.payload.exercise_id);
+    if (!block) continue;
+    block.sets.push({ ...entry.payload, log_id: null, pending: true });
+  }
+
+  for (const block of session.exercises) {
+    block.working_sets_done = block.sets.filter((s) => !s.is_warmup).length;
+    block.is_complete = block.target_sets
+      ? block.working_sets_done >= block.target_sets
+      : block.sets.length > 0;
+  }
+
+  state.session = session;
+}
 
 function updateOfflineBanner() {
   const queued = outbox.size;
@@ -471,7 +573,7 @@ async function loadHome() {
     api('/sessions/active'),
   ]);
   state.routines = routines;
-  state.session = session;
+  adoptSession(session);
   renderRoutines();
   renderResume();
   renderActions();
@@ -571,7 +673,7 @@ async function startWorkout(routineId) {
       method: 'POST',
       body: routineId ? { routine_id: routineId } : {},
     });
-    state.session = session;
+    adoptSession(session);
     renderWorkout();
     show('workout', session.name || '');
   } catch (error) {
@@ -583,7 +685,7 @@ async function refreshSession() {
   if (!state.session) return;
   try {
     const { session } = await api(`/sessions/${state.session.session_id}`);
-    state.session = session;
+    adoptSession(session);
     if (state.view === 'workout') renderWorkout();
   } catch { /* offline: keep showing what we have */ }
 }
@@ -629,25 +731,43 @@ function renderExercise(exercise) {
 
   const body = el('tbody');
 
-  // Sets already logged.
+  // Sets already logged, numbered by working set.
+  //
+  // NOT the server's set_number: that orders every set of the lift, warm-ups
+  // included, so after one warm-up the first working set came back as "2" while
+  // the entry row below had just called it "1".
+  let working = 0;
   exercise.sets.forEach((set) => {
-    body.append(el('tr', { className: 'logged' },
+    if (!set.is_warmup) working += 1;
+    body.append(el('tr', { className: set.pending ? 'logged pending' : 'logged' },
       el('td', { className: 'setno' },
-        set.is_warmup ? el('span', { className: 'warmup-tag' }, 'W') : String(set.set_number)),
+        set.is_warmup ? el('span', { className: 'warmup-tag' }, 'W') : String(working)),
       el('td', { className: 'prev' }, ''),
       el('td', { className: 'num' }, trim(set.weight_kg) || '—'),
       el('td', { className: 'num' }, String(set.reps ?? '')),
       el('td', { className: 'tick' },
-        el('button', {
-          className: 'tickbtn on',
-          title: 'Delete this set',
-          onclick: () => deleteSet(set.log_id),
-        }, '✓'))));
+        set.pending
+          // Queued on this phone: there is no server row to delete yet.
+          ? el('button', {
+            className: 'tickbtn', disabled: true, title: 'Waiting to sync',
+            'aria-label': 'Waiting to sync',
+          }, '⏳')
+          : el('button', {
+            className: 'tickbtn on',
+            title: 'Delete this set',
+            onclick: () => deleteSet(set.log_id),
+          }, '✓'))));
   });
 
   // One empty row to log the next set into, pre-filled from last time.
-  const nextNumber = exercise.sets.filter((s) => !s.is_warmup).length + 1;
-  const previous = exercise.previous[Math.min(nextNumber - 1, exercise.previous.length - 1)];
+  //
+  // Lined up against last time's WORKING sets. Indexing the full list matched
+  // working set 1 against last session's warm-up and suggested its weight.
+  // Falls back to every set when last time was all warm-ups.
+  const nextNumber = working + 1;
+  const priorWorking = exercise.previous.filter((s) => !s.is_warmup);
+  const priorSets = priorWorking.length ? priorWorking : exercise.previous;
+  const previous = priorSets[Math.min(nextNumber - 1, priorSets.length - 1)];
   const suggestedWeight = previous ? trim(previous.weight_kg) :
     (exercise.target_weight_kg ? trim(exercise.target_weight_kg) : '');
 
@@ -764,7 +884,7 @@ async function logSet(exercise, weightInput, repsInput, button, asWarmup = false
     // be a second round trip — and a second full session load on the server —
     // for something we are holding.
     if (result.session) {
-      state.session = result.session;
+      adoptSession(result.session);
       renderWorkout();
     } else {
       await refreshSession();
@@ -781,6 +901,14 @@ async function logSet(exercise, weightInput, repsInput, button, asWarmup = false
       // the request fails, and gating the outbox on navigator.onLine meant the
       // set was dropped in exactly the situation the outbox exists for.
       outbox.add({ session_id: state.session.session_id, payload, key });
+      // Drawn as a pending row straight away. Left off the screen, the set
+      // looked like it had not been logged and got logged again.
+      const block = state.session.exercises.find((e) => e.exercise_id === exercise.exercise_id);
+      if (block) {
+        block.sets.push({ ...payload, log_id: null, pending: true });
+        if (!asWarmup) block.working_sets_done += 1;
+      }
+      renderWorkout();
       toast('Saved on this phone', 'It will sync when the connection is back.');
       if (!asWarmup) rest.start(exercise.rest_seconds || 120, exercise.name);
     }
@@ -801,12 +929,20 @@ async function deleteSet(logId) {
 
 async function finishWorkout() {
   if (outbox.size) await outbox.flush();
+  // Finishing with sets still queued would lose them: the server refuses a set
+  // for a finished workout, and the outbox drops a refused set for good.
+  if (outbox.hasPending(state.session.session_id)) {
+    toast('Sets still waiting to sync',
+      'Finish once the connection is back, so none of them are lost.', 'bad');
+    return;
+  }
   try {
     const { session } = await api(`/sessions/${state.session.session_id}/finish`, {
       method: 'POST', body: {},
     });
     rest.stop();
     state.session = null;
+    adHoc.clear();
     toast('Workout saved',
       `${session.total_sets} sets · ${trim(session.total_volume_kg)} kg · ${mmss(session.duration_seconds)}`);
     await loadHome();
@@ -819,9 +955,15 @@ async function finishWorkout() {
 async function discardWorkout() {
   if (!confirm('Discard this workout and every set in it? This cannot be undone.')) return;
   try {
-    await api(`/sessions/${state.session.session_id}`, { method: 'DELETE' });
+    const discarded = state.session.session_id;
+    await api(`/sessions/${discarded}`, { method: 'DELETE' });
     rest.stop();
     state.session = null;
+    adHoc.clear();
+    // Sets queued for the discarded workout would only be refused later, one
+    // "rejected" toast each.
+    outbox.write(outbox.read().filter((entry) => entry.session_id !== discarded));
+    updateOfflineBanner();
     await loadHome();
     show('home');
   } catch (error) {
@@ -951,26 +1093,39 @@ async function pickExercise(item) {
     // Added to a live workout: log nothing, just make the block appear. A zero
     // set would be a lie; the exercise showing up with an empty row is the
     // intent.
-    state.session.exercises.push({
-      exercise_id: exercise.exercise_id,
-      name: exercise.name,
-      muscle_group: exercise.muscle_group,
-      equipment: exercise.equipment,
-      equipment_label: exercise.equipment_label,
-      is_bodyweight: false,
-      position: 1000 + state.session.exercises.length,
-      target_sets: null, target_reps_label: '', target_weight_kg: null,
-      rest_seconds: 120, sets: [], previous: [], previous_date: null,
-      working_sets_done: 0, is_complete: false, added_ad_hoc: true,
-    });
+    const sessionId = state.session.session_id;
+    if (!state.session.exercises.some((e) => e.exercise_id === exercise.exercise_id)) {
+      const block = {
+        exercise_id: exercise.exercise_id,
+        name: exercise.name,
+        muscle_group: exercise.muscle_group,
+        equipment: exercise.equipment,
+        equipment_label: exercise.equipment_label,
+        // From the server, never assumed: a pull-up with an empty weight is a
+        // complete set, and hard-coding false demanded a weight for it.
+        is_bodyweight: Boolean(exercise.is_bodyweight ?? item.is_bodyweight),
+        position: 1000 + state.session.exercises.length,
+        target_sets: null, target_reps_label: '', target_weight_kg: null,
+        rest_seconds: 120, previous: [], previous_date: null,
+        added_ad_hoc: true,
+      };
+      // Remembered until a set is logged on it; see adHoc.
+      adHoc.add(sessionId, block);
+      state.session.exercises.push({
+        ...block, sets: [], working_sets_done: 0, is_complete: false,
+      });
+    }
     renderWorkout();
     show('workout', state.session.name || '');
 
     // Fill in last time's numbers in the background.
     try {
       const data = await api(
-        `/exercises/${exercise.exercise_id}/previous?exclude_session_id=${state.session.session_id}`);
-      const block = state.session.exercises.find((e) => e.exercise_id === exercise.exercise_id);
+        `/exercises/${exercise.exercise_id}/previous?exclude_session_id=${sessionId}`);
+      adHoc.update(sessionId, exercise.exercise_id,
+        { previous: data.previous, previous_date: data.previous_date });
+      const block = state.session
+        && state.session.exercises.find((e) => e.exercise_id === exercise.exercise_id);
       if (block) {
         block.previous = data.previous;
         block.previous_date = data.previous_date;

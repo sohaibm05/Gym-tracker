@@ -1,0 +1,6 @@
+# Linters for the workflow files, installed only by CI's lint job (not by
+# requirements-dev.txt): actionlint-py downloads the actionlint binary from
+# GitHub at install time and checks it against a pinned sha256.
+# Kept in a requirements file so Dependabot proposes their updates too.
+actionlint-py==1.7.12.25
+zizmor==1.30.1

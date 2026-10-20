@@ -1,0 +1,88 @@
+# Checks the live Vercel production site after each production deploy.
+#
+# Vercel deploys through its own GitHub integration, not from CI. When a
+# deployment finishes it reports back as a GitHub deployment status: creator
+# vercel[bot], environment "Production" for main and "Preview" for every other
+# branch (those names come from this repository's deployments list). Running
+# on that event, instead of on the push, means the check sees the deployment
+# that just went live rather than racing the build and hitting the old one.
+#
+# Needs no secrets: /healthz is public and the job never checks out the repo.
+# Preview deployments trigger the workflow too, and the job is skipped for them.
+name: Post-deploy smoke test
+
+on:
+  deployment_status:
+
+permissions: {}
+
+# A newer production deployment makes an older check pointless.
+concurrency:
+  group: post-deploy-smoke-${{ github.event.deployment.environment }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  vercel-production:
+    name: Vercel production /healthz
+    if: >-
+      github.event.deployment_status.state == 'success' &&
+      github.event.deployment.environment == 'Production' &&
+      github.event.deployment.creator.login == 'vercel[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # The production domain. A repository variable overrides it if the
+      # project is renamed or gets a custom domain.
+      PRODUCTION_URL: ${{ vars.PRODUCTION_URL || 'https://gym-tracker-sobu1.vercel.app' }}
+      # This deployment's own URL. Vercel's default Deployment Protection
+      # answers 401 there, which is reported and not counted as a failure.
+      DEPLOYMENT_URL: ${{ github.event.deployment_status.environment_url || github.event.deployment_status.target_url }}
+      ATTEMPTS: "6"
+      RETRY_DELAY_SECONDS: "10"
+    steps:
+      # Retries absorb a cold start of the Python function. A 200 whose body is
+      # not {"status": "ok"} fails: "degraded" means fault injection is armed
+      # in production.
+      - name: GET /healthz
+        run: |
+          probe() {
+            local url="${1%/}/healthz" label="$2" protected_ok="$3"
+            local body="$RUNNER_TEMP/healthz.json" code=000 status attempt
+            for attempt in $(seq 1 "$ATTEMPTS"); do
+              code="$(curl -sS -m 15 -o "$body" -w '%{http_code}' "$url")" || code=000
+              if [ "$code" = 200 ]; then
+                break
+              fi
+              if [ "$protected_ok" = yes ] && { [ "$code" = 401 ] || [ "$code" = 403 ]; }; then
+                echo "::notice title=${label}::${url} answered HTTP ${code} (Vercel Deployment Protection), so only the production URL is checked."
+                return 0
+              fi
+              echo "${label}: attempt ${attempt}/${ATTEMPTS}: HTTP ${code}"
+              if [ "$attempt" -lt "$ATTEMPTS" ]; then
+                sleep "$RETRY_DELAY_SECONDS"
+              fi
+            done
+            if [ "$code" != 200 ]; then
+              echo "::error title=${label}::GET ${url} returned HTTP ${code} after ${ATTEMPTS} attempts"
+              return 1
+            fi
+            status="$(jq -r '.status // empty' "$body" 2>/dev/null)" || status=""
+            if [ "$status" != ok ]; then
+              echo "::error title=${label}::GET ${url} returned status '${status:-not JSON}', expected 'ok': $(head -c 300 "$body")"
+              return 1
+            fi
+            echo "${label}: GET ${url} -> $(cat "$body")"
+            echo "- ${label}: \`GET ${url}\` -> \`$(cat "$body")\`" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          echo "### Vercel production smoke test (${GITHUB_SHA:0:7})" >> "$GITHUB_STEP_SUMMARY"
+          rc=0
+          if [ -n "$DEPLOYMENT_URL" ]; then
+            probe "$DEPLOYMENT_URL" "This deployment" yes || rc=1
+          fi
+          probe "$PRODUCTION_URL" "Production URL" no || rc=1
+          exit "$rc"

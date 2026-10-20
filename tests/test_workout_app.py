@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 import re
 import sys
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -621,7 +621,7 @@ class TestMeasurementQueriesAreScoped:
         """
         import ast
 
-        source = Path(module.__file__).read_text()
+        source = Path(module.__file__).read_text(encoding="utf-8")
         offenders: list[str] = []
 
         for node in ast.walk(ast.parse(source)):
@@ -744,8 +744,6 @@ class TestAgainstPostgres:
     def test_previous_performance_is_one_earlier_session(self, engine):
         """Not "the last N sets" — repeating a workout would splice two
         different days into a Previous column that never happened."""
-        import sqlalchemy as sa
-
         with engine.begin() as conn:
             exercise_id = sessions_module.resolve_exercise(conn, 1, "Squat (Barbell)")
             first = sessions_module.start_session(conn, 1, name="A")
@@ -901,7 +899,7 @@ class TestSearchKeyAgreement:
             Path(__file__).resolve().parents[1]
             / "migrations"
             / "003_routines_sessions_measurements.sql"
-        ).read_text()
+        ).read_text(encoding="utf-8")
         assert "btrim(" in migration, "the backfill must trim, or trailing punctuation lingers"
         assert "translate(" in migration, "the backfill must fold accents"
         # And the Python side is the definition both agree on.
@@ -914,7 +912,7 @@ class TestSearchKeyAgreement:
         lift became two rows with two separate histories."""
         import pipeline
 
-        source = Path(pipeline.__file__).read_text()
+        source = Path(pipeline.__file__).read_text(encoding="utf-8")
         insert = source[source.index("INSERT INTO exercises"):]
         insert = insert[: insert.index("RETURNING")]
         assert "search_key" in insert
@@ -926,7 +924,7 @@ class TestPackaging:
         where docker history exposes it to anyone who can pull."""
         patterns = {
             line.strip()
-            for line in (Path(__file__).resolve().parents[1] / ".dockerignore").read_text().splitlines()
+            for line in (Path(__file__).resolve().parents[1] / ".dockerignore").read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.startswith("#")
         }
         for required in (".env", ".venv/", ".git/"):
@@ -935,7 +933,7 @@ class TestPackaging:
     def test_the_cardinality_demo_still_reaches_the_image(self):
         """docker-compose runs it from the app image, so excluding
         observability/ wholesale would break the Part E2 service."""
-        ignore = (Path(__file__).resolve().parents[1] / ".dockerignore").read_text()
+        ignore = (Path(__file__).resolve().parents[1] / ".dockerignore").read_text(encoding="utf-8")
         assert "observability/\n" not in ignore
         assert "observability/cardinality_demo.py" not in ignore
 
@@ -1062,7 +1060,6 @@ class TestPostgresRegressions:
         whole session after every logged set — so one tap cost a query per lift
         in the routine, on gym wifi.
         """
-        import sqlalchemy as sa
         from sqlalchemy import event
 
         counter = {"n": 0}

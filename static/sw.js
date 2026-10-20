@@ -30,7 +30,7 @@
 // Bump to invalidate the shell cache. The version is in the name rather than in
 // the entries, so activating a new worker drops the whole old cache at once and
 // cannot leave a half-updated mix of old and new assets.
-const CACHE = 'gym-shell-v3';
+const CACHE = 'gym-shell-v4';
 
 // /workout is deliberately NOT pre-cached at install time.
 //
