@@ -4,7 +4,7 @@
 # Postgres driver and broke every database call on a clean build. Bump these
 # deliberately, then re-run `pytest -q` and the stack, rather than by accident.
 groq==1.7.0
-pydantic==2.14.0
+pydantic==2.14.1
 sqlalchemy==2.1.4
 psycopg2-binary==2.9.13
 fastapi==0.143.0
