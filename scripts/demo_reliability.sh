@@ -45,11 +45,20 @@ restore() {
 trap restore EXIT
 
 echo "restarting the app with injected latency (3s on every 4th /api/sessions/ request)"
+# MSYS2_ENV_CONV_EXCL: Git Bash on Windows otherwise rewrites the prefix into
+# "C:/Program Files/Git/api/sessions/" on its way to docker.exe, and the fault
+# never matches a request.
+MSYS2_ENV_CONV_EXCL=FAULT_PATH_PREFIX \
 FAULT_INJECTION_ENABLED=true FAULT_LATENCY_MS=3000 FAULT_LATENCY_EVERY_N=4 \
   FAULT_PATH_PREFIX=/api/sessions/ docker compose up -d app >/dev/null
 wait_healthy
 
-"$PY" clients/http_caller.py --calls 18 --interval 1 | tee "$OUT" &
+# 30 calls, so the run outlasts the outage and the 10s recovery period and the
+# breaker's trial call is seen closing it.
+# Appending, so the ">>>" markers below land between the caller's lines
+# instead of being overwritten by them.
+: > "$OUT"
+"$PY" clients/http_caller.py --calls 30 --interval 1 | tee -a "$OUT" &
 caller=$!
 
 sleep 9

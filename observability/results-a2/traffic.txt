@@ -17,9 +17,36 @@ round 2
   gRPC repeat same key  OK  replayed
   gRPC reps = 0         INVALID_ARGUMENT  Reps must be between 1 and 500.
   gRPC no such workout  NOT_FOUND  That workout does not exist.
+round 3
+  HTTP valid            201  written
+  HTTP repeat same key  200  replayed
+  HTTP reps = 0         400  Reps must be between 1 and 500.
+  HTTP no such workout  404  That workout does not exist.
+  gRPC valid            OK  written
+  gRPC repeat same key  OK  replayed
+  gRPC reps = 0         INVALID_ARGUMENT  Reps must be between 1 and 500.
+  gRPC no such workout  NOT_FOUND  That workout does not exist.
+round 4
+  HTTP valid            201  written
+  HTTP repeat same key  200  replayed
+  HTTP reps = 0         400  Reps must be between 1 and 500.
+  HTTP no such workout  404  That workout does not exist.
+  gRPC valid            OK  written
+  gRPC repeat same key  OK  replayed
+  gRPC reps = 0         INVALID_ARGUMENT  Reps must be between 1 and 500.
+  gRPC no such workout  NOT_FOUND  That workout does not exist.
+round 5
+  HTTP valid            201  written
+  HTTP repeat same key  200  replayed
+  HTTP reps = 0         400  Reps must be between 1 and 500.
+  HTTP no such workout  404  That workout does not exist.
+  gRPC valid            OK  written
+  gRPC repeat same key  OK  replayed
+  gRPC reps = 0         INVALID_ARGUMENT  Reps must be between 1 and 500.
+  gRPC no such workout  NOT_FOUND  That workout does not exist.
 rate limit: POST /api/records/rebuild x5
-  call 1: 200  {"rebuilt":3}
-  call 2: 200  {"rebuilt":3}
-  call 3: 200  {"rebuilt":3}
+  call 1: 200  {"rebuilt":15}
+  call 2: 200  {"rebuilt":15}
+  call 3: 200  {"rebuilt":15}
   call 4: 429  Retry-After: 60s
   call 5: 429  Retry-After: 60s

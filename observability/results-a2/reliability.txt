@@ -1,0 +1,64 @@
+[00:55:31.484] settings: timeout 2.0s, 2 retries (backoff 0.5s doubling, +25% jitter), breaker opens after 3 consecutive failures and tries again after 10.0s
+[00:55:31.645] start workout attempt 1 -> 201 (161 ms, request id fa6b4c9dc67c4a7d)
+[00:55:31.645] workout 2 is live
+[00:55:31.747] set 1 attempt 1 -> 201 (102 ms, request id be9e94c3a61f40a6)
+[00:55:31.747] set 1 written: log_id 87, 62.5 × 8
+[00:55:32.836] set 2 attempt 1 -> 201 (90 ms, request id 03afdf751e6e4b27)
+[00:55:32.836] set 2 written: log_id 88, 65 × 8
+[00:55:33.931] set 3 attempt 1 -> 201 (94 ms, request id db72f05f1d944e8d)
+[00:55:33.931] set 3 written: log_id 89, 67.5 × 8
+[00:55:36.940] set 4 attempt 1 -> timed out after 2.0s; retrying in 0.57s
+[00:55:37.611] set 4 attempt 2 -> 201 (96 ms, request id 6dd04b09e38c4095)
+[00:55:37.611] set 4 written: log_id 90, 70 × 8
+[00:55:38.702] set 5 attempt 1 -> 201 (90 ms, request id 551e9345ae354467)
+[00:55:38.702] set 5 written: log_id 91, 72.5 × 8
+>>> stopping the app container
+[00:55:39.803] set 6 attempt 1 -> 201 (101 ms, request id f2c0645dd14d40ed)
+[00:55:39.803] set 6 written: log_id 92, 75 × 8
+[00:55:40.826] set 7 attempt 1 -> ReadError: [WinError 10053] An established connection was aborted by the software in your host machine; retrying in 0.59s
+[00:55:45.436] set 7 attempt 2 -> timed out after 2.0s; retrying in 1.25s
+[00:55:50.705] breaker OPEN after 3 consecutive failure(s): blocking calls for 10s
+[00:55:50.705] set 7 attempt 3 -> timed out after 2.0s; no retries left
+[00:55:50.705] set 7 failed: timed out after 2.0s
+[00:55:51.706] set 8 blocked: circuit open, 9.0s until a trial call
+[00:55:52.706] set 9 blocked: circuit open, 8.0s until a trial call
+>>> starting the app container
+[00:55:53.707] set 10 blocked: circuit open, 7.0s until a trial call
+[00:55:54.707] set 11 blocked: circuit open, 6.0s until a trial call
+[00:55:55.708] set 12 blocked: circuit open, 5.0s until a trial call
+[00:55:56.708] set 13 blocked: circuit open, 4.0s until a trial call
+[00:55:57.709] set 14 blocked: circuit open, 3.0s until a trial call
+[00:55:58.709] set 15 blocked: circuit open, 2.0s until a trial call
+[00:55:59.709] set 16 blocked: circuit open, 1.0s until a trial call
+[00:56:00.710] breaker HALF_OPEN: letting one trial call through
+[00:56:00.891] breaker CLOSED: trial call succeeded, normal service resumed
+[00:56:00.891] set 17 attempt 1 -> 201 (181 ms, request id ddf808658c8e49ff)
+[00:56:00.891] set 17 written: log_id 93, 102.5 × 8
+[00:56:01.975] set 18 attempt 1 -> 201 (84 ms, request id d88def3fb6c8421e)
+[00:56:01.975] set 18 written: log_id 94, 105 × 8
+[00:56:03.059] set 19 attempt 1 -> 201 (83 ms, request id 641c4badb23e4098)
+[00:56:03.059] set 19 written: log_id 95, 107.5 × 8
+[00:56:06.074] set 20 attempt 1 -> timed out after 2.0s; retrying in 0.58s
+[00:56:06.768] set 20 attempt 2 -> 201 (110 ms, request id 9f522282a7044194)
+[00:56:06.768] set 20 written: log_id 96, 110 × 8
+[00:56:07.860] set 21 attempt 1 -> 201 (91 ms, request id 1a2619e1a12e42d8)
+[00:56:07.860] set 21 written: log_id 97, 112.5 × 8
+[00:56:08.975] set 22 attempt 1 -> 201 (114 ms, request id 12eff2adfcb14049)
+[00:56:08.975] set 22 written: log_id 98, 115 × 8
+[00:56:11.992] set 23 attempt 1 -> timed out after 2.0s; retrying in 0.60s
+[00:56:12.701] set 23 attempt 2 -> 201 (111 ms, request id 28b419b6ec3344e7)
+[00:56:12.701] set 23 written: log_id 99, 117.5 × 8
+[00:56:13.782] set 24 attempt 1 -> 201 (81 ms, request id f535baf2f3834b5f)
+[00:56:13.782] set 24 written: log_id 100, 120 × 8
+[00:56:14.871] set 25 attempt 1 -> 201 (88 ms, request id d34a9e579d3b4f6a)
+[00:56:14.871] set 25 written: log_id 101, 122.5 × 8
+[00:56:17.875] set 26 attempt 1 -> timed out after 2.0s; retrying in 0.55s
+[00:56:20.441] set 26 attempt 2 -> timed out after 2.0s; retrying in 1.13s
+[00:56:23.573] breaker OPEN after 3 consecutive failure(s): blocking calls for 10s
+[00:56:23.573] set 26 attempt 3 -> timed out after 2.0s; no retries left
+[00:56:23.573] set 26 failed: timed out after 2.0s
+[00:56:24.574] set 27 blocked: circuit open, 9.0s until a trial call
+[00:56:25.574] set 28 blocked: circuit open, 8.0s until a trial call
+[00:56:26.575] set 29 blocked: circuit open, 7.0s until a trial call
+[00:56:27.575] set 30 blocked: circuit open, 6.0s until a trial call
+[00:56:27.575] summary: written 15, replayed 0, blocked 13, failed 2, refused 0
