@@ -66,7 +66,8 @@ The user task is **logging a set during a live workout**. Over HTTP it is
 `gymtracker.v1.WorkoutService/LogSet`, served by a second process
 (`grpc_server.py`, container `gym-grpc`). Both call `sessions.log_set` on the
 same Postgres database. The report is
-**[docs/assignment2-report.md](docs/assignment2-report.md)**.
+**[docs/Assignment2-HTTP-gRPC-Metrics.docx](docs/Assignment2-HTTP-gRPC-Metrics.docx)**,
+with the call-path diagram in [docs/a2-call-paths.png](docs/a2-call-paths.png).
 
 ### Run
 
