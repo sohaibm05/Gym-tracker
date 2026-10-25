@@ -1,0 +1,13 @@
+$ python clients/grpc_client.py --session-id 1 --exercise "Bench Press (Barbell)" --weight 82.5 --reps 8 --request-id a2-grpc-ok
+status:     OK (133 ms, deadline 2.0s)
+request id: a2-grpc-ok
+written:    log_id 48, Bench Press (Barbell) set 12: 82.5 × 8
+record:     Heaviest weight 82.5
+record:     Best estimated 1RM 104.5
+(exit 0)
+
+$ python clients/grpc_client.py --session-id 1 --exercise "Bench Press (Barbell)" --weight 82.5 --reps 0 --request-id a2-grpc-fail
+status:     INVALID_ARGUMENT (123 ms, deadline 2.0s)
+request id: a2-grpc-fail
+error:      Reps must be between 1 and 500.
+(exit 1)
