@@ -502,13 +502,18 @@ jobs:
       # its compiled wheels and answers /healthz, not merely that it was built.
       # Emulated Python is several times slower, so the image's 3s probe
       # timeout and 20s start period are relaxed for this run only; the probe
-      # command itself is the image's own.
+      # command itself is the image's own. The amd64 step left this digest in
+      # the local image store, and Docker's containerd store then refuses to
+      # pull the arm64 variant under it ("cannot overwrite digest"), so the
+      # local copy is removed first.
       - name: Smoke test the pushed digest (linux/arm64, emulated)
         env:
           REF: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
           SMOKE_TIMEOUT: "300"
           SMOKE_RUN_ARGS: --health-timeout=30s --health-start-period=240s --health-interval=5s
-        run: bash .github/scripts/smoke_image.sh "$REF" linux/arm64
+        run: |
+          docker image rm "$REF" || true
+          bash .github/scripts/smoke_image.sh "$REF" linux/arm64
 
       # GitHub-signed SLSA provenance (Sigstore), stored by GitHub and pushed
       # next to the image. Verify with:
