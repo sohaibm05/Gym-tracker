@@ -23,4 +23,4 @@ prometheus-client==0.26.0
 # least the version the code in grpc_gen/ was generated against (6.31.1); the
 # generated module checks this at import and refuses an older runtime.
 grpcio==1.80.0
-protobuf==6.33.6
+protobuf==7.36.2
