@@ -69,6 +69,11 @@ same Postgres database. The report is
 **[docs/Assignment2-HTTP-gRPC-Metrics.docx](docs/Assignment2-HTTP-gRPC-Metrics.docx)**,
 with the call-path diagram in [docs/a2-call-paths.png](docs/a2-call-paths.png).
 
+A narrated demo video (about 13 minutes) walks through Parts A to C against the
+running stack: **[docs/video/assignment2-demo.mp4](docs/video/assignment2-demo.mp4)**,
+with captions in [assignment2-demo.srt](docs/video/assignment2-demo.srt) and the
+narration as text, with scene timestamps, in [transcript.md](docs/video/transcript.md).
+
 ### Run
 
 ```bash

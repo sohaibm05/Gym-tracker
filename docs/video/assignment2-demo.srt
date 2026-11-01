@@ -1,0 +1,703 @@
+1
+00:00:00,350 --> 00:00:06,867
+This is the Assignment 2 demo: HTTP APIs, gRPC and metrics, built on the Gym Tracker
+
+2
+00:00:06,867 --> 00:00:08,264
+from Assignment 1.
+
+3
+00:00:08,544 --> 00:00:11,744
+The user task is logging one set during a live workout.
+
+4
+00:00:12,024 --> 00:00:18,360
+Over HTTP it is a POST to a workout's sets; over gRPC it is WorkoutService.LogSet,
+
+5
+00:00:18,360 --> 00:00:20,600
+served by a separate process.
+
+6
+00:00:20,880 --> 00:00:25,856
+We go through Part A, the HTTP API; Part B, the gRPC service;
+
+7
+00:00:25,856 --> 00:00:27,814
+and Part C, the metrics.
+
+8
+00:00:28,994 --> 00:00:31,447
+Everything runs locally with Docker Compose.
+
+9
+00:00:31,727 --> 00:00:37,459
+Beside the app container, gym-tracker, is the new gym-grpc container, both on the same
+
+10
+00:00:37,459 --> 00:00:42,457
+Postgres, with Prometheus, Grafana and the Elastic stack from Assignment 1.
+
+11
+00:00:43,637 --> 00:00:45,835
+Part A starts with the six REST constraints.
+
+12
+00:00:46,115 --> 00:00:51,032
+Client-server: the browser app and the Python caller share only the JSON contract with
+
+13
+00:00:51,032 --> 00:00:51,661
+the server.
+
+14
+00:00:51,941 --> 00:00:56,571
+Stateless: every request carries its credentials and names its resource in the path.
+
+15
+00:00:56,851 --> 00:01:00,083
+Cacheable, partly: static files carry Cache-Control;
+
+16
+00:01:00,083 --> 00:01:02,632
+per-user JSON is deliberately not cached.
+
+17
+00:01:02,912 --> 00:01:08,267
+Uniform interface: plural nouns, standard methods, real status codes, one error body.
+
+18
+00:01:08,547 --> 00:01:13,837
+Layered system: clients only know a base URL, so a proxy in between changes nothing.
+
+19
+00:01:14,117 --> 00:01:19,702
+And code on demand, the optional one, is shown: the browser runs the app.js and service
+
+20
+00:01:19,702 --> 00:01:21,243
+worker the server sends.
+
+21
+00:01:22,423 --> 00:01:26,583
+Every endpoint under /api was reviewed, leaving out health and metrics.
+
+22
+00:01:26,863 --> 00:01:30,703
+For logging a set, this table compares the old endpoint with the new one.
+
+23
+00:01:30,983 --> 00:01:36,190
+The singular path became the plural /api/sessions, with the old path kept as a
+
+24
+00:01:36,190 --> 00:01:38,727
+deprecated alias for installed phones.
+
+25
+00:01:39,007 --> 00:01:44,641
+Untyped dictionaries became typed models, so bad input is a 400 before any database
+
+26
+00:01:44,641 --> 00:01:44,980
+work.
+
+27
+00:01:45,260 --> 00:01:51,276
+Errors now use 400, 401, 404, 409, 429 or 500,
+
+28
+00:01:51,556 --> 00:01:55,204
+always in one body with a code, a message and the request id.
+
+29
+00:01:55,484 --> 00:01:58,236
+And an Idempotency-Key header makes retries safe.
+
+30
+00:01:58,516 --> 00:02:03,846
+Elsewhere, /session became /sessions, PUT became PATCH, the rebuild endpoint gained a
+
+31
+00:02:03,846 --> 00:02:08,799
+rate limit, and the rest were left alone. The browser app was updated to match.
+
+32
+00:02:09,979 --> 00:02:16,196
+The OpenAPI Specification is a standard, machine-readable description of an HTTP API:
+
+33
+00:02:16,196 --> 00:02:21,243
+its paths, methods, parameters, bodies, responses and authentication.
+
+34
+00:02:21,523 --> 00:02:26,876
+Tools read it to render documentation, generate clients, and test requests, so it is the
+
+35
+00:02:26,876 --> 00:02:29,309
+contract between an API and its callers.
+
+36
+00:02:29,589 --> 00:02:34,365
+Here it is generated from the code, and a test fails if the committed file and the code
+
+37
+00:02:34,365 --> 00:02:34,859
+disagree.
+
+38
+00:02:35,875 --> 00:02:40,397
+Swagger UI renders the spec, with every route, its inputs and its responses.
+
+39
+00:02:40,677 --> 00:02:44,261
+We authorize with the demo account and try the log-a-set endpoint.
+
+40
+00:02:49,859 --> 00:02:53,482
+The request has an Idempotency-Key header and a body:
+
+41
+00:02:53,482 --> 00:02:55,875
+the exercise, 80 kilograms, 8 reps.
+
+42
+00:02:58,747 --> 00:03:02,779
+The answer is 201 Created, with the new set and its log id.
+
+43
+00:03:03,059 --> 00:03:05,278
+The same request again, with the same key,
+
+44
+00:03:07,845 --> 00:03:12,143
+returns 200, with idempotent-replayed: true and the same log id.
+
+45
+00:03:12,143 --> 00:03:13,755
+Nothing new was written.
+
+46
+00:03:14,035 --> 00:03:15,379
+With reps set to zero,
+
+47
+00:03:22,385 --> 00:03:27,803
+the answer is 400, in the shared error format: a code, a message and the request id.
+
+48
+00:03:28,983 --> 00:03:34,199
+Logging a set is what gets retried: on gym wifi, a response can be lost after the set
+
+49
+00:03:34,199 --> 00:03:34,935
+was written.
+
+50
+00:03:35,215 --> 00:03:39,034
+So the client sends one key per set, unchanged on every retry.
+
+51
+00:03:39,314 --> 00:03:43,983
+The server stores it under a unique index per account, looks it up first, and returns
+
+52
+00:03:43,983 --> 00:03:46,290
+the stored set instead of writing another.
+
+53
+00:03:46,570 --> 00:03:50,026
+Two copies racing past the lookup are settled by that index.
+
+54
+00:03:50,306 --> 00:03:55,479
+Other calls are safe to repeat by design: starting a workout returns the live one, and
+
+55
+00:03:55,479 --> 00:03:58,306
+rebuilding records twice gives the same result.
+
+56
+00:03:59,486 --> 00:04:04,073
+Rate limiting protects POST /api/records/rebuild, the most expensive call.
+
+57
+00:04:04,353 --> 00:04:07,723
+The limit is three calls per sixty seconds, in a sliding window,
+
+58
+00:04:08,003 --> 00:04:11,587
+shared by everything one account does; other users are unaffected.
+
+59
+00:04:11,867 --> 00:04:15,985
+Every attempt counts, and Retry-After says when a call will be accepted again.
+
+60
+00:04:24,155 --> 00:04:29,403
+Five calls: three are accepted, and the fourth and fifth get 429 Too Many Requests.
+
+61
+00:04:29,683 --> 00:04:33,779
+The full response has Retry-After: 60 and the standard error body.
+
+62
+00:04:34,803 --> 00:04:38,280
+After waiting those 60 seconds, the call is accepted again.
+
+63
+00:04:39,460 --> 00:04:43,620
+The tests cover a valid request, invalid input and a repeated request.
+
+64
+00:04:43,900 --> 00:04:49,766
+201 for a valid set, 400 in the shared shape for bad input, and one row for a repeat,
+
+65
+00:04:49,766 --> 00:04:53,010
+even with two copies racing on a real Postgres.
+
+66
+00:04:53,290 --> 00:04:55,444
+All 56 Assignment 2 tests pass,
+
+67
+00:04:57,495 --> 00:05:00,759
+and the committed OpenAPI document matches the code.
+
+68
+00:05:01,939 --> 00:05:06,939
+The Python caller plays another service, say a watch app's sync job, logging several
+
+69
+00:05:06,939 --> 00:05:07,891
+sets in one run.
+
+70
+00:05:08,171 --> 00:05:10,411
+Each attempt times out after 2 seconds.
+
+71
+00:05:10,691 --> 00:05:15,315
+A failure is retried at most twice, with backoff from half a second, doubling, plus
+
+72
+00:05:15,315 --> 00:05:15,705
+jitter.
+
+73
+00:05:15,985 --> 00:05:21,115
+Only timeouts, connection errors and 5xx are retried, never a 4xx, and the
+
+74
+00:05:21,115 --> 00:05:24,305
+Idempotency-Key makes retrying this POST safe.
+
+75
+00:05:24,585 --> 00:05:29,662
+The circuit breaker opens after three consecutive failures and allows one trial call
+
+76
+00:05:29,662 --> 00:05:30,750
+after ten seconds.
+
+77
+00:05:31,930 --> 00:05:36,811
+The demo restarts the app so that every fourth request is held for three seconds, longer
+
+78
+00:05:36,811 --> 00:05:37,754
+than the timeout.
+
+79
+00:05:38,034 --> 00:05:39,229
+The first sets succeed.
+
+80
+00:05:40,576 --> 00:05:43,242
+Set four times out, and succeeds on the retry.
+
+81
+00:05:43,522 --> 00:05:48,353
+Then the app container is stopped. Set six is refused three times, and the breaker
+
+82
+00:05:48,353 --> 00:05:48,706
+opens.
+
+83
+00:05:48,986 --> 00:05:52,016
+Now calls are blocked at once, without touching the network.
+
+84
+00:05:54,283 --> 00:05:58,528
+The first trial fails, since the app is still down, so the breaker opens again.
+
+85
+00:06:00,752 --> 00:06:04,464
+With the container back, the next trial succeeds and the breaker closes.
+
+86
+00:06:04,744 --> 00:06:08,456
+Ten sets written, nineteen blocked, one failed, none written twice.
+
+87
+00:06:09,636 --> 00:06:14,436
+Part B serves one operation, logging a set, from a new gRPC service.
+
+88
+00:06:14,716 --> 00:06:22,248
+It runs in its own container, gym-grpc, on port 50051, with metrics on 9102.
+
+89
+00:06:22,248 --> 00:06:25,617
+The HTTP version stays in the app.
+
+90
+00:06:25,897 --> 00:06:32,054
+Both handlers call the same function, sessions.log_set, on the same database, so the
+
+91
+00:06:32,054 --> 00:06:37,844
+business rules are one piece of code. The gRPC server never calls the HTTP API.
+
+92
+00:06:38,124 --> 00:06:41,622
+It is a unary RPC: one set in, one result out.
+
+93
+00:06:42,802 --> 00:06:47,325
+The contract is workout.proto: one service, one RPC, LogSet.
+
+94
+00:06:47,605 --> 00:06:53,239
+Weight and reps are optional, so a missing value differs from zero, and the idempotency
+
+95
+00:06:53,239 --> 00:06:54,922
+key follows the HTTP rule.
+
+96
+00:06:55,202 --> 00:06:58,829
+The response has the set, any records it beat, and a replayed flag.
+
+97
+00:07:00,009 --> 00:07:03,102
+The code is generated with grpc_tools.protoc,
+
+98
+00:07:03,382 --> 00:07:06,796
+producing the messages, type hints and gRPC module,
+
+99
+00:07:07,076 --> 00:07:09,977
+which holds the client stub and the servicer base class.
+
+100
+00:07:10,257 --> 00:07:13,414
+Our handler subclasses the servicer and implements LogSet,
+
+101
+00:07:13,694 --> 00:07:17,129
+and both handlers call the same sessions_module.log_set.
+
+102
+00:07:17,409 --> 00:07:20,118
+Regenerating gives exactly the committed code.
+
+103
+00:07:21,298 --> 00:07:26,205
+The gRPC client takes its input from flags and sets a two-second deadline.
+
+104
+00:07:29,440 --> 00:07:34,756
+A valid set returns OK, with the set, the records it beat, and our request id echoed
+
+105
+00:07:34,756 --> 00:07:35,072
+back.
+
+106
+00:07:35,352 --> 00:07:40,088
+Zero reps fails with INVALID_ARGUMENT and the same message as HTTP.
+
+107
+00:07:40,368 --> 00:07:43,419
+And a one-millisecond deadline gives DEADLINE_EXCEEDED.
+
+108
+00:07:44,599 --> 00:07:48,033
+The traffic script sends the same four calls through both versions.
+
+109
+00:07:48,313 --> 00:07:55,524
+HTTP: 201, then 200 replayed, 400 for zero reps, and 404 for a missing workout.
+
+110
+00:07:55,804 --> 00:08:00,412
+gRPC: OK, OK replayed, INVALID_ARGUMENT and NOT_FOUND.
+
+111
+00:08:00,692 --> 00:08:06,452
+Directly over HTTP, the failure is a 400 with our request id in the error body.
+
+112
+00:08:08,462 --> 00:08:12,985
+Both map the same business exceptions, so an input fails the same way over each.
+
+113
+00:08:13,265 --> 00:08:17,742
+HTTP tells created from replayed with 201 and 200;
+
+114
+00:08:17,742 --> 00:08:20,966
+gRPC has one OK and a replayed flag.
+
+115
+00:08:21,246 --> 00:08:26,643
+A bad field is 400 or INVALID_ARGUMENT: retrying the same input cannot help.
+
+116
+00:08:26,923 --> 00:08:32,939
+A missing workout is 404 or NOT_FOUND; a finished one is 409 or FAILED_PRECONDITION.
+
+117
+00:08:33,219 --> 00:08:39,781
+Bad credentials are 401 or UNAUTHENTICATED; a bug is 500 or INTERNAL, with details only
+
+118
+00:08:39,781 --> 00:08:40,686
+in the logs.
+
+119
+00:08:40,966 --> 00:08:46,998
+And a caller that stops waiting gets a client timeout over HTTP, but DEADLINE_EXCEEDED
+
+120
+00:08:46,998 --> 00:08:49,734
+over gRPC, which also tells the server.
+
+121
+00:08:50,914 --> 00:08:52,301
+Here are both call paths.
+
+122
+00:08:52,581 --> 00:08:58,838
+HTTP: JSON to port 8000, the middleware that sets the request id and counts the request,
+
+123
+00:08:58,838 --> 00:09:01,754
+then the handler that validates the body.
+
+124
+00:09:02,034 --> 00:09:08,860
+gRPC: the client calls the generated stub, which sends protobuf over HTTP/2 to port
+
+125
+00:09:08,860 --> 00:09:14,535
+50051, where the generated servicer dispatches to our LogSet handler.
+
+126
+00:09:14,815 --> 00:09:18,403
+Both end in sessions.log_set and the same Postgres table.
+
+127
+00:09:18,403 --> 00:09:19,914
+Neither wraps the other.
+
+128
+00:09:20,999 --> 00:09:25,308
+Logs and trace correlation still work across the gRPC boundary.
+
+129
+00:09:25,588 --> 00:09:31,647
+The client sends x-request-id as metadata; the server logs under it and returns it, as
+
+130
+00:09:31,647 --> 00:09:34,676
+the HTTP middleware does with X-Request-ID.
+
+131
+00:09:34,956 --> 00:09:37,431
+So one Kibana search on our request ids
+
+132
+00:09:40,080 --> 00:09:46,688
+finds the gRPC lines from gym-tracker-grpc, set logged and rpc served, OK and
+
+133
+00:09:46,688 --> 00:09:51,408
+INVALID_ARGUMENT, beside the HTTP failure from the app.
+
+134
+00:09:52,588 --> 00:09:55,788
+Part C starts with an audit of the Assignment 1 metrics.
+
+135
+00:09:56,068 --> 00:10:02,830
+The HTTP counter, duration histogram and in-flight gauge already cover the HTTP LogSet,
+
+136
+00:10:02,830 --> 00:10:05,007
+429s included, so they stay.
+
+137
+00:10:05,287 --> 00:10:07,953
+The gRPC service had no metrics at all.
+
+138
+00:10:08,233 --> 00:10:11,924
+Live-workout sets were never counted, the gap Assignment 1 listed.
+
+139
+00:10:12,204 --> 00:10:14,231
+And nothing showed idempotency working.
+
+140
+00:10:14,511 --> 00:10:17,391
+Build info and the LLM gauge were left alone.
+
+141
+00:10:18,571 --> 00:10:19,915
+Four metrics were added.
+
+142
+00:10:20,195 --> 00:10:25,891
+A counter of gRPC calls by service, method and status code, for rate and errors.
+
+143
+00:10:26,171 --> 00:10:30,288
+A duration histogram in seconds, for p50 and p95.
+
+144
+00:10:30,568 --> 00:10:32,040
+A gauge of calls in flight.
+
+145
+00:10:32,320 --> 00:10:36,459
+And a counter of live sets by transport and outcome, written or replayed.
+
+146
+00:10:36,739 --> 00:10:40,877
+All labels come from fixed lists; no user, request or trace ids.
+
+147
+00:10:42,057 --> 00:10:45,620
+The gRPC service exposes them on its own endpoint,
+
+148
+00:10:45,900 --> 00:10:47,372
+with only bounded labels,
+
+149
+00:10:49,262 --> 00:10:53,699
+and buckets from five milliseconds to ten seconds, the same as HTTP.
+
+150
+00:10:54,879 --> 00:10:59,731
+Duration is measured at the server for both transports, so network time is left out and
+
+151
+00:10:59,731 --> 00:11:01,237
+they compare like for like.
+
+152
+00:11:01,517 --> 00:11:07,098
+The buckets are dense from five to a hundred milliseconds, where a LogSet normally
+
+153
+00:11:07,098 --> 00:11:10,093
+falls; p50 and p95 use a five-minute window.
+
+154
+00:11:10,373 --> 00:11:15,158
+In-flight calls beat message size: a request is tens of bytes, a flat line, while
+
+155
+00:11:15,158 --> 00:11:18,821
+concurrency is what runs out first, with eight worker threads.
+
+156
+00:11:19,101 --> 00:11:22,087
+And the live-sets counter fills the Assignment 1 gap.
+
+157
+00:11:23,109 --> 00:11:28,400
+Prometheus scrapes the gRPC service as its own job, and it is up beside the app.
+
+158
+00:11:28,680 --> 00:11:34,120
+The cardinality demo is down by design; it only runs for an Assignment 1 experiment.
+
+159
+00:11:34,400 --> 00:11:38,453
+Here is the gRPC p95 over a five-minute window.
+
+160
+00:11:42,524 --> 00:11:49,124
+In Grafana, every gRPC panel sits beside its HTTP twin, filled by the repeatable traffic
+
+161
+00:11:49,124 --> 00:11:49,649
+script.
+
+162
+00:11:49,929 --> 00:11:54,526
+Calls per second and error ratios. About half the calls fail by design:
+
+163
+00:11:54,526 --> 00:11:57,310
+invalid and not-found calls in every round.
+
+164
+00:11:57,590 --> 00:11:59,958
+Calls by status code for each transport.
+
+165
+00:12:02,581 --> 00:12:08,366
+Server-side p50 and p95 over five minutes; in this small virtual machine both sit at a
+
+166
+00:12:08,366 --> 00:12:10,048
+few hundred milliseconds.
+
+167
+00:12:10,328 --> 00:12:13,229
+In-flight calls, and live sets written versus replayed.
+
+168
+00:12:14,964 --> 00:12:18,825
+And the rate-limited endpoint, with its 200s and 429s.
+
+169
+00:12:20,005 --> 00:12:21,882
+These are the queries behind the panels:
+
+170
+00:12:22,162 --> 00:12:24,744
+calls by status code, and the error ratio;
+
+171
+00:12:25,024 --> 00:12:29,333
+histogram_quantile for p50 and p95 over five minutes;
+
+172
+00:12:29,613 --> 00:12:35,586
+and in-flight calls and live sets. The HTTP side uses the same panels on the sets route.
+
+173
+00:12:36,766 --> 00:12:42,783
+Everything is in the repository: code, OpenAPI document, proto and generation command,
+
+174
+00:12:42,783 --> 00:12:47,540
+both clients, tests, Prometheus configuration and Grafana dashboard.
+
+175
+00:12:47,820 --> 00:12:52,707
+The README has the run and test commands, and the report has the tables and evidence.
+
+176
+00:12:52,707 --> 00:12:53,857
+Thanks for watching.
