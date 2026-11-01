@@ -14,5 +14,5 @@ grpcio-tools==1.80.0
 # Linters. Pinned like everything else: ruff adds rules to the families that
 # ruff.toml selects in minor releases, so an unpinned linter can fail CI on a day
 # nothing in this repository changed. CI's lint job installs only these lines.
-ruff==0.17.0
+ruff==0.17.2
 shellcheck-py==0.11.0.1
