@@ -68,6 +68,9 @@ The user task is **logging a set during a live workout**. Over HTTP it is
 same Postgres database. The report is
 **[docs/Assignment2-HTTP-gRPC-Metrics.docx](docs/Assignment2-HTTP-gRPC-Metrics.docx)**,
 with the call-path diagram in [docs/a2-call-paths.png](docs/a2-call-paths.png).
+The narrated video walkthrough (34:59, with subtitles) is attached to the
+**[Assignment 2 video](https://github.com/sohaibm05/Gym-tracker/releases/tag/a2-video)**
+release rather than committed, because at 115 MB it is over GitHub's file limit.
 
 ### Run
 
